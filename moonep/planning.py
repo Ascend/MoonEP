@@ -37,7 +37,6 @@ class MoonEPCommPlan:
     N: int
     R: int
     E: int
-    B: int
     NvS: int
     K: int
 
@@ -53,16 +52,16 @@ class MoonEPCommPlan:
         N = int(self.N)
         R = int(self.R)
         E = int(self.E)
-        B = int(self.B)
+        epn = E // R
         NvS = int(self.NvS)
         assert self.dst.dtype == torch.int32 and self.dst.is_contiguous()
         assert self.dst.numel() == N
         assert self.experts_to_copy.dtype == torch.int32 and self.experts_to_copy.is_contiguous()
-        assert tuple(self.experts_to_copy.shape) == (R, B)
+        assert tuple(self.experts_to_copy.shape) == (R, epn)
         assert self.remote_stats.dtype == torch.int32 and self.remote_stats.is_contiguous()
         assert tuple(self.remote_stats.shape) == (2,)
         assert self.zero_fill_ranges.dtype == torch.int32 and self.zero_fill_ranges.is_contiguous()
-        assert tuple(self.zero_fill_ranges.shape) == (E + B, 2)
+        assert tuple(self.zero_fill_ranges.shape) == (2 * epn, 2)
         assert self.dup_groups.dtype == torch.int32 and self.dup_groups.is_contiguous()
         assert tuple(self.dup_groups.shape) == (NvS, 3)
         assert self.dup_loffs.dtype == torch.int32 and self.dup_loffs.is_contiguous()
@@ -82,7 +81,6 @@ class MoonEPCommPlan:
             N=self.N,
             R=self.R,
             E=self.E,
-            B=self.B,
             NvS=self.NvS,
             K=self.K,
         )
@@ -206,12 +204,6 @@ def warp_argmax_min_idx(v, i):
     return m, j
 
 @cute.jit
-def warp_argmax_max_idx(v, i):
-    m = cute.arch.warp_redux_sync(v, "max")
-    j = cute.arch.warp_redux_sync(i if v == m else -1, "max")
-    return m, j
-
-@cute.jit
 def warp_argmin_min_idx(v, i):
     m = cute.arch.warp_redux_sync(v, "min")
     j = cute.arch.warp_redux_sync(i if v == m else 2147483647, "min")
@@ -234,14 +226,6 @@ def warp_scan_argmax_min_idx(s, n, lane):
     return warp_argmax_min_idx(bv, bi)
 
 @cute.jit
-def warp_scan_argmax_max_idx(s, n, lane):
-    bv = 0; bi = -1
-    for k in cutlass.range(lane, n, 32):
-        x = s[k]
-        if x >= bv: bv = x; bi = k   # >= makes ties pick the larger idx
-    return warp_argmax_max_idx(bv, bi)
-
-@cute.jit
 def warp_scan_argmin_min_idx(s, n, lane):
     bv = 2147483647; bi = 2147483647
     for k in cutlass.range(lane, n, 32):
@@ -261,15 +245,6 @@ def reg_scan_argmax_min_idx(reg, N: cutlass.Constexpr, lane):
         k = lane + j * 32
         if k < N and reg[j] > bv: bv = reg[j]; bi = k
     return warp_argmax_min_idx(bv, bi)
-
-@cute.jit
-def reg_scan_argmax_max_idx(reg, N: cutlass.Constexpr, lane):
-    bv = 0; bi = -1
-    CHUNK = cutlass.const_expr(ceil_div(N, 32))
-    for j in cutlass.range(CHUNK, unroll_full=True):
-        k = lane + j * 32
-        if k < N and reg[j] >= bv: bv = reg[j]; bi = k
-    return warp_argmax_max_idx(bv, bi)
 
 @cute.jit
 def reg_scan_argmin_min_idx(reg, N: cutlass.Constexpr, lane):
@@ -351,10 +326,10 @@ def _pd_issue_g2s(meta, smem_stage, src_begin, logical_count, mbar):
 
 
 class PlanningKernel:
-    def __init__(self, R, E, B, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
+    def __init__(self, R, E, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                  TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
                  token_padding, num_sms):
-        self.R, self.E, self.B, self.S, self.K = R, E, B, S, K
+        self.R, self.E, self.S, self.K = R, E, S, K
         self.N = self.S * self.K
         self.NvS_capacity, self.NvS, self.num_vblocks = NvS_capacity, NvS, num_vblocks
         self.meta_stride = meta_stride
@@ -370,15 +345,16 @@ class PlanningKernel:
         R = cutlass.const_expr(self.R)
         ms = cutlass.const_expr(self.meta_stride)
         N = cutlass.const_expr(self.N)
+        epn = cutlass.const_expr(self.E // self.R)
         num_sms = cutlass.const_expr(self.num_sms)
         meta_t = cute.make_tensor(meta, cute.make_layout((R * ms,)))
         mc_t = cute.make_tensor(mc, cute.make_layout((R * ms,)))
         tpe_t = cute.make_tensor(tpe, cute.make_layout((self.E,)))
         topk_t = cute.make_tensor(topk, cute.make_layout((N,)))
         dst_t = cute.make_tensor(dst, cute.make_layout((N,)))
-        cu_t = cute.make_tensor(cu_seqlens, cute.make_layout((self.E + self.B,)))
-        etc_t = cute.make_tensor(experts_to_copy, cute.make_layout((self.R * self.B,)))
-        zfr_t = cute.make_tensor(zero_fill, cute.make_layout(((self.E + self.B) * 2,)))
+        cu_t = cute.make_tensor(cu_seqlens, cute.make_layout((2 * epn,)))
+        etc_t = cute.make_tensor(experts_to_copy, cute.make_layout((self.R * epn,)))
+        zfr_t = cute.make_tensor(zero_fill, cute.make_layout((4 * epn,)))
         stats_t = cute.make_tensor(remote_stats, cute.make_layout((2,)))
         alloc_t = cute.make_tensor(alloc, cute.make_layout((R * self.E,)))
         gt_t = cute.make_tensor(group_tokens, cute.make_layout((R,)))
@@ -522,12 +498,11 @@ class PlanningKernel:
                rank: Int32):
         R = cutlass.const_expr(self.R)
         E = cutlass.const_expr(self.E)
-        B = cutlass.const_expr(self.B)
         S = cutlass.const_expr(self.S)
         K = cutlass.const_expr(self.K)
         epn = cutlass.const_expr(E // R)
         LOG2_R = cutlass.const_expr(log2_r(R))
-        EB_PAD = cutlass.const_expr(ceil_pow2(E + B))
+        EB_PAD = cutlass.const_expr(ceil_pow2(2 * epn))
         IPT_EB = cutlass.const_expr(ceil_div(EB_PAD, BLOCK_DIM_P2))
         ms = cutlass.const_expr(self.meta_stride)
         N = cutlass.const_expr(self.N)
@@ -547,9 +522,9 @@ class PlanningKernel:
         TPE_SUB = E * R
         EOFF_SUB = 2 * E * R
         CU_SUB = 3 * E * R
-        ZFR_SUB = CU_SUB + R * (E + B)
-        ETC_SUB = ZFR_SUB + 2 * R * (E + B)
-        STATS_SUB = ETC_SUB + R * B
+        ZFR_SUB = CU_SUB + R * (2 * epn)
+        ETC_SUB = ZFR_SUB + 2 * R * (2 * epn)
+        STATS_SUB = ETC_SUB + R * epn
         PB = PLAN_OFF
         num_threads = BLOCK_DIM_P2
         NUM_WARPS = cutlass.const_expr(BLOCK_DIM_P2 // 32)
@@ -568,10 +543,10 @@ class PlanningKernel:
             return smem.allocate_tensor(Int32, cute.make_layout((aligned_n,)), byte_alignment=16)
         PHASE_D_TILE = 32
         PHASE_D_GROUPS_PER_CTA = cutlass.const_expr(
-            align_up((E + B + num_sms - 1) // num_sms, PHASE_D_TILE)
+            align_up((2 * epn + num_sms - 1) // num_sms, PHASE_D_TILE)
         )
         PHASE_D_ETC_PER_CTA = cutlass.const_expr(
-            align_up((R * B + num_sms - 1) // num_sms, PHASE_D_TILE)
+            align_up((R * epn + num_sms - 1) // num_sms, PHASE_D_TILE)
         )
         # Each CTA only stages the Phase D slice it owns. Each segment gets an
         # extra +4 ints to hold the head/tail elements the 16B-aligned envelope
@@ -594,9 +569,8 @@ class PlanningKernel:
         s_hist = sa(E)
         s_bp = sa(E)
         s_col = sa(E)
-        s_chosen = sa(B)
+        s_chosen = sa(epn)
         s_wmax = sa(64)
-        s_mask = sa(E)
         bar_p = bar.iterator
         # Phase A
         # tpe gather -> rank0 chunk (helper handles head/tail alignment itself)
@@ -802,27 +776,26 @@ class PlanningKernel:
             )
             all_cu_seqlens = cute.make_tensor(
                 meta.iterator + (PB + CU_SUB),
-                cute.make_layout((R, E + B), stride=(E + B, 1)),
+                cute.make_layout((R, 2 * epn), stride=(2 * epn, 1)),
             )
             zero_fill_start = cute.make_tensor(
                 meta.iterator + (PB + ZFR_SUB),
-                cute.make_layout((R, E + B), stride=((E + B) * 2, 2)),
+                cute.make_layout((R, 2 * epn), stride=(4 * epn, 2)),
             )
             zero_fill_count = cute.make_tensor(
                 meta.iterator + (PB + ZFR_SUB + 1),
-                cute.make_layout((R, E + B), stride=((E + B) * 2, 2)),
+                cute.make_layout((R, 2 * epn), stride=(4 * epn, 2)),
             )
             all_experts_to_copy = cute.make_tensor(
                 meta.iterator + (PB + ETC_SUB),
-                cute.make_layout((R, B), stride=(B, 1)),
+                cute.make_layout((R, epn), stride=(epn, 1)),
             )
             all_remote_stats = cute.make_tensor(
                 meta.iterator + (PB + STATS_SUB),
                 cute.make_layout((R, 2), stride=(2, 1)),
             )
             s_expert_counts = cute.make_tensor(s_col.iterator, cute.make_layout((E,)))
-            s_selected_experts = cute.make_tensor(s_chosen.iterator, cute.make_layout((B,)))
-            s_selected_mask = cute.make_tensor(s_mask.iterator, cute.make_layout((E,)))
+            s_selected_experts = cute.make_tensor(s_chosen.iterator, cute.make_layout((epn,)))
             s_scan_warp_prefix = cute.make_tensor(s_wmax.iterator, cute.make_layout((NUM_WARPS,)))
             for idx in cutlass.range(
                 pid * num_threads + tid, R * 2, num_sms * num_threads
@@ -837,51 +810,42 @@ class PlanningKernel:
                 for expert_idx in cutlass.range(tid, E, num_threads):
                     cnt = alloc_tensor[dest_rank, expert_idx]
                     s_expert_counts[expert_idx] = cnt
-                    s_selected_mask[expert_idx] = 0
+                for slot in cutlass.range(tid, epn, num_threads):
+                    s_selected_experts[slot] = -1
+                    all_experts_to_copy[dest_rank, slot] = -1
                 cute.arch.barrier()
 
-                # A single warp scans the max B times to pick the top-B remote
-                # experts; the picked entry is cleared to 0 to take the next
-                # largest, and its mask is marked.
+                # With epn slots every remote expert fits. Compact all positive
+                # remote experts once in global-expert order.
                 if tid < 32:
                     lane = tid
                     E_CHUNK = cutlass.const_expr(ceil_div(E, 32))
-                    remote_expert_counts = cute.make_rmem_tensor(E_CHUNK, Int32)
-                    for j in cutlass.range(E_CHUNK, unroll_full=True):
-                        expert_idx = lane + j * 32
-                        remote_expert_counts[j] = 0
+                    lanes_lt = (Uint32(1) << lane) - Uint32(1)
+                    remote_expert_count = Int32(0)
+                    for chunk in cutlass.range(E_CHUNK, unroll=1):
+                        expert_idx = chunk * Int32(32) + lane
+                        selected = cutlass.Boolean(False)
                         if expert_idx < E:
                             cnt = s_expert_counts[expert_idx]
-                            is_local = (expert_idx >= local_start) & (expert_idx < local_end)
-                            remote_expert_counts[j] = 0 if is_local else cnt
-                    remote_expert_count = 0
-                    for j in cutlass.range(E_CHUNK, unroll_full=True):
-                        if remote_expert_counts[j] > 0:
-                            remote_expert_count += 1
-                    remote_expert_count = cute.arch.warp_redux_sync(
-                        remote_expert_count, "add"
-                    )
-                    if tid == 0:
-                        all_remote_stats[dest_rank, 0] = remote_expert_count
-                    for slot in cutlass.range_constexpr(B):
-                        best_cnt, best_idx = reg_scan_argmax_max_idx(remote_expert_counts, E, lane)
-                        for j in cutlass.range(E_CHUNK, unroll_full=True):
-                            expert_idx = lane + j * 32
-                            if expert_idx == best_idx:
-                                remote_expert_counts[j] = 0
-                        if tid == 0:
-                            expert_idx = best_idx if best_cnt > 0 else -1
+                            selected = (cnt > 0) & (
+                                (expert_idx < local_start) | (expert_idx >= local_end)
+                            )
+                        peers = Uint32(cute.arch.vote_ballot_sync(selected))
+                        if selected:
+                            slot = remote_expert_count + Int32(
+                                cute.arch.popc(peers & lanes_lt)
+                            )
                             s_selected_experts[slot] = expert_idx
                             all_experts_to_copy[dest_rank, slot] = expert_idx
-                            if expert_idx >= 0:
-                                owner_rank = expert_idx // epn
-                                cute.arch.atomic_add(
-                                    elem_ptr(all_remote_stats, (owner_rank, 1)),
-                                    1,
-                                    scope="gpu",
-                                )
-                                s_selected_mask[expert_idx] = 1
-                        cute.arch.sync_warp()
+                            owner_rank = expert_idx // epn
+                            cute.arch.atomic_add(
+                                elem_ptr(all_remote_stats, (owner_rank, 1)),
+                                1,
+                                scope="gpu",
+                            )
+                        remote_expert_count += Int32(cute.arch.popc(peers))
+                    if lane == 0:
+                        all_remote_stats[dest_rank, 0] = remote_expert_count
                 cute.arch.barrier()
 
                 count_values = []
@@ -891,14 +855,12 @@ class PlanningKernel:
                     group_idx = tid * IPT_EB + i
                     token_count = 0
                     expert_id = -1
-                    if group_idx < E + B:
-                        if group_idx < E:
-                            is_selected = s_selected_mask[group_idx] != 0
-                            if ~is_selected:
-                                token_count = s_expert_counts[group_idx]
-                                expert_id = group_idx
+                    if group_idx < 2 * epn:
+                        if group_idx < epn:
+                            expert_id = local_start + group_idx
+                            token_count = s_expert_counts[expert_id]
                         else:
-                            selected_expert = s_selected_experts[group_idx - E]
+                            selected_expert = s_selected_experts[group_idx - epn]
                             if selected_expert >= 0:
                                 token_count = s_expert_counts[selected_expert]
                                 expert_id = selected_expert
@@ -933,7 +895,7 @@ class PlanningKernel:
                 base = s_scan_warp_prefix[warp_id] + inclusive - total_padded
                 for i in cutlass.range_constexpr(IPT_EB):
                     group_idx = tid * IPT_EB + i
-                    if group_idx < E + B:
+                    if group_idx < 2 * epn:
                         padded_end = base + padded_values[i]
                         token_count = count_values[i]
                         expert_id = expert_values[i]
@@ -1000,12 +962,12 @@ class PlanningKernel:
             cute.make_layout((R, E), stride=(E, 1)),
         )
 
-        pd_group_count = cutlass.const_expr(E + B)
+        pd_group_count = cutlass.const_expr(2 * epn)
         group_begin, group_end, group_copy_begin, group_copy_count = _pd_cta_slice(
             pd_group_count, pid, num_sms, PHASE_D_TILE
         )
         etc_begin, etc_end, etc_copy_begin, etc_copy_count = _pd_cta_slice(
-            R * B, pid, num_sms, PHASE_D_TILE
+            R * epn, pid, num_sms, PHASE_D_TILE
         )
         # Index 0 of the stage tensors is the aligned envelope start; the
         # logical start is pointed inside the envelope by *_stage_bias, so the
@@ -1030,6 +992,12 @@ class PlanningKernel:
         if tid == 0:
             cute.arch.mbarrier_init(pd_mbar, 1)
         cute.arch.mbarrier_init_fence()
+        # The scratch smem was previously written through the generic proxy
+        # (Phase B s_tpe / run_c1 s_wcount). Bridge those writes into the
+        # async proxy before the Phase-D bulk G2S copies overwrite the same
+        # storage (every thread fences its own prior writes before the
+        # rendezvous).
+        cute.arch.fence_view_async_shared()
         cute.arch.barrier()
         if tid == 0:
             # Kick off the three G2S bulk copies before C2 starts; the
@@ -1136,10 +1104,10 @@ class PlanningKernel:
 # Host side: compile cache + launch
 # ============================================================
 @functools.lru_cache(maxsize=None)
-def _get_compiled(R, E, B, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
+def _get_compiled(R, E, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                   TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
                   token_padding, num_sms):
-    k = PlanningKernel(R, E, B, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
+    k = PlanningKernel(R, E, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                        TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
                        token_padding, num_sms)
     i32 = make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=16)
@@ -1149,11 +1117,9 @@ def _get_compiled(R, E, B, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
 
 def _launch_planning_kernel(ctx, topk, tpe, dst, cu_seqlens,
                             experts_to_copy, zero_fill_ranges, remote_stats):
-    assert int(ctx['B']) > 0, f"planning requires B > 0, got B={int(ctx['B'])}"
     comp = _get_compiled(
         int(ctx['R']),
         int(ctx['E']),
-        int(ctx['B']),
         int(ctx['S']),
         int(ctx['K']),
         int(ctx['NvS_capacity']),
@@ -1172,7 +1138,7 @@ def _launch_planning_kernel(ctx, topk, tpe, dst, cu_seqlens,
 
     def p16(t):  # large buffers 16B aligned -> allows coalesced/vectorized access
         return make_ptr(Int32, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-    def p4(t):  # odd-length outputs like E+B; avoids out-of-bounds vector writes
+    def p4(t):  # odd-length outputs; avoids out-of-bounds vector writes
         return make_ptr(Int32, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     comp(
@@ -1207,7 +1173,7 @@ def allocate_planning_outputs(ctx: dict):
     to materialize.
     """
     E = ctx['E']
-    B = ctx.get('B', 0)
+    epn = E // ctx['R']
     S = ctx['S']
     K = ctx['K']
     N = S * K
@@ -1218,13 +1184,13 @@ def allocate_planning_outputs(ctx: dict):
     # Over-allocate output tensors to a multiple of 4 and then slice, avoiding
     # an out-of-bounds full-vector write at the tail (returned shapes unchanged).
     dst = torch.empty(_round4(N), dtype=torch.int32, device=dev)[:N]
-    cu_seqlens = torch.empty(_round4(E + B), dtype=torch.int32, device=dev)[:E + B]
-    experts_to_copy = torch.empty(_round4(ctx['R'] * B), dtype=torch.int32, device=dev)[
-        :ctx['R'] * B
-    ].view(ctx['R'], B)
+    cu_seqlens = torch.empty(_round4(2 * epn), dtype=torch.int32, device=dev)[:2 * epn]
+    experts_to_copy = torch.empty(
+        _round4(ctx['R'] * epn), dtype=torch.int32, device=dev
+    )[:ctx['R'] * epn].view(ctx['R'], epn)
     zero_fill_ranges = torch.empty(
-        _round4((E + B) * 2), dtype=torch.int32, device=dev
-    )[:(E + B) * 2].view(E + B, 2)
+        _round4(4 * epn), dtype=torch.int32, device=dev
+    )[:4 * epn].view(2 * epn, 2)
     remote_stats = torch.empty(_round4(2), dtype=torch.int32, device=dev)[:2]
     dup_groups = torch.empty(
         _round4(NvS * 3), dtype=torch.int32, device=dev
@@ -1243,7 +1209,6 @@ def allocate_planning_outputs(ctx: dict):
         N=N,
         R=ctx['R'],
         E=E,
-        B=B,
         NvS=NvS,
         K=K,
     )
@@ -1253,15 +1218,14 @@ def allocate_planning_outputs(ctx: dict):
 def _check_planning_outputs(ctx: dict, cu_seqlens, plan) -> None:
     assert isinstance(plan, MoonEPCommPlan)
     E = ctx['E']
-    B = ctx.get('B', 0)
+    epn = E // ctx['R']
     assert plan.N == ctx['S'] * ctx['K']
     assert plan.R == ctx['R']
     assert plan.E == E
-    assert plan.B == B
     assert plan.NvS == ctx['NvS']
     assert plan.K == ctx['K']
     assert cu_seqlens.dtype == torch.int32 and cu_seqlens.is_contiguous()
-    assert tuple(cu_seqlens.shape) == (E + B,)
+    assert tuple(cu_seqlens.shape) == (2 * epn,)
 
 
 def _check_dedup_encoding_bounds(ctx: dict) -> None:

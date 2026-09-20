@@ -25,7 +25,7 @@ from tests.planning_reference import launch_planning_torch_reference
 
 
 DISPATCH_CASES = [
-    KernelCase("balanced", S=256, K=8, epn=16, H=128, num_sms=32, B=4),
+    KernelCase("balanced", S=256, K=8, epn=16, H=128, num_sms=32),
     KernelCase(
         "tiny_k1_no_padding",
         S=1,
@@ -42,7 +42,6 @@ DISPATCH_CASES = [
         epn=8,
         H=64,
         num_sms=8,
-        B=2,
         token_padding=16,
         routing="all_local",
     ),
@@ -53,7 +52,6 @@ DISPATCH_CASES = [
         epn=8,
         H=64,
         num_sms=8,
-        B=2,
         token_padding=16,
         routing="all_remote",
         min_R=2,
@@ -65,7 +63,6 @@ DISPATCH_CASES = [
         epn=4,
         H=64,
         num_sms=8,
-        B=2,
         token_padding=8,
         routing="duplicate_topk",
         min_R=2,
@@ -77,7 +74,6 @@ DISPATCH_CASES = [
         epn=4,
         H=64,
         num_sms=8,
-        B=2,
         token_padding=8,
         routing="duplicate_topk",
         min_R=2,
@@ -89,7 +85,6 @@ DISPATCH_CASES = [
         epn=4,
         H=64,
         num_sms=8,
-        B=1,
         token_padding=8,
         routing="single_expert",
         min_R=2,
@@ -104,7 +99,6 @@ ZERO_FILL_CASES = [
         epn=8,
         H=64,
         num_sms=8,
-        B=2,
         token_padding=16,
         routing="all_local",
     ),
@@ -115,7 +109,6 @@ ZERO_FILL_CASES = [
         epn=8,
         H=64,
         num_sms=8,
-        B=3,
         token_padding=16,
         routing="all_remote",
         min_R=2,
@@ -130,7 +123,6 @@ LARGE_DISPATCH_CASES = [
         epn=14,
         H=7168,
         num_sms=32,
-        B=4,
     )
 ]
 
@@ -369,7 +361,6 @@ def test_dispatch_saved_plan_hidden_only_reuses_dst_and_skips_weights(dist_env):
         epn=8,
         H=64,
         num_sms=8,
-        B=2,
         token_padding=16,
         routing="all_remote",
         min_R=2,

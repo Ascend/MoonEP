@@ -32,7 +32,6 @@ def launch_planning_torch_reference(
     rank = ctx["rank"]
     R = ctx["R"]
     E = ctx["E"]
-    B = int(ctx["B"])
     S = ctx["S"]
     K = ctx["K"]
     N = S * K
@@ -135,8 +134,8 @@ def launch_planning_torch_reference(
     alloc_cumsum = alloc.cumsum(dim=1)
 
     expert_off = torch.zeros(R, E, dtype=torch.int32)
-    cu_seqlens = torch.zeros(R, E + B, dtype=torch.int32)
-    experts_to_copy = torch.full((R, B), -1, dtype=torch.int32)
+    cu_seqlens = torch.zeros(R, 2 * epn, dtype=torch.int32)
+    experts_to_copy = torch.full((R, epn), -1, dtype=torch.int32)
     remote_stats_all = torch.zeros(R, 2, dtype=torch.int32)
     # zero_fill_ranges[d, g] = (pad_start_loff, n_pad_rows): the segment-
     # padding rows the dispatch zero warp clears. If n_pad_rows == 0, the
@@ -144,7 +143,7 @@ def launch_planning_torch_reference(
     # cnt == 0 groups occupy no space and contribute 0 pad rows; the
     # [last_padded_end, NvS) tail is intentionally NOT covered (master
     # behavior — consumers read via cu_seqlens, the tail is undefined).
-    zero_fill_by_rank = torch.zeros(R, E + B, 2, dtype=torch.int32)
+    zero_fill_by_rank = torch.zeros(R, 2 * epn, 2, dtype=torch.int32)
 
     for d in range(R):
         local_start = d * epn
@@ -155,30 +154,30 @@ def launch_planning_torch_reference(
             if alloc[e, d].item() > 0 and not (local_start <= e < local_end)
         ]
 
-        # Pick the B remote expert segments with the most tokens for VM
-        # prefetch;
-        remote_experts.sort(key=lambda e: (alloc[e, d].item(), e), reverse=True)
+        if len(remote_experts) > epn:
+            raise AssertionError(
+                f"torch planning reference: {len(remote_experts)} remote "
+                f"experts exceed epn={epn}"
+            )
         remote_stats_all[d, 0] = len(remote_experts)
-        for b, e in enumerate(remote_experts[:B]):
+        for b, e in enumerate(remote_experts):
             experts_to_copy[d, b] = e
             remote_stats_all[e // epn, 1] += 1
 
-        experts_to_prefetch = set(remote_experts[:B])
         start = 0
 
         # The physical token order follows the VM group id:
-        #   0..E-1 are the global expert groups;
-        #   E..E+B-1 are the prefetch slots of the selected remote experts.
-        for g in range(E + B):
+        #   0..epn-1 are this rank's local expert groups;
+        #   epn..2*epn-1 are the selected remote experts' prefetch slots.
+        for g in range(2 * epn):
             cnt = 0
             expert_id = -1
 
-            if g < E:
-                if g not in experts_to_prefetch:
-                    cnt = alloc[g, d].item()
-                    expert_id = g
+            if g < epn:
+                expert_id = local_start + g
+                cnt = alloc[expert_id, d].item()
             else:
-                b = g - E
+                b = g - epn
                 if experts_to_copy[d, b].item() >= 0:
                     expert_id = experts_to_copy[d, b].item()
                     cnt = alloc[expert_id, d].item()

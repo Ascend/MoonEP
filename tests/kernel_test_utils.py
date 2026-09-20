@@ -29,7 +29,6 @@ class KernelCase:
     epn: int
     H: int
     num_sms: int
-    B: int | None = None
     token_padding: int = DEFAULT_TOKEN_PADDING
     routing: str = "balanced"
     bias_ratio: float = 0.0
@@ -55,7 +54,6 @@ def init_case(case, R):
         case.K,
         case.E(R),
         R,
-        B=case.B,
         num_sms=case.num_sms,
         token_padding=case.token_padding,
     )
@@ -327,15 +325,22 @@ def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy):
     errors = []
     R = int(ctx["R"])
     E = int(ctx["E"])
-    B = int(ctx["B"])
+    epn = E // R
     NvS = int(ctx["NvS"])
     N = case.S * case.K
 
+    expected_nvs = _align_up(
+        N + (case.token_padding - 1) * 2 * case.epn,
+        case.token_padding,
+    )
+    if NvS != expected_nvs:
+        errors.append(f"NvS={NvS}, expected aligned capacity {expected_nvs}")
+
     planning_out_elems = (
         3 * E * R
-        + R * (E + B)
-        + 2 * R * (E + B)
-        + R * B
+        + R * (2 * epn)
+        + 2 * R * (2 * epn)
+        + R * epn
         + 2 * R
     )
     n4 = _align_up(N, 4)
@@ -374,9 +379,9 @@ def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy):
             errors.append("dst contains an out-of-range local offset")
 
     cu_cpu = cu_seqlens.cpu()
-    if cu_seqlens.dtype != torch.int32 or tuple(cu_seqlens.shape) != (E + B,):
+    if cu_seqlens.dtype != torch.int32 or tuple(cu_seqlens.shape) != (2 * epn,):
         errors.append(
-            f"cu_seqlens must be int32 [{E + B}], "
+            f"cu_seqlens must be int32 [{2 * epn}], "
             f"got {cu_seqlens.dtype} {tuple(cu_seqlens.shape)}"
         )
     else:
@@ -398,9 +403,9 @@ def planning_invariant_errors(case, ctx, dst, cu_seqlens, experts_to_copy):
             errors.append(f"cu_seqlens total {int(cu_cpu[-1].item())} exceeds NvS={NvS}")
 
     copy_cpu = experts_to_copy.cpu()
-    if experts_to_copy.dtype != torch.int32 or tuple(experts_to_copy.shape) != (R, B):
+    if experts_to_copy.dtype != torch.int32 or tuple(experts_to_copy.shape) != (R, epn):
         errors.append(
-            f"experts_to_copy must be int32 [{R}, {B}], "
+            f"experts_to_copy must be int32 [{R}, {epn}], "
             f"got {experts_to_copy.dtype} {tuple(experts_to_copy.shape)}"
         )
     elif not torch.all((copy_cpu == -1) | ((copy_cpu >= 0) & (copy_cpu < E))):

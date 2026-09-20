@@ -40,33 +40,32 @@ where $T_e$ is the number of tokens routed to expert $e$, and $\bar{T}$ is the e
 
 ### Integration
 
-**Notation**: `S` = input tokens per rank, `K` = routed top-k per token, `E` = total routed experts in the EP group, `R` = number of EP ranks (EP comm size), `B` = weight prefetch slots per rank, `NvS` = dispatched token slots per rank (`S × K` real tokens plus per-VM-group padding), `H` = hidden size, `H'` = expert FFN intermediate size.
+**Notation**: `S` = input tokens per rank, `K` = routed top-k per token, `E` = total routed experts in the EP group, `R` = number of EP ranks (EP comm size), `epn = E/R` = local experts and prefetch/reduce slots per rank, `NvS` = dispatched token slots per rank (`S × K` real tokens plus per-VM-group padding), `H` = hidden size, `H'` = expert FFN intermediate size.
 
-MoonEP's contract with a training or inference framework is **one contiguous symmetric-memory weight tensor per expert projection, plus a planner-produced `cu_seqlens`**. The VM group GEMM consumes a single `[E+B, H, H']` weight tensor; `cu_seqlens[E+B]` (returned by `dispatch`) selects which expert rows are active for the current step.
+MoonEP's communication API receives each projection as a local expert tensor `[epn, H, H']` plus an all-rank prefetch-buffer view `[R, epn, H, H']`. The integrating framework exposes this rank's local experts followed by its local prefetch slice as one contiguous `[2*epn, H, H']` compute view for the VM group GEMM; the planner-produced `cu_seqlens[2*epn]` selects the active rows.
 
 #### Weight buffer
 
 <img src="figure/weight_buffer.png" alt="MoonEP weight buffer layout" width="1000">
 
-For each expert projection (gate/up/down), every layer holds **one contiguous VMM range** `[E+B, H, H']`, identically laid out on every rank. Contiguity is a hard requirement: the group GEMM addresses experts purely by row index.
+For each expert projection (gate/up/down), the framework builds two related views:
 
-- **Rows `[0, E)`: all ranks' local experts** — `E/R` rows per rank. Each chunk physically *is* the home rank's parameter memory, mapped everywhere via symmetric memory.
-- **Rows `[E, E+B)`: local prefetch slots**, filled by `buffer.prefetch_weight`; the planner points duplicated experts' token segments at these slots via `cu_seqlens`. Their physical memory comes from a process-global pool shared by all layers, so the extra cost is `B` expert weights per projection in total, not per layer.
+- **Communication view `[R, epn, H, H']`**: all ranks' prefetch pools mapped directly for `buffer.prefetch_weight`.
+- **Compute view `[2*epn, H, H']`**: rows `[0, epn)` alias this rank's local parameter weights; rows `[epn, 2*epn)` alias this rank's prefetch slice. The VM group GEMM and `cu_seqlens` use this compact row order without mapping the other ranks' parameter weights.
 
-**How to set B.**
+Each rank's prefetch pool is process-global and shared by all layers, so the extra physical cost is `epn` expert weights per projection in total, not per layer.
 
-- **Training**: must use **`B = E/R`** — the planner duplicates experts from at most one remote home group per rank (≤ `E/R` experts), so every expert the group GEMM touches is local.
-- **Inference** (prefetch only, no gradients): `B < E/R` is allowed, **`B = 3–4` is recommended**. If a rank ever needs more distinct remote experts than `B`, the group GEMM reads the overflow weights straight from the home rank through the symmetric mapping (memory semantics, addressed by `cu_seqlens`) — slightly slower, with no impact on correctness.
+Each rank has `epn` prefetch slots. The planner moves experts from at most one remote home group to each destination rank, so these slots cover every remote expert segment.
 
 #### Gradient buffers (training only)
 
 <img src="figure/grad_buffer.png" alt="MoonEP grad buffer and grad reduce" width="1000">
 
-Training mirrors the weight layout in fp32: one contiguous `[E+B, H, H']` **grad buffer** per projection.
+Training mirrors the compact weight layout in fp32:
 
-- **Rows `[0, E)`**: the owner ranks' parameter grads.
-- **Rows `[E, E+B)`**: prefetch-slot grads, backed by a **separate reduce buffer, not by the parameter grads** — duplicated experts' grads are temporary and must stay invisible to the framework's own grad reduce. The physical memory comes from a process-global pool shared across layers, like the prefetch pool.
-- **Reduce buffer**: every rank maps all `R` reduce buffers as one `[R, B, H, H']` view. `reduce_grad` lets each rank read the slots holding its own experts' grads from every rank's reduce buffer (remote reads over NVLink), accumulate them into its local parameter grad, then zero its own consumed slots for the next microbatch.
+- **Local grad `[epn, H, H']`**: this rank's parameter grads.
+- **Compute grad view `[2*epn, H, H']`**: the local grad followed by this rank's reduce-buffer slice. The tail contains temporary prefetch-slot grads and stays separate from the framework's own parameter-grad reduction.
+- **Reduce buffer**: every rank maps all `R` reduce buffers as one `[R, epn, H, H']` view. `reduce_grad` lets each rank read the slots holding its own experts' grads from every rank's reduce buffer (remote reads over NVLink), accumulate them into its local parameter grad, then zero its own consumed slots for the next microbatch.
 
 ### API walkthrough
 
@@ -77,8 +76,9 @@ buffer = Buffer(S=4096, H=7168, K=8, E=256, num_ep_ranks=8,
                 num_sms=32, token_padding=128)
 ```
 
-- `num_sms=None` defaults to 32. `B` defaults to `E // num_ep_ranks`; an explicit value like `B=4` may also be passed.
+- `num_sms=None` defaults to 32. The current implementation derives `epn = E // num_ep_ranks` internally.
 - `dispatch` / `combine` / `prefetch_weight` / `reduce_grad` all accept `async_finish=True` to run on the comm stream and return a CUDA event.
+- `combine` defaults to `inter_rank_sync=True`, which runs an explicit rank sync before staging. Pass `inter_rank_sync=False` to skip this pre-staging sync; the combine kernel still performs its own entry cross-rank barrier.
 
 #### dispatch fwd
 
@@ -91,16 +91,20 @@ hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
 )
 # hidden_nvsh:       [NvS, H] bf16 — dispatched tokens in physical VM group order
 # route_weights_nvs: [NvS] fp32
-# cu_seqlens:        [E+B] int32 — padded token end offset per VM group row
+# cu_seqlens:        [2*epn] int32 — padded token end offset per VM group row
 # plan:              MoonEPCommPlan — save it for prefetch/combine and both backward passes
 
 buffer.prefetch_weight(
     plan=plan,
-    full_gate_weight=full_gate_weight,    # [E+B, H, H'] bf16
-    full_up_weight=full_up_weight,        # [E+B, H, H'] bf16
-    full_down_weight=full_down_weight,    # [E+B, H, H'] bf16
+    local_gate_weight=local_gate_weight,        # [epn, H, H'] bf16
+    local_up_weight=local_up_weight,            # [epn, H, H'] bf16
+    local_down_weight=local_down_weight,        # [epn, H, H'] bf16
+    gate_prefetch_buffer=gate_prefetch_buffer,  # [R, epn, H, H'] bf16
+    up_prefetch_buffer=up_prefetch_buffer,      # [R, epn, H, H'] bf16
+    down_prefetch_buffer=down_prefetch_buffer,  # [R, epn, H, H'] bf16
 )
-# full_*_weight: rows [0, E) are source expert weights, rows [E, E+B) are prefetch slots
+# The framework's GEMM view aliases local_*_weight followed by this rank's
+# *_prefetch_buffer slice as [2*epn, H, H'].
 ```
 
 #### dispatch bwd
@@ -116,15 +120,15 @@ grad_hidden_sh, _, _ = buffer.combine(
 
 buffer.reduce_grad(
     plan=plan,
-    full_gate_grad=full_gate_grad,          # [E+B, H, H'] fp32
-    full_up_grad=full_up_grad,              # [E+B, H, H'] fp32
-    full_down_grad=full_down_grad,          # [E+B, H, H'] fp32
-    gate_reduce_buffer=gate_reduce_buffer,  # [R, B, H, H'] fp32
-    up_reduce_buffer=up_reduce_buffer,      # [R, B, H, H'] fp32
-    down_reduce_buffer=down_reduce_buffer,  # [R, B, H, H'] fp32
+    local_gate_grad=local_gate_grad,          # [epn, H, H'] fp32
+    local_up_grad=local_up_grad,              # [epn, H, H'] fp32
+    local_down_grad=local_down_grad,          # [epn, H, H'] fp32
+    gate_reduce_buffer=gate_reduce_buffer,  # [R, epn, H, H'] fp32
+    up_reduce_buffer=up_reduce_buffer,      # [R, epn, H, H'] fp32
+    down_reduce_buffer=down_reduce_buffer,  # [R, epn, H, H'] fp32
 )
-# full_*_grad: same [E+B] layout as the weights; rows [E, E+B) are backed by the reduce buffer
-# *_reduce_buffer: all R ranks' reduce buffers mapped as one [R, B, H, H'] view
+# The framework's GEMM grad view aliases local_*_grad followed by this rank's
+# *_reduce_buffer slice as [2*epn, H, H'].
 ```
 
 #### combine fwd

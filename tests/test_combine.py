@@ -55,7 +55,7 @@ COMBINE_CASES = [
 ]
 
 GLOBAL_REF_CASES = [
-    KernelCase("global_balanced", S=64, K=4, epn=8, H=128, num_sms=8, B=2),
+    KernelCase("global_balanced", S=64, K=4, epn=8, H=128, num_sms=8),
     KernelCase(
         "global_all_remote",
         S=64,
@@ -63,7 +63,6 @@ GLOBAL_REF_CASES = [
         epn=8,
         H=128,
         num_sms=8,
-        B=2,
         routing="all_remote",
         min_R=2,
     ),
@@ -77,7 +76,6 @@ LARGE_COMBINE_CASES = [
         epn=14,
         H=7168,
         num_sms=32,
-        B=4,
     )
 ]
 
@@ -101,7 +99,9 @@ def _dispatch_inputs(ctx, case, rank, R, seed=0):
     launch_planning(ctx, topk.reshape(-1).contiguous(), tpe, cu_seqlens, plan)
     dst = plan.dst
     experts_to_copy = plan.experts_to_copy
-    expert_ids = _expert_ids_from_experts_to_copy(ctx, cu_seqlens, experts_to_copy[rank])
+    expert_ids = _expert_ids_from_experts_to_copy(
+        ctx, rank, cu_seqlens, experts_to_copy[rank]
+    )
     launch_dispatch(ctx, hidden, weights, plan, build_dedup_map=True)
     launch_dispatch_epilogue(ctx, plan)
     hidden_user = torch.empty_like(ctx["hidden_buf_local"])
@@ -139,18 +139,21 @@ def _combine_full(ctx, case, plan, hidden_user, weights_user=None):
     return output, output_sk
 
 
-def _expert_ids_from_experts_to_copy(ctx, cu_seqlens, experts_to_copy_row):
+def _expert_ids_from_experts_to_copy(
+    ctx, rank, cu_seqlens, experts_to_copy_row
+):
     E = int(ctx["E"])
-    B = int(ctx["B"])
-    expert_ids = torch.full((E + B,), -1, dtype=torch.int32, device=cu_seqlens.device)
+    R = int(ctx["R"])
+    epn = E // R
+    expert_ids = torch.full((2 * epn,), -1, dtype=torch.int32, device=cu_seqlens.device)
     prev = 0
-    for group_id in range(E + B):
+    for group_id in range(2 * epn):
         cur = int(cu_seqlens[group_id].item())
         if cur > prev:
-            if group_id < E:
-                expert_ids[group_id] = group_id
+            if group_id < epn:
+                expert_ids[group_id] = rank * epn + group_id
             else:
-                expert_ids[group_id] = experts_to_copy_row[group_id - E]
+                expert_ids[group_id] = experts_to_copy_row[group_id - epn]
         prev = cur
     return expert_ids
 
@@ -192,7 +195,7 @@ def _combine_global_reference(ctx, case, rank, R, hidden, dst, cu_seqlens,
 
     for dest_r in range(R):
         expert_ids = _expert_ids_from_experts_to_copy(
-            ctx, all_cu[dest_r], experts_to_copy[dest_r]
+            ctx, dest_r, all_cu[dest_r], experts_to_copy[dest_r]
         )
         expert_fn(global_buf[dest_r], all_cu[dest_r], expert_ids)
 
@@ -253,7 +256,7 @@ def test_combine_matches_global_reference(dist_env, case, expert_name, expert_fn
 
 def test_combine_output_sk_gathers_route_weights(dist_env):
     rank, R = dist_env
-    case = KernelCase("output_sk", S=128, K=4, epn=8, H=128, num_sms=8, B=2)
+    case = KernelCase("output_sk", S=128, K=4, epn=8, H=128, num_sms=8)
     ctx = init_case(case, R)
     hidden, weights, _dst, _cu, _expert_ids, plan, hidden_user, _weights_user = _dispatch_inputs(
         ctx, case, rank, R, seed=100
@@ -275,7 +278,7 @@ def test_combine_output_sk_gathers_route_weights(dist_env):
 
 def test_buffer_combine_stages_external_buffers_and_gathers_weights(dist_env):
     rank, R = dist_env
-    case = KernelCase("public_staging", S=128, K=4, epn=8, H=128, num_sms=8, B=2)
+    case = KernelCase("public_staging", S=128, K=4, epn=8, H=128, num_sms=8)
     ctx = init_case(case, R)
     buffer = ctx["_buffer"]
     _hidden, weights, _dst, _cu, _expert_ids, plan, hidden_user, weights_user = _dispatch_inputs(
@@ -302,7 +305,7 @@ def test_buffer_combine_stages_external_buffers_and_gathers_weights(dist_env):
 
 def test_buffer_combine_async_gathers_weights(dist_env):
     rank, R = dist_env
-    case = KernelCase("async_weights", S=128, K=4, epn=8, H=128, num_sms=8, B=2)
+    case = KernelCase("async_weights", S=128, K=4, epn=8, H=128, num_sms=8)
     ctx = init_case(case, R)
     buffer = ctx["_buffer"]
     _hidden, weights, _dst, _cu, _expert_ids, plan, hidden_user, weights_user = _dispatch_inputs(

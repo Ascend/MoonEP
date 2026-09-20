@@ -15,9 +15,8 @@ Everything shared across both libraries:
     iterations, cross-rank mean), warmup=20, iters=50
   - identical SM budget (32) and expert_alignment/token_padding (128)
 
-Reported ops (MoonEP runs the public Buffer API end-to-end; the [E+B]
-weight pools are assembled from per-rank chunks with nvl_dist_map since
-B == epn, so prefetch_weight issues real NVLink remote reads):
+Reported ops (MoonEP runs the public Buffer API end-to-end; local weights are
+[epn, H, H'] and the communication pools are [R, epn, H, H']):
   - plan: MoonEP launch_planning (exact, separate)  |  v2 layout is fused
           into dispatch_impl and cannot be timed in isolation; estimated as
           full-dispatch minus cached-dispatch (comes out ~= 0)
@@ -125,24 +124,9 @@ class MoonEPRunner:
 
     def __init__(self, group, R, S, K, E, H, num_sms, hp=2048):
         from moonep import Buffer
-        from moonep._C import (
-            FABRIC_HANDLE_BYTES as _FABRIC_HANDLE_BYTES,
-            nvl_dist_alloc, nvl_release_mem_handle,
-            nvl_dist_map, get_vmm_granularity
-        )
-        from moonep.buffer import (_all_gather_shareables, _exchange_ipc_fds,
-                                   _use_fabric_for_group)
+        from moonep.buffer import create_nvl_dist_tensor, pad_dim0_for_alignment
         from moonep.planning import allocate_planning_outputs, launch_planning
-        from moonep.inter_rank_sync import launch_inter_rank_sync
         self._launch_planning = launch_planning
-        self._launch_sync = launch_inter_rank_sync
-        self._use_fabric = _use_fabric_for_group(group)
-        self._alloc_chunk = lambda shape, dtype: nvl_dist_alloc(
-            shape=shape, dtype=dtype, use_fabric=self._use_fabric)
-        self._release = nvl_release_mem_handle
-        self._dist_map = nvl_dist_map
-        self._gather_shareables = _all_gather_shareables
-        self._exchange_fds = _exchange_ipc_fds
         self.num_sms = num_sms
         self.rank = dist.get_rank(group)
         self.R = R
@@ -151,70 +135,28 @@ class MoonEPRunner:
         self.ctx = self.buffer._require_ctx()
         self.plan_scratch, self.cu_seqlens = allocate_planning_outputs(self.ctx)
 
-        # --------------------------------------------------------------
-        # Training-framework [E+B] weight/grad tensors (public API inputs).
-        # B == epn,
-        # so the buffer chunk has the same shape as an expert chunk and
-        # nvl_dist_map is reused directly: the [epn, H, Hp] expert chunks of
-        # the R ranks (dense global pool, remote rows walk NVLink) plus this
-        # rank's own [epn] buffer chunk appended last, mapped with
-        # world_size=R+1, give [E+B, H, Hp].
-        # --------------------------------------------------------------
         self.epn = E // R
-        self.B = int(self.ctx['B'])
-        assert self.B == self.epn, (
-            f"composite [E+B] layout expects B == epn, got B={self.B}, "
-            f"epn={self.epn}")
         self.hp = hp
-        gran = get_vmm_granularity()
-        self._keepalives = []
+        assert pad_dim0_for_alignment(
+            [self.epn, H, hp], torch.bfloat16
+        ) == self.epn, "prefetch pool chunk must be VMM aligned"
 
-        def build_full(dtype: torch.dtype):
-            itemsize = 2 if dtype == torch.bfloat16 else 4
-            chunk_bytes = self.epn * H * hp * itemsize
-            assert chunk_bytes % gran == 0, (
-                f"chunk bytes {chunk_bytes} not VMM-aligned ({gran})")
-            # per-rank expert chunk (shared) + this rank's buffer chunk (local)
-            ka_w, w_sh, w_owned = self._alloc_chunk([self.epn, H, hp], dtype)
-            ka_b, b_sh, b_owned = self._alloc_chunk([self.B, H, hp], dtype)
-            for ka, owned in ((ka_w, w_owned), (ka_b, b_owned)):
-                self._keepalives.append(ka)
-                self._release(owned)
-            # exchange the expert chunk handles, then append this rank's own
-            # buffer chunk as the trailing (R+1)-th chunk
-            if self._use_fabric:
-                all_w = self._gather_shareables(w_sh, group)
-                full = self._dist_map(
-                    chunk_shape=[self.epn, H, hp], dtype=dtype,
-                    shareables=torch.cat(
-                        [all_w, b_sh.view(1, _FABRIC_HANDLE_BYTES)], dim=0),
-                    local_rank=self.rank, world_size=R + 1, use_fabric=True)
-            else:
-                w_fd, b_fd = int(w_sh.item()), int(b_sh.item())
-                fds = self._exchange_fds(w_fd, list(range(R)), self.rank, R,
-                                         group)
-                os.close(w_fd)
-                all_w_fds = [fds[r] for r in range(R)]
-                try:
-                    full = self._dist_map(
-                        chunk_shape=[self.epn, H, hp], dtype=dtype,
-                        shareables=torch.tensor(all_w_fds + [b_fd],
-                                                dtype=torch.int64),
-                        local_rank=self.rank, world_size=R + 1,
-                        use_fabric=False)
-                finally:
-                    for fd in all_w_fds:
-                        os.close(fd)
-                os.close(b_fd)
-            return full
-
-        # full_weight for the 3 projections (bf16). grad_reduce is not on the
+        # grad_reduce is not on the
         # MoE critical path (overlappable with subsequent compute) and is not
-        # included in this benchmark, so no full_grad / reduce_buffer is built.
-        self.full_weights = [build_full(torch.bfloat16) for _ in range(3)]
-        # fill: random weights
-        for fw in self.full_weights:
-            fw[self.rank * self.epn:(self.rank + 1) * self.epn].normal_()
+        # included in this benchmark.
+        self.local_weights = []
+        self.prefetch_buffers = []
+        for _ in range(3):
+            self.local_weights.append(
+                torch.randn(
+                    self.epn, H, hp, dtype=torch.bfloat16, device='cuda'
+                )
+            )
+            pool = create_nvl_dist_tensor(
+                [self.epn, H, hp], torch.bfloat16,
+                self.rank, R, group=group,
+            )
+            self.prefetch_buffers.append(pool.view(R, self.epn, H, hp))
         torch.cuda.synchronize()
         dist.barrier(group=group)
 
@@ -230,8 +172,17 @@ class MoonEPRunner:
         self._launch_planning(self.ctx, self._topk_flat, tpe,
                               self.cu_seqlens, self.plan_scratch)
         # Byte accounting from the plan's slot table (global expert ids).
-        etc_cpu = self.plan.experts_to_copy.cpu()   # [R, B] int32, -1 = idle
-        self.max_recv = int((etc_cpu >= 0).sum(dim=1).max().item())
+        etc_cpu = self.plan.experts_to_copy.cpu()   # [R, epn] int32, -1 = idle
+        valid = etc_cpu >= 0
+        self.max_recv = int(valid.sum(dim=1).max().item())
+        dst = torch.arange(self.R).view(self.R, 1).expand_as(etc_cpu)
+        owners = torch.div(
+            etc_cpu.clamp_min(0), self.epn, rounding_mode='floor'
+        )
+        remote = valid & (owners != dst)
+        self.max_send = int(
+            torch.bincount(owners[remote], minlength=self.R).max().item()
+        ) if bool(remote.any()) else 0
         self.shard_view = self.ctx['hidden_buf_local']
         self.weights_view = self.ctx['weights_buf_local'].view(torch.float32)
         torch.cuda.synchronize()
@@ -244,16 +195,15 @@ class MoonEPRunner:
     def _prefetch(self):
         self.buffer.prefetch_weight(
             plan=self.plan,
-            full_gate_weight=self.full_weights[0],
-            full_up_weight=self.full_weights[1],
-            full_down_weight=self.full_weights[2])
+            local_gate_weight=self.local_weights[0],
+            local_up_weight=self.local_weights[1],
+            local_down_weight=self.local_weights[2],
+            gate_prefetch_buffer=self.prefetch_buffers[0],
+            up_prefetch_buffer=self.prefetch_buffers[1],
+            down_prefetch_buffer=self.prefetch_buffers[2])
 
     def prefetch(self):
-        # prefetch_weight has no cross-rank sync of its own; pair it with a
-        # small sync kernel so timed iterations stay serialized across ranks
-        # (same as bench_comm).
         self._prefetch()
-        self._launch_sync(self.ctx)
 
     def dispatch_fwd(self):
         # full fwd (public API): inter_rank_sync + planning + dispatch +
@@ -453,7 +403,7 @@ def main():
                 # MoonEP: planning measured exactly and separately.
                 plan_us = time_op(runner.planning, group, args.warmup, args.iters)
                 pf = time_op(runner.prefetch, group, args.warmup, args.iters)
-                pf_gbps = (3 * runner.max_recv * H * runner.hp * 2
+                pf_gbps = (3 * runner.max_send * H * runner.hp * 2
                            / (pf * 1e-6) / 1e9) if pf > 0 else 0.0
             else:
                 # v2: layout is FUSED into dispatch_impl — the public API has
@@ -465,7 +415,9 @@ def main():
                 pf, pf_gbps = 0.0, 0.0
             rows.append(dict(lib=lib, ep=R, E=E, H=H, K=K, sigma=sigma,
                              target_maxvio=target, maxvio=maxvio,
-                             plan_us=plan_us, pf_us=pf,
+                             plan_us=plan_us, pf_us=pf, pf_gbps=pf_gbps,
+                             max_send=getattr(runner, 'max_send', 0),
+                             max_recv=getattr(runner, 'max_recv', 0),
                              d_f_us=d_f, d_b_us=d_b, c_f_us=c_f, c_b_us=c_b,
                              d_f_gbps=gbps(S, K, H, d_f),
                              d_b_gbps=gbps(S, K, H, d_b),

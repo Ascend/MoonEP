@@ -21,45 +21,45 @@ from moonep.grad_reduce import launch_grad_reduce
 EXP_H = 3584
 EXP_HP = 3072
 
-# All cases: rank0-initiated, num_sms == 32. Each local expert is reduced
+# All ranks launch collectively with rank0 as the busiest owner. Each local
+# expert is reduced
 # a *different* number of times in 0..3 (R-1=3 is the max), via `counts[e]`.
-# 0 means that expert is skipped. base_B > epn leaves idle columns so the
-# slot layout is sparse. Default shape is 3584x3072; later cases vary the
-# expert shape, epn and slot-column density.
+# 0 means that expert is skipped. Default shape is 3584x3072; later cases vary
+# the expert shape and epn.
 NUM_SMS = 32
 DEFAULT_CASES = [
     # small-slot cases: only a few experts reduced at all.
-    {"label": "slots_1",  "epn": 8, "H": EXP_H, "Hp": EXP_HP, "base_B": 14,
+    {"label": "slots_1",  "epn": 8, "H": EXP_H, "Hp": EXP_HP,
      "counts": [1, 0, 0, 0, 0, 0, 0, 0]},
-    {"label": "slots_2",  "epn": 8, "H": EXP_H, "Hp": EXP_HP, "base_B": 14,
+    {"label": "slots_2",  "epn": 8, "H": EXP_H, "Hp": EXP_HP,
      "counts": [1, 1, 0, 0, 0, 0, 0, 0]},
-    {"label": "slots_3",  "epn": 8, "H": EXP_H, "Hp": EXP_HP, "base_B": 14,
+    {"label": "slots_3",  "epn": 8, "H": EXP_H, "Hp": EXP_HP,
      "counts": [2, 1, 0, 0, 0, 0, 0, 0]},
-    {"label": "slots_5",  "epn": 8, "H": EXP_H, "Hp": EXP_HP, "base_B": 14,
+    {"label": "slots_5",  "epn": 8, "H": EXP_H, "Hp": EXP_HP,
      "counts": [3, 2, 0, 0, 0, 0, 0, 0]},
-    {"label": "ramp_0_3", "epn": 8, "H": EXP_H, "Hp": EXP_HP, "base_B": 14,
+    {"label": "ramp_0_3", "epn": 8, "H": EXP_H, "Hp": EXP_HP,
      "counts": [0, 1, 2, 3, 0, 1, 2, 3]},
-    {"label": "mixed",    "epn": 8, "H": EXP_H, "Hp": EXP_HP, "base_B": 14,
+    {"label": "mixed",    "epn": 8, "H": EXP_H, "Hp": EXP_HP,
      "counts": [3, 0, 2, 1, 3, 0, 2, 1]},
-    {"label": "heavy",    "epn": 8, "H": EXP_H, "Hp": EXP_HP, "base_B": 14,
+    {"label": "heavy",    "epn": 8, "H": EXP_H, "Hp": EXP_HP,
      "counts": [3, 3, 2, 3, 1, 0, 2, 3]},
     # saturated: every expert contributed by every remote rank (24 slots).
-    {"label": "full_3x8", "epn": 8, "H": EXP_H, "Hp": EXP_HP, "base_B": 14,
+    {"label": "full_3x8", "epn": 8, "H": EXP_H, "Hp": EXP_HP,
      "counts": [3, 3, 3, 3, 3, 3, 3, 3]},
-    # dense slot columns: base_B == epn, no idle columns.
-    {"label": "dense_B8", "epn": 8, "H": EXP_H, "Hp": EXP_HP, "base_B": 8,
+    # dense slot columns: every slot is active.
+    {"label": "dense_epn8", "epn": 8, "H": EXP_H, "Hp": EXP_HP,
      "counts": [2, 1, 3, 1, 2, 3, 1, 2]},
     # fewer / more experts per rank at the same shape.
-    {"label": "epn4_full",  "epn": 4, "H": EXP_H, "Hp": EXP_HP, "base_B": 14,
+    {"label": "epn4_full",  "epn": 4, "H": EXP_H, "Hp": EXP_HP,
      "counts": [3, 3, 3, 3]},
-    {"label": "epn16_mixed", "epn": 16, "H": EXP_H, "Hp": EXP_HP, "base_B": 16,
+    {"label": "epn16_mixed", "epn": 16, "H": EXP_H, "Hp": EXP_HP,
      "counts": [3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0, 3, 2, 1, 0]},
     # different expert shapes (same mixed/heavy count patterns).
-    {"label": "thin_7168x128", "epn": 8, "H": 7168, "Hp": 128, "base_B": 14,
+    {"label": "thin_7168x128", "epn": 8, "H": 7168, "Hp": 128,
      "counts": [3, 0, 2, 1, 3, 0, 2, 1]},
-    {"label": "tall_1024x3072", "epn": 8, "H": 1024, "Hp": 3072, "base_B": 14,
+    {"label": "tall_1024x3072", "epn": 8, "H": 1024, "Hp": 3072,
      "counts": [3, 0, 2, 1, 3, 0, 2, 1]},
-    {"label": "tiny_512x512", "epn": 8, "H": 512, "Hp": 512, "base_B": 14,
+    {"label": "tiny_512x512", "epn": 8, "H": 512, "Hp": 512,
      "counts": [3, 3, 2, 3, 1, 0, 2, 3]},
 ]
 
@@ -71,14 +71,14 @@ def setup():
     return rank, dist.get_world_size()
 
 
-def expert_plan(R, B, epn, counts, dev):
+def expert_plan(R, epn, counts, dev):
     """rank0 owns experts 0..epn-1; expert e is reduced ``counts[e]`` times.
 
     For expert e the contributing remote ranks are 1..counts[e], each placing
     its grad in slot column e. All other slots stay idle (-1). counts[e] must
-    be < R (only R-1 remote ranks exist). epn <= B so column e exists.
+    be < R (only R-1 remote ranks exist).
     """
-    plan = torch.full((R, B), -1, dtype=torch.int32, device=dev)
+    plan = torch.full((R, epn), -1, dtype=torch.int32, device=dev)
     for e in range(epn):
         for src_rank in range(1, counts[e] + 1):
             plan[src_rank, e] = e  # owner rank0, local expert e
@@ -91,7 +91,6 @@ def bench_case(case, args, rank, R):
     E = R * epn
     H = int(case["H"])
     Hp = int(case["Hp"])
-    B = pad_dim0_for_alignment([int(case["base_B"]), H, Hp], torch.float32)
     counts = case.get("counts") or [int(case.get("nremote", 1))] * epn
     num_sms = NUM_SMS
 
@@ -99,26 +98,32 @@ def bench_case(case, args, rank, R):
         f"{case['label']}: H and Hp must be multiples of 128"
     assert len(counts) == epn, f"{case['label']}: counts must have epn={epn} entries"
     assert all(0 <= c < R for c in counts), f"{case['label']}: each count must be in [0, R)"
+    assert pad_dim0_for_alignment([epn, H, Hp], torch.float32) == epn, \
+        f"{case['label']}: fixed-epn VMM chunk must be aligned"
 
-    reduce_full = create_nvl_dist_tensor([B, H, Hp], torch.float32, rank, R)
-    reduce_buffers = reduce_full.view(R, B, H, Hp)
-    experts_to_copy = expert_plan(R, B, epn, counts, dev)
+    reduce_full = create_nvl_dist_tensor([epn, H, Hp], torch.float32, rank, R)
+    reduce_buffers = reduce_full.view(R, epn, H, Hp)
+    experts_to_copy = expert_plan(R, epn, counts, dev)
 
     # grad_reduce needs the cross-rank barrier slots from Buffer.
-    buffer = Buffer(S=128, H=H, K=1, E=E, num_ep_ranks=R, num_sms=num_sms, B=B)
+    buffer = Buffer(
+        S=128, H=H, K=1, E=E, num_ep_ranks=R,
+        num_sms=num_sms,
+    )
     ctx = buffer._require_ctx()
 
     gen = torch.Generator(device=dev).manual_seed(321 + rank)
-    remote_expert_grads = torch.randn(
-        E, H, Hp, dtype=torch.float32, device=dev, generator=gen
+    local_expert_grads = torch.randn(
+        epn, H, Hp, dtype=torch.float32, device=dev, generator=gen
     )
-    reduce_buffers[rank].copy_(torch.randn_like(reduce_buffers[rank]))
+    local_slots = torch.randn_like(reduce_buffers[rank])
+    reduce_buffers[rank].copy_(local_slots)
     torch.cuda.synchronize()
     dist.barrier(device_ids=[torch.cuda.current_device()])
 
     def reduce_once():
         launch_grad_reduce(
-            remote_expert_grads,
+            local_expert_grads,
             reduce_buffers,
             experts_to_copy,
             rank=rank,
@@ -146,6 +151,10 @@ def bench_case(case, args, rank, R):
                 reduce_once()
         torch.cuda.synchronize()
         dist.barrier(device_ids=[torch.cuda.current_device()])
+
+    reduce_buffers[rank].copy_(local_slots)
+    torch.cuda.synchronize()
+    dist.barrier(device_ids=[torch.cuda.current_device()])
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -177,11 +186,11 @@ def bench_case(case, args, rank, R):
 
     dist.barrier(device_ids=[torch.cuda.current_device()])
     buffer.destroy()
-    return worst_us, bytes_per_rank / 1e6, bw_gbs, comm_gbs, E, B, slots
+    return worst_us, bytes_per_rank / 1e6, bw_gbs, comm_gbs, E, slots
 
 
 def explicit_single_config_requested(argv):
-    shape_flags = ("--epn", "--H", "--Hp", "--B", "--nremote")
+    shape_flags = ("--epn", "--H", "--Hp", "--nremote")
     for arg in argv:
         for flag in shape_flags:
             if arg == flag or arg.startswith(flag + "="):
@@ -194,11 +203,10 @@ def parse_args():
     parser.add_argument("--suite", action="store_true",
                         help="Run the default multi-case benchmark suite")
     parser.add_argument("--single", action="store_true",
-                        help="Run exactly the config described by --epn/--H/--Hp/--B/--nremote")
+                        help="Run exactly the config described by --epn/--H/--Hp/--nremote")
     parser.add_argument("--epn", type=int, default=8)
     parser.add_argument("--H", type=int, default=3584)
     parser.add_argument("--Hp", type=int, default=3072)
-    parser.add_argument("--B", type=int, default=14)
     parser.add_argument("--nremote", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
@@ -224,7 +232,6 @@ def main():
             "epn": args.epn,
             "H": args.H,
             "Hp": args.Hp,
-            "base_B": args.B,
             "nremote": args.nremote,
         }]
     else:
@@ -236,16 +243,18 @@ def main():
             f"iters={args.iters})"
         )
         print(
-            f"{'Config':<20} {'E':>5} {'B':>4} {'H':>7} {'Hp':>6} "
+            f"{'Config':<20} {'E':>5} {'epn':>4} {'H':>7} {'Hp':>6} "
             f"{'SMs':>5} {'Slots':>6} {'Data(MB)':>10} {'Worst(us)':>10} {'BW(GB/s)':>9} {'CommBW':>8}"
         )
-        print("-" * 101)
+        print("-" * 97)
 
     for case in cases:
-        worst_us, mb, bw_gbs, comm_gbs, E, B, slots = bench_case(case, args, rank, R)
+        worst_us, mb, bw_gbs, comm_gbs, E, slots = bench_case(
+            case, args, rank, R
+        )
         if rank == 0:
             print(
-                f"{case['label']:<20} {E:>5} {B:>4} "
+                f"{case['label']:<20} {E:>5} {case['epn']:>4} "
                 f"{case['H']:>7} {case['Hp']:>6} {NUM_SMS:>5} {slots:>6} "
                 f"{mb:>10.2f} {worst_us:>10.2f} {bw_gbs:>9.2f} {comm_gbs:>8.2f}"
             )

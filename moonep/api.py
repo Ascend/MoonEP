@@ -2,9 +2,9 @@
 MoonEP Top-level API.
 
 Notation: S = input tokens per rank, K = routed top-k per token, E = total routed
-experts in the EP group, R = number of EP ranks (EP comm size), B = weight
-prefetch slots per rank, NvS = dispatched token slots per rank (S*K real
-tokens plus per-VM-group padding), H = hidden size, H' = expert FFN
+experts in the EP group, R = number of EP ranks (EP comm size), epn = E/R local
+experts and prefetch slots per rank, NvS = dispatched token slots per rank (S*K
+real tokens plus per-VM-group padding), H = hidden size, H' = expert FFN
 intermediate size.
 
 Usage:
@@ -16,9 +16,12 @@ Usage:
     )
     buffer.prefetch_weight(
         plan=plan,
-        full_gate_weight=full_gate_weight,
-        full_up_weight=full_up_weight,
-        full_down_weight=full_down_weight,
+        local_gate_weight=local_gate_weight,
+        local_up_weight=local_up_weight,
+        local_down_weight=local_down_weight,
+        gate_prefetch_buffer=gate_prefetch_buffer,
+        up_prefetch_buffer=up_prefetch_buffer,
+        down_prefetch_buffer=down_prefetch_buffer,
     )
 
     # combine fwd
@@ -36,9 +39,9 @@ Usage:
     grad_hidden_sh, _, _ = buffer.combine(plan=plan, hidden_nvsh=grad_hidden_nvsh)
     buffer.reduce_grad(
         plan=plan,
-        full_gate_grad=full_gate_grad,
-        full_up_grad=full_up_grad,
-        full_down_grad=full_down_grad,
+        local_gate_grad=local_gate_grad,
+        local_up_grad=local_up_grad,
+        local_down_grad=local_down_grad,
         gate_reduce_buffer=gate_reduce_buffer,
         up_reduce_buffer=up_reduce_buffer,
         down_reduce_buffer=down_reduce_buffer,
@@ -68,7 +71,7 @@ from .dispatch import launch_dispatch
 from .dispatch_epilogue import launch_dispatch_epilogue
 from .combine import launch_combine
 from .combine_prologue import launch_combine_prologue
-from .prefetch import _ELEM_TYPES, launch_prefetch, retile_for_prefetch
+from .prefetch import _ELEM_TYPES, launch_prefetch
 from .grad_reduce import launch_grad_reduce
 
 logger = logging.getLogger(__name__)
@@ -77,6 +80,21 @@ logger = logging.getLogger(__name__)
 def _align_up(x: int, alignment: int) -> int:
     """Round x up to a multiple of alignment."""
     return ((x + alignment - 1) // alignment) * alignment
+
+
+def _validate_rank_strided_pool(pool: torch.Tensor) -> int:
+    """Validate a CUDA pool with contiguous rank payloads and optional gaps."""
+    assert pool.is_cuda and pool.ndim >= 2 and pool.shape[0] > 0
+    assert pool[0].is_contiguous(), "pools must be contiguous within each rank"
+    rank_numel = pool[0].numel()
+    rank_stride = int(pool.stride(0))
+    assert rank_numel > 0 and rank_stride >= rank_numel, "rank payloads must not overlap"
+    stride_bytes = rank_stride * pool.element_size()
+    assert stride_bytes % 16 == 0 and 0 < stride_bytes < (1 << 40)
+    assert pool.data_ptr() % 16 == 0, "pools must be 16-byte aligned"
+    end = pool.storage_offset() + (pool.shape[0] - 1) * rank_stride + rank_numel
+    assert end * pool.element_size() <= pool.untyped_storage().nbytes()
+    return rank_stride
 
 
 def _num_sms_dedup_from_env(max_sms: int) -> int:
@@ -155,59 +173,19 @@ def _log_context_buffer_size(ctx: dict) -> None:
     logger.info("\n".join(log_lines))
 
 
-def _launch_full_weight_prefetches(
-    ctx,
-    full_gate_weight: torch.Tensor,
-    full_up_weight: torch.Tensor,
-    full_down_weight: torch.Tensor,
-    experts_to_copy: torch.Tensor,
-    scales: tuple[torch.Tensor, ...] | None = None,
-) -> None:
-    E = int(ctx['E'])
-    num_sms = int(ctx['num_sms'])
-    for full_weight in (full_gate_weight, full_up_weight, full_down_weight):
-        launch_prefetch(
-            full_weight[:E],
-            full_weight[E:],
-            experts_to_copy,
-            num_sms=num_sms,
-        )
-    for full_scale in scales or ():
-        tiled = retile_for_prefetch(full_scale)
-        launch_prefetch(
-            tiled[:E],
-            tiled[E:],
-            experts_to_copy,
-            num_sms=num_sms,
-        )
-
-
-def _launch_full_grad_reduces(
+def _launch_grad_reduces(
     ctx,
     experts_to_copy: torch.Tensor,
-    full_gate_grad: torch.Tensor,
-    full_up_grad: torch.Tensor,
-    full_down_grad: torch.Tensor,
-    gate_reduce_buffer: torch.Tensor,
-    up_reduce_buffer: torch.Tensor,
-    down_reduce_buffer: torch.Tensor,
+    local_grads: tuple[torch.Tensor, ...],
+    reduce_buffers: tuple[torch.Tensor, ...],
 ) -> None:
-    E = int(ctx['E'])
-    B = int(ctx['B'])
     rank = int(ctx['rank'])
     num_sms = int(ctx['num_sms'])
-    for name, full_grad, reduce_buffer in (
-        ("gate", full_gate_grad, gate_reduce_buffer),
-        ("up", full_up_grad, up_reduce_buffer),
-        ("down", full_down_grad, down_reduce_buffer),
+    for local_grad, reduce_buffer in zip(
+        local_grads, reduce_buffers, strict=True,
     ):
-        assert full_grad is not None, f"full_{name}_grad is required"
-        assert full_grad.dtype == torch.float32 and full_grad.is_contiguous(), \
-            f"full_{name}_grad must be contiguous fp32 [E+B, H, H']"
-        assert full_grad.ndim == 3 and int(full_grad.shape[0]) == E + B, \
-            f"full_{name}_grad first dim must be E+B"
         launch_grad_reduce(
-            full_grad[:E],
+            local_grad,
             reduce_buffer,
             experts_to_copy,
             rank=rank,
@@ -227,14 +205,14 @@ def _create_context(
     num_ep_ranks: int,
     num_sms: int | None = None,
     token_padding: int = 128,
-    B: int | None = None,
     group: "dist.ProcessGroup | None" = None,
 ) -> dict:
     """Pre-allocate all NVLink shared buffers and local temp buffers.
 
-    The extra logical NvS slots from token_padding are allocated as
-    (token_padding - 1) * 2 * E / num_ep_ranks; the physical allocation is
-    still aligned to VMM granularity.
+    The extra logical NvS slots from token_padding are bounded by
+    (token_padding - 1) * 2 * E / num_ep_ranks. The logical capacity is then
+    rounded up to token_padding, while the physical allocation is separately
+    aligned to VMM granularity.
     NVLink shared buffer layout:
       - hidden_buf: [NvS_padded, H] bf16 — separate allocation, padded for VMM alignment
       - meta_buf:   [meta_chunk_padded] int32 — merged allocation containing:
@@ -270,9 +248,6 @@ def _create_context(
     assert E % R == 0, f"E ({E}) must be divisible by R ({R})"
     assert isinstance(token_padding, int) and token_padding > 0, \
         f"token_padding must be a positive int, got {token_padding}"
-    if B is None:
-        B = epn
-    assert isinstance(B, int) and B > 0, f"B must be a positive int, got {B}"
 
     NvS_capacity = S * K
 
@@ -281,11 +256,14 @@ def _create_context(
     # experts, so each rank has at most E/R remote expert segments, plus at
     # most E/R local expert segments. Each non-empty segment is padded up
     # from at least 1 real token slot to a multiple of token_padding, so the
-    # extra logical NvS slot bound is (token_padding - 1) * 2 * E/R. The
-    # physical allocation below is still aligned to VMM granularity via
-    # pad_dim0_for_alignment() / pad_to_granularity().
+    # extra logical NvS slot bound is (token_padding - 1) * 2 * E/R.
+    # This tight bound is not necessarily a multiple of token_padding.
+    # Dispatch returns the full logical [NvS, H] view. Aligning NvS to
+    # token_padding lets callers launch tiled operators with fixed shapes
+    # without reading GPU-side cu_seqlens or dynamically padding the output.
+    # The physical allocation is aligned separately to VMM granularity below.
     token_padding_extra = (token_padding - 1) * 2 * epn
-    NvS = NvS_capacity + token_padding_extra
+    NvS = _align_up(NvS_capacity + token_padding_extra, token_padding)
 
     # ================================================================
     # Planning constexpr computation and int32 range guards
@@ -314,9 +292,9 @@ def _create_context(
     )
     planning_out_elems = (
         broadcast_elems
-        + R * (E + B)
-        + 2 * R * (E + B)
-        + B * R
+        + R * (2 * epn)
+        + 2 * R * (2 * epn)
+        + epn * R
         + 2 * R
     )
 
@@ -395,7 +373,6 @@ def _create_context(
         'rank': rank,
         'group': group,
         'R': R, 'E': E, 'S': S, 'K': K, 'H': H,
-        'B': B,
         'N': N, 'NvS': NvS,
         'NvS_capacity': NvS_capacity,
         'NvS_padded': NvS_padded,
@@ -454,7 +431,6 @@ class Buffer:
         num_ep_ranks: int,
         num_sms: int | None = None,
         token_padding: int = 128,
-        B: int | None = None,
         group: "dist.ProcessGroup | None" = None,
         comm_stream_priority: int = -1,
         enable_pdl: bool = True,
@@ -472,8 +448,6 @@ class Buffer:
             num_sms: SM count for the comm kernels; None defaults to 32.
             token_padding: each non-empty VM group is padded up to a multiple
                 of this token count.
-            B: weight prefetch slots per rank; None defaults to
-                ``E // num_ep_ranks``.
             group: torch.distributed process group; None uses the default
                 group. Must be called after ``init_process_group``.
             comm_stream_priority: priority of the async comm stream; the
@@ -499,7 +473,6 @@ class Buffer:
             S, H, K, E, num_ep_ranks,
             num_sms=num_sms,
             token_padding=token_padding,
-            B=B,
             group=group,
         )
         self._comm_stream = torch.cuda.Stream(
@@ -701,7 +674,7 @@ class Buffer:
         experts_to_copy: torch.Tensor,
         grad_reduce_args,
     ) -> None:
-        _launch_full_grad_reduces(ctx, experts_to_copy, *grad_reduce_args)
+        _launch_grad_reduces(ctx, experts_to_copy, *grad_reduce_args)
 
     def _run_prefetch_weight_on_current_stream(
         self,
@@ -710,11 +683,16 @@ class Buffer:
         weight_prefetch_args,
         scale_prefetch_args=None,
     ) -> None:
-        _launch_full_weight_prefetches(
-            ctx,
+        launch_prefetch(
             *weight_prefetch_args,
-            experts_to_copy[int(ctx['rank'])],
+            experts_to_copy,
             scales=scale_prefetch_args,
+            rank=int(ctx['rank']),
+            num_sms=int(ctx['num_sms']),
+            meta_buf=ctx['meta_buf'],
+            meta_stride=int(ctx['meta_chunk_padded']),
+            barrier_off=int(ctx['BARRIER_OFF']),
+            grid_sync_bar=ctx['grid_sync_bar'],
         )
 
     def dispatch(
@@ -774,8 +752,8 @@ class Buffer:
               group order.
             - route_weights_nvs: [NvS] fp32, or None when ``route_weights_sk``
               is None.
-            - cu_seqlens: [E+B] int32 padded token end offset per VM group
-              row; None on the plan-reuse path.
+            - cu_seqlens: [2*epn] int32 padded token end offset per VM group
+              row, where epn=E/R; None on the plan-reuse path.
             - plan: MoonEPCommPlan; save it for prefetch/combine and both
               backward passes.
         """
@@ -862,28 +840,38 @@ class Buffer:
         plan: MoonEPCommPlan | None = None,
         async_finish: bool = False,
         *,
-        full_gate_weight: torch.Tensor | None = None,
-        full_up_weight: torch.Tensor | None = None,
-        full_down_weight: torch.Tensor | None = None,
-        full_gate_scale: torch.Tensor | None = None,
-        full_up_scale: torch.Tensor | None = None,
-        full_down_scale: torch.Tensor | None = None,
+        local_gate_weight: torch.Tensor | None = None,
+        local_up_weight: torch.Tensor | None = None,
+        local_down_weight: torch.Tensor | None = None,
+        gate_prefetch_buffer: torch.Tensor | None = None,
+        up_prefetch_buffer: torch.Tensor | None = None,
+        down_prefetch_buffer: torch.Tensor | None = None,
+        local_gate_scale: torch.Tensor | None = None,
+        local_up_scale: torch.Tensor | None = None,
+        local_down_scale: torch.Tensor | None = None,
+        gate_scale_prefetch_buffer: torch.Tensor | None = None,
+        up_scale_prefetch_buffer: torch.Tensor | None = None,
+        down_scale_prefetch_buffer: torch.Tensor | None = None,
     ):
-        """Prefetch the remote expert weights selected by ``plan`` into the
-        local prefetch slots (dispatch fwd, weight side).
+        """Push local expert weights selected by ``plan`` into all ranks'
+        prefetch slots (dispatch fwd, weight side).
 
         Args:
             plan: MoonEPCommPlan returned by ``dispatch``.
             async_finish: run on the comm stream and return a CUDA event.
-            full_gate_weight / full_up_weight / full_down_weight:
-                [E+B, H, H'] contiguous weight tensors; rows [0, E) are source
-                expert weights, rows [E, E+B) are the prefetch slots filled by
-                this call. bf16 for unquantized experts, uint8 for MXFP4 (e2m1
-                packs two values per byte, so H' is K/2).
-            full_gate_scale / full_up_scale / full_down_scale:
-                optional [E+B, ...] contiguous block-scale tensors, same row
-                convention. Required for quantized experts and omitted for bf16
-                ones.
+            local_gate_weight / local_up_weight / local_down_weight:
+                [epn, H, H'] contiguous local expert weights, where epn=E/R.
+                bf16 for unquantized experts, uint8 for packed MXFP4.
+            gate_prefetch_buffer / up_prefetch_buffer /
+            down_prefetch_buffer:
+                [R, epn, H, H'] all-rank prefetch-buffer views, contiguous
+                within each rank with optional padding between ranks.
+            local_gate_scale / local_up_scale / local_down_scale:
+                optional [epn, ...] contiguous local block-scale tensors.
+            gate_scale_prefetch_buffer / up_scale_prefetch_buffer /
+            down_scale_prefetch_buffer:
+                optional [R, epn, ...] all-rank scale-buffer views with the
+                same rank-contiguous layout (each pool has its own stride).
 
         Returns:
             None in synchronous mode, or the comm-stream CUDA event when
@@ -897,22 +885,49 @@ class Buffer:
         ctx = self._require_ctx()
 
         assert isinstance(plan, MoonEPCommPlan), "Buffer.prefetch_weight: plan is required"
-        weight_prefetch_args = (full_gate_weight, full_up_weight, full_down_weight)
-        assert all(w is not None for w in weight_prefetch_args), \
+        R = int(ctx['R'])
+        epn = int(ctx['E']) // R
+        local_weights = (local_gate_weight, local_up_weight, local_down_weight)
+        prefetch_buffers = (
+            gate_prefetch_buffer,
+            up_prefetch_buffer,
+            down_prefetch_buffer,
+        )
+        assert all(t is not None for t in (*local_weights, *prefetch_buffers)), \
             "prefetch_weight tensors must be provided together"
-        for w in weight_prefetch_args:
-            assert w.dtype in _ELEM_TYPES, \
-                f"prefetch_weight: unsupported weight dtype {w.dtype}"
-            assert w.is_contiguous()
-            assert w.ndim == 3 and int(w.shape[0]) == int(ctx['E']) + int(ctx['B'])
+        for local, pool in zip(local_weights, prefetch_buffers, strict=True):
+            assert local.dtype in _ELEM_TYPES, \
+                f"prefetch_weight: unsupported weight dtype {local.dtype}"
+            assert local.is_contiguous()
+            assert local.ndim == 3 and int(local.shape[0]) == epn
+            assert pool.dtype == local.dtype and _validate_rank_strided_pool(pool)
+            assert pool.ndim == 4 and tuple(pool.shape[:2]) == (R, epn)
+            assert tuple(pool.shape[2:]) == tuple(local.shape[1:])
+            assert pool.device == local.device
+        weight_prefetch_args = (local_weights, prefetch_buffers)
 
-        scale_prefetch_args = (full_gate_scale, full_up_scale, full_down_scale)
-        if any(s is not None for s in scale_prefetch_args):
-            assert all(s is not None for s in scale_prefetch_args), \
+        local_scales = (local_gate_scale, local_up_scale, local_down_scale)
+        scale_prefetch_buffers = (
+            gate_scale_prefetch_buffer,
+            up_scale_prefetch_buffer,
+            down_scale_prefetch_buffer,
+        )
+        if any(t is not None for t in (*local_scales, *scale_prefetch_buffers)):
+            assert all(t is not None for t in (*local_scales, *scale_prefetch_buffers)), \
                 "prefetch_weight scales must be provided together"
-            for s in scale_prefetch_args:
-                assert s.is_contiguous()
-                assert s.ndim >= 2 and int(s.shape[0]) == int(ctx['E']) + int(ctx['B'])
+            for local, pool in zip(
+                local_scales, scale_prefetch_buffers, strict=True,
+            ):
+                assert local.is_contiguous()
+                assert local.ndim >= 2 and int(local.shape[0]) == epn
+                assert pool.dtype == local.dtype and _validate_rank_strided_pool(pool)
+                assert pool.ndim == local.ndim + 1
+                assert tuple(pool.shape[:2]) == (R, epn)
+                assert tuple(pool.shape[2:]) == tuple(local.shape[1:])
+                assert pool.device == local.device
+            scale_prefetch_args = tuple(zip(
+                local_scales, scale_prefetch_buffers, strict=True,
+            ))
         else:
             scale_prefetch_args = None
 
@@ -930,7 +945,13 @@ class Buffer:
         assert comm is not None, "MoonEP Buffer communication stream is not initialized"
 
         self._record_streams(
-            (plan.experts_to_copy, *weight_prefetch_args, *(scale_prefetch_args or ())),
+            (
+                plan.experts_to_copy,
+                *local_weights,
+                *prefetch_buffers,
+                *(local_scales if scale_prefetch_args else ()),
+                *(scale_prefetch_buffers if scale_prefetch_args else ()),
+            ),
             comm,
         )
         input_ready = main_stream.record_event()
@@ -1086,9 +1107,10 @@ class Buffer:
         self,
         plan: MoonEPCommPlan | None = None,
         async_finish: bool = False,
-        full_gate_grad: torch.Tensor | None = None,
-        full_up_grad: torch.Tensor | None = None,
-        full_down_grad: torch.Tensor | None = None,
+        *,
+        local_gate_grad: torch.Tensor | None = None,
+        local_up_grad: torch.Tensor | None = None,
+        local_down_grad: torch.Tensor | None = None,
         gate_reduce_buffer: torch.Tensor | None = None,
         up_reduce_buffer: torch.Tensor | None = None,
         down_reduce_buffer: torch.Tensor | None = None,
@@ -1104,33 +1126,43 @@ class Buffer:
         Args:
             plan: MoonEPCommPlan returned by ``dispatch``.
             async_finish: run on the comm stream and return a CUDA event.
-            full_gate_grad / full_up_grad / full_down_grad:
-                [E+B, H, H'] fp32 contiguous grad tensors, same layout as the
-                weights; rows [E, E+B) are backed by the reduce buffer.
+            local_gate_grad / local_up_grad / local_down_grad:
+                [epn, H, H'] fp32 contiguous local parameter grads.
             gate_reduce_buffer / up_reduce_buffer / down_reduce_buffer:
-                [R, B, H, H'] fp32 — all R ranks' reduce buffers mapped as
-                one view.
+                [R, epn, H, H'] fp32 — all R ranks' reduce buffers mapped as
+                one view, contiguous within each rank with optional rank padding.
 
         Returns:
             None in synchronous mode, or the comm-stream CUDA event when
             ``async_finish=True``.
 
         Kept separate from ``combine``; running on the shared comm stream
-        keeps the Buffer's barrier/meta resources serialized.
+        keeps the Buffer's barrier/meta resources serialized. The caller
+        must ensure all ranks' reduce-buffer writes are visible to remote
+        TMA reads and prior reductions' clears have completed before buffer
+        reuse.
         """
         ctx = self._require_ctx()
 
-        grad_reduce_args = (
-            full_gate_grad,
-            full_up_grad,
-            full_down_grad,
+        R = int(ctx['R'])
+        epn = int(ctx['E']) // R
+        local_grads = (local_gate_grad, local_up_grad, local_down_grad)
+        reduce_buffers = (
             gate_reduce_buffer,
             up_reduce_buffer,
             down_reduce_buffer,
         )
-        assert all(t is not None for t in grad_reduce_args), \
+        assert all(t is not None for t in (*local_grads, *reduce_buffers)), \
             "reduce_grad tensors must be provided together"
         assert isinstance(plan, MoonEPCommPlan), "Buffer.reduce_grad: plan is required"
+        for local, pool in zip(local_grads, reduce_buffers, strict=True):
+            assert local.dtype == torch.float32 and local.is_contiguous()
+            assert local.ndim == 3 and int(local.shape[0]) == epn
+            assert pool.dtype == torch.float32 and _validate_rank_strided_pool(pool)
+            assert pool.ndim == 4 and tuple(pool.shape[:2]) == (R, epn)
+            assert tuple(pool.shape[2:]) == tuple(local.shape[1:])
+            assert pool.device == local.device
+        grad_reduce_args = (local_grads, reduce_buffers)
 
         if not async_finish:
             self._run_reduce_grad_on_current_stream(
@@ -1144,7 +1176,9 @@ class Buffer:
         comm = self._comm_stream
         assert comm is not None, "MoonEP Buffer communication stream is not initialized"
 
-        self._record_streams((plan.experts_to_copy, *grad_reduce_args), comm)
+        self._record_streams(
+            (plan.experts_to_copy, *local_grads, *reduce_buffers), comm,
+        )
         input_ready = main_stream.record_event()
         comm.wait_event(input_ready)
 

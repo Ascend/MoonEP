@@ -14,7 +14,7 @@ Sweeps:
 E is fixed at 896 total experts; experts-per-rank (epn = E / ep) shrinks as
 the EP group grows.
 
-Reports the MoonEP communication operators used by Megatron:
+Reports the MoonEP communication operators:
   - dispatch_fwd: dispatch kernel with route-weight scatter (dedup: only
     representative ``dst >= 0`` rows are transferred).
   - dispatch_bwd: hidden-only dispatch kernel with the saved plan.
@@ -29,18 +29,17 @@ Reports the MoonEP communication operators used by Megatron:
   - combine_bwd:  dedup-aware combine kernel with droute_weights_sk gather
                   after the prologue.
   - prefetch:     remote expert-weight prefetch driven by the planner's
-                  experts_to_copy. The kernel has no inter-rank sync of its
-                  own, so each timed iteration is prefetch + a small
-                  inter-rank sync kernel to keep ranks serialized.
+                  experts_to_copy. Local owners push into the all-rank pool;
+                  the kernel includes collective completion.
   - grad_reduce:  remote expert-grad reduction (cross-rank barrier built in).
 
-Expert weights/grads use one [Hp]-wide proxy tensor per rank, NVL-distributed
-so each rank physically owns its epn experts (remote rows are NVLink-mapped).
+Expert weights/grads use compact local [epn, H, Hp] tensors and NVL-distributed
+communication pools [R, epn, H, Hp].
 max_recv is the max over ranks of prefetched expert count (slots with
-experts_to_copy >= 0); max_send is the max over owner ranks of slots whose
-grads flow back to that owner. Both prefetch and grad_reduce bandwidth use
-the bottleneck rank's traffic max(max_send, max_recv) * H * Hp as the byte
-count (bf16 for prefetch, fp32 for grad_reduce). mx/mean is the global
+experts_to_copy >= 0); max_send is the max over owner ranks of those slots.
+Both owner-push prefetch and local-destination grad_reduce bandwidth use
+max_send * H * Hp as the critical byte count (bf16 for prefetch, fp32 for
+grad_reduce). mx/mean is the global
 expert-load imbalance
 (max over experts of routed token count, divided by the mean).
 
@@ -84,7 +83,6 @@ from moonep.dispatch_epilogue import launch_dispatch_epilogue
 from moonep.combine import launch_combine
 from moonep.combine_prologue import launch_combine_prologue
 from moonep.grad_reduce import launch_grad_reduce
-from moonep.inter_rank_sync import launch_inter_rank_sync
 from moonep.planning import allocate_planning_outputs, launch_planning
 from moonep.prefetch import launch_prefetch
 
@@ -205,7 +203,7 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
     # Capture deduped `dst` plus src_info. The first forward dispatch below
     # materializes the plan-owned dedup structures (dup_groups / dup_loffs /
     # dup_counts), which then drive the dispatch epilogue / combine prologue.
-    # The plan carries the full [R, B] experts_to_copy table needed by
+    # The plan carries the full [R, epn] experts_to_copy table needed by
     # prefetch/grad_reduce.
     launch_planning(ctx, topk_flat, tpe, cu_seqlens, plan)
     dst = plan.dst
@@ -301,8 +299,7 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
     )
 
     # ---- prefetch / grad_reduce: remote expert weight movement driven by the
-    # planner's experts_to_copy ([R, B] global expert ids, -1 = idle slot).
-    B = int(ctx['B'])  # prefetch slots per rank, == epn by default
+    # planner's experts_to_copy ([R, epn] global expert ids, -1 = idle slot).
     epn = E // R
     etc_cpu = experts_to_copy.cpu()
     valid = etc_cpu >= 0
@@ -316,48 +313,49 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
     else:
         max_send = 0
 
-    # NVL-dist expert weight/grad pools: each rank physically owns epn experts;
-    # remote rows are NVLink-mapped. Chunk dim0 is padded to VMM granularity,
-    # so global expert e lives at padded id (e // epn) * padded_epn + e % epn.
-    # bf16 padding also satisfies fp32 (rows are 2x the bytes).
-    padded_epn = pad_dim0_for_alignment([epn, H, Hp], torch.bfloat16)
-    E_pad = R * padded_epn
-    Bp = pad_dim0_for_alignment([B, H, Hp], torch.float32)
+    assert pad_dim0_for_alignment([epn, H, Hp], torch.bfloat16) == epn
+    weights_local = tuple(
+        torch.randn(epn, H, Hp, dtype=torch.bfloat16, device=dev)
+        for _ in range(3)
+    )
+    prefetch_full = tuple(
+        create_nvl_dist_tensor(
+            [epn, H, Hp], torch.bfloat16, group_rank, R, group=group,
+        )
+        for _ in range(3)
+    )
+    prefetch_buffers = tuple(
+        tensor.view(R, epn, H, Hp) for tensor in prefetch_full
+    )
 
-    etc_pad = torch.full((R, Bp), -1, dtype=torch.int32, device=dev)
-    remapped = ((experts_to_copy.long() // epn) * padded_epn
-                + experts_to_copy.long() % epn).to(torch.int32)
-    etc_pad[:, :B] = torch.where(experts_to_copy >= 0, remapped, experts_to_copy)
-
-    weights_full = create_nvl_dist_tensor(
-        [padded_epn, H, Hp], torch.bfloat16, group_rank, R, group=group)
-    assert weights_full.shape[0] == E_pad
-    weights_full[group_rank * padded_epn:(group_rank + 1) * padded_epn].normal_()
-    prefetch_buf = torch.empty(Bp, H, Hp, dtype=torch.bfloat16, device=dev)
-
-    grads_full = create_nvl_dist_tensor(
-        [padded_epn, H, Hp], torch.float32, group_rank, R, group=group)
-    grads_full[group_rank * padded_epn:(group_rank + 1) * padded_epn].zero_()
+    assert pad_dim0_for_alignment([epn, H, Hp], torch.float32) == epn
+    grads_local = torch.zeros(epn, H, Hp, dtype=torch.float32, device=dev)
     reduce_full = create_nvl_dist_tensor(
-        [Bp, H, Hp], torch.float32, group_rank, R, group=group)
-    reduce_buffers = reduce_full.view(R, Bp, H, Hp)
-    reduce_buffers[group_rank].normal_()
+        [epn, H, Hp], torch.float32, group_rank, R, group=group)
+    reduce_buffers = reduce_full.view(R, epn, H, Hp)
+    local_reduce_slots = torch.randn_like(reduce_buffers[group_rank])
+    reduce_buffers[group_rank].copy_(local_reduce_slots)
     torch.cuda.synchronize()
     dist.barrier(group=group)
 
-    # prefetch has no inter-rank sync of its own; pair every launch with the
-    # small inter-rank sync kernel so successive iterations stay serialized
-    # across ranks (same role the built-in barrier plays for the other ops).
     def _prefetch_call():
-        launch_prefetch(weights_full, prefetch_buf, etc_pad[group_rank],
-                        num_sms=num_sms)
-        launch_inter_rank_sync(ctx)
+        launch_prefetch(
+            weights_local,
+            prefetch_buffers,
+            experts_to_copy,
+            rank=group_rank,
+            num_sms=num_sms,
+            meta_buf=ctx['meta_buf'],
+            meta_stride=int(ctx['meta_chunk_padded']),
+            barrier_off=int(ctx['BARRIER_OFF']),
+            grid_sync_bar=ctx['grid_sync_bar'],
+        )
 
     prefetch_us = time_gpu_op(_prefetch_call, warmup, iters, group, cudagraph=cudagraph)
 
     def _grad_reduce_call():
         launch_grad_reduce(
-            grads_full, reduce_buffers, etc_pad,
+            grads_local, reduce_buffers, experts_to_copy,
             rank=group_rank, num_sms=num_sms,
             meta_buf=ctx['meta_buf'],
             meta_stride=int(ctx['meta_chunk_padded']),
@@ -413,11 +411,10 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
         combine_prologue_total_bytes / combine_prologue_bwd_us * 1e6 / 1e9
     )
 
-    # Bottleneck rank traffic: each op's worst rank moves
-    # max(max_send, max_recv) expert rows over NVLink.
-    mx_experts = max(max_send, max_recv)
-    prefetch_bytes = mx_experts * H * Hp * 2     # bf16 weights
-    grad_reduce_bytes = mx_experts * H * Hp * 4  # fp32 grads
+    # Both owner-push prefetch and owner-local grad reduction are limited by
+    # the busiest owner rank. max_recv remains reported as a workload shape.
+    prefetch_bytes = 3 * max_send * H * Hp * 2
+    grad_reduce_bytes = max_send * H * Hp * 4
 
     result = {
         'planning_us': planning_us,
@@ -429,6 +426,7 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, Hp,
         'combine_prologue_bwd_us': combine_prologue_bwd_us,
         'combine_fwd_us': combine_fwd_us,
         'combine_bwd_us': combine_bwd_us,
+        'epn': epn,
         'NvS': NvS,
         'dedup_ratio': dedup_ratio,
         'dup_group_count': dup_group_count,
@@ -463,7 +461,7 @@ def cleanup_ctx():
 # Driver
 # -------------------------------------------------------------------------
 
-EP_SIZES = [4, 8]
+EP_SIZES = [4, 8, 16, 32, 64]
 
 
 def build_configs():
@@ -501,8 +499,7 @@ def main():
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--num-sms", type=int, default=32)
-    # Expert weight inner dim H' for prefetch/grad_reduce ([E, H, Hp] proxy
-    # weights).
+    # Expert weight inner dim H' for compact [epn, H, Hp] proxy tensors.
     ap.add_argument("--hp", type=int, default=3072,
                     help="Expert weight inner dim H' (multiple of 128).")
     # CUDA-graph timing is on by default, removing per-launch overhead;
@@ -556,7 +553,7 @@ def main():
     csv_writer = None
     csv_file = None
     csv_header = [
-        "ep", "H", "K", "S", "E", "Hp", "unbalance_ratio",
+        "ep", "H", "K", "S", "E", "epn", "Hp", "unbalance_ratio",
         "max_recv", "max_send", "load_max_mean",
         "planning_us",
         "dispatch_fwd_us", "dispatch_bwd_us",
@@ -665,7 +662,8 @@ def main():
                 print(line, flush=True)
                 if csv_writer:
                     csv_writer.writerow([
-                        ep, cfg['H'], cfg['K'], cfg['S'], cfg['E'], args.hp,
+                        ep, cfg['H'], cfg['K'], cfg['S'], cfg['E'],
+                        res['epn'], args.hp,
                         f"{cfg['unbalance_ratio']:.2f}",
                         res['max_recv'],
                         res['max_send'],

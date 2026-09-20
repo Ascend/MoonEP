@@ -86,7 +86,7 @@ class DispatchKernel:
         R: int,
         S: int,
         K: int,
-        zero_groups: int,       # zero_fill_ranges entries = E + B
+        zero_groups: int,       # zero_fill_ranges entries = 2 * epn
         NvS: int,
         NvS_padded: int,
         SRC_INFO_OFF: int,
@@ -152,7 +152,7 @@ class DispatchKernel:
         weights_ptr: cute.Pointer,            # int32 view of fp32 [S, K] (or placeholder)
         dst_ptr: cute.Pointer,                # int32 [N=S*K]
         meta_ptr: cute.Pointer,               # int32 [R*meta_stride]
-        zero_fill_ranges_ptr: cute.Pointer,   # int32 [E+B, 2] (col0=pad_start, col1=n_pad)
+        zero_fill_ranges_ptr: cute.Pointer,   # int32 [2*epn, 2] (col0=pad_start, col1=n_pad)
         bar_ptr: cute.Pointer,                # int32 [1] grid barrier counter
         primary_packed_ptr: cute.Pointer,
         kmask_ptr: cute.Pointer,
@@ -204,8 +204,8 @@ class DispatchKernel:
             w_tensor = cute.make_tensor(
                 weights_ptr, cute.make_layout((1,))
             )
-        # zero_fill_ranges: int32 [E+B, 2] — col 0 pad_start_loff, col 1 n_pad_rows.
-        # Linearized as length 2*(E+B) so warp 2's per-group read pulls both
+        # zero_fill_ranges: int32 [2*epn, 2] — col 0 pad_start_loff, col 1 n_pad_rows.
+        # Linearized as length 4*epn so warp 2's per-group read pulls both
         # values via a single contiguous int2 load.
         zero_fill_ranges_tensor = cute.make_tensor(
             zero_fill_ranges_ptr,
@@ -448,11 +448,11 @@ class DispatchKernel:
             cute.arch.cp_async_bulk_wait_group(0)
 
         # ============================================
-        # Warp 2 — per-expert zero-fill loop (runs concurrently with
-        # producer/consumer dispatch). For each expert e on this rank the
-        # planning kernel wrote zero_fill_ranges[e] = (pad_start_loff, n_pad_rows)
+        # Warp 2 — per-group zero-fill loop (runs concurrently with
+        # producer/consumer dispatch). For each group e in this rank's compact
+        # layout, planning wrote zero_fill_ranges[e] = (pad_start_loff, n_pad_rows)
         # for the segment-padding rows DeepGEMM will read but the dispatch
-        # consumer does not write. Each CTA strides through E experts; for
+        # consumer does not write. Each CTA strides through zero_groups entries; for
         # each non-empty range it issues n_pad_rows back-to-back
         # cp.async.bulk_s2g zeros from zero_smem and, when with_weights is
         # set, a paired int32 zero store into the matching slot of meta_buf
@@ -790,7 +790,7 @@ def _check_dispatch_plan(ctx: dict, hidden_sh: torch.Tensor, plan: MoonEPCommPla
     N = S * K
     R = int(ctx['R'])
     E = int(ctx['E'])
-    B = int(ctx.get('B', 0))
+    epn = E // R
     NvS = int(ctx['NvS'])
     dev = hidden_sh.device
 
@@ -808,7 +808,7 @@ def _check_dispatch_plan(ctx: dict, hidden_sh: torch.Tensor, plan: MoonEPCommPla
             f"{name} must be on {dev}, got {t.device}"
 
     _check_tensor(plan.dst, "dst", (N,))
-    _check_tensor(plan.zero_fill_ranges, "zero_fill_ranges", (E + B, 2))
+    _check_tensor(plan.zero_fill_ranges, "zero_fill_ranges", (2 * epn, 2))
     _check_tensor(plan.dup_groups, "dup_groups", (NvS, 3))
     _check_tensor(plan.dup_loffs, "dup_loffs", (NvS,))
     _check_tensor(plan.dup_counts, "dup_counts", (2,))
@@ -818,7 +818,6 @@ def _check_dedup_builder_tensors(ctx: dict, dev: torch.device) -> None:
     R = int(ctx['R'])
     S = int(ctx['S'])
     K = int(ctx['K'])
-    NvS = int(ctx['NvS'])
 
     def _check_scratch(name: str, numel: int) -> None:
         assert name in ctx, f"ctx missing {name}"
@@ -878,7 +877,7 @@ def launch_dispatch(
     S = int(ctx['S'])
     K = int(ctx['K'])
     E = int(ctx['E'])
-    B = int(ctx.get('B', 0))
+    epn = E // R
 
     assert hidden_sh.dtype == torch.bfloat16 and hidden_sh.is_contiguous(), \
         "hidden_sh must be contiguous bf16"
@@ -912,7 +911,7 @@ def launch_dispatch(
     device_index = hidden_sh.device.index
 
     dispatch_compiled = _get_compiled(
-        H, R, S, K, E + B, NvS, NvS_padded, meta_stride, SRC_INFO_OFF,
+        H, R, S, K, 2 * epn, NvS, NvS_padded, meta_stride, SRC_INFO_OFF,
         num_sms, with_weights, build_dedup_map, device_index,
         bool(pdl_trigger),
     )

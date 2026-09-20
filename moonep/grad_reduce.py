@@ -15,7 +15,7 @@ Warp-specialized, tile-partitioned design:
   - Work is split by 128x128 tile across all SMs over a prescan-compacted
     list of active local experts (experts with no remote slot cost nothing).
     The prescan itself is cooperative (smem stage + cta-atomic count +
-    match_any warp fill): a single-thread gmem scan of the R*B plan is
+    match_any warp fill): a single-thread gmem scan of the R*EPN plan is
     bottlenecked by serial load latency.
   - Accumulation never writes the reduce buffers. After all tiles are summed
     a cross-rank barrier fences all peers, then each rank clears only its own
@@ -54,20 +54,20 @@ class GradReduceKernel:
 
     def __init__(
         self,
-        E: int,
+        EPN: int,
         H: int,
         Hp: int,
         R: int,
-        B: int,
+        rank_stride: int,
         meta_stride: int,
         num_sms: int,
         smem_budget: int,
     ):
-        self.E = E
+        self.EPN = EPN
         self.H = H
         self.Hp = Hp
         self.R = R
-        self.B = B
+        self.rank_stride = rank_stride
         self.meta_stride = meta_stride
         self.num_sms = num_sms
         need = self._smem_bytes()
@@ -85,30 +85,28 @@ class GradReduceKernel:
         tile_bytes = self.M_BLOCK * self.N_BLOCK * 4
         stage = _round_up(self.STAGES * tile_bytes, 128)
         mbar = _round_up(self.STAGES * 2 * 8, 16)
-        # off[EPN+1] + alist[EPN] + acnt[1] + slist[R*B] + sexp[R*B]
-        # + cur[EPN+1] + clist[B] + ccnt[1]
-        epn = self.E // self.R
+        # off[EPN+1] + alist[EPN] + acnt[1] + slist[R*EPN] + sexp[R*EPN]
+        # + cur[EPN+1] + clist[EPN] + ccnt[1]
         scan = _round_up(
-            (3 * epn + 4 + 2 * self.R * self.B + self.B) * 4, 128)
+            (4 * self.EPN + 4 + 2 * self.R * self.EPN) * 4, 128)
         return stage + mbar + scan + 256
 
     @cute.jit
     def __call__(
         self,
-        expert_grad_ptr: cute.Pointer,    # fp32 [E, H, H']
-        reduce_buf_ptr: cute.Pointer,     # fp32 [R, B, H, H']
-        experts_ptr: cute.Pointer,        # int32 [R, B]
+        expert_grad_ptr: cute.Pointer,    # fp32 [EPN, H, H']
+        reduce_buf_ptr: cute.Pointer,     # fp32 [R, EPN, H, H']
+        experts_ptr: cute.Pointer,        # int32 [R, EPN]
         meta_ptr: cute.Pointer,           # int32 [R*meta_stride] (barrier)
         bar_ptr: cute.Pointer,            # int32 [1] grid barrier counter
         rank: Int32,
         barrier_off: Int32,
         stream: cuda.CUstream,
     ):
-        E = cutlass.const_expr(self.E)
+        EPN = cutlass.const_expr(self.EPN)
         H = cutlass.const_expr(self.H)
         Hp = cutlass.const_expr(self.Hp)
         R = cutlass.const_expr(self.R)
-        B = cutlass.const_expr(self.B)
         meta_stride = cutlass.const_expr(self.meta_stride)
         M_BLOCK = cutlass.const_expr(self.M_BLOCK)
         N_BLOCK = cutlass.const_expr(self.N_BLOCK)
@@ -116,13 +114,16 @@ class GradReduceKernel:
 
         expert_grad = cute.make_tensor(
             expert_grad_ptr,
-            cute.make_layout((E * H, Hp), stride=(Hp64, cutlass.Int64(1))),
+            cute.make_layout((EPN * H, Hp), stride=(Hp64, cutlass.Int64(1))),
         )
         reduce_buf = cute.make_tensor(
             reduce_buf_ptr,
-            cute.make_layout((R * B * H, Hp), stride=(Hp64, cutlass.Int64(1))),
+            cute.make_layout(
+                (EPN * H, Hp, R),
+                stride=(Hp64, cutlass.Int64(1), cutlass.Int64(self.rank_stride)),
+            ),
         )
-        experts = cute.make_tensor(experts_ptr, cute.make_layout((R * B,)))
+        experts = cute.make_tensor(experts_ptr, cute.make_layout((R * EPN,)))
         meta = cute.make_tensor(meta_ptr, cute.make_layout((R * meta_stride,)))
         bar = cute.make_tensor(bar_ptr, cute.make_layout((1,)))
 
@@ -160,11 +161,10 @@ class GradReduceKernel:
         rank: Int32,
         barrier_off: Int32,
     ):
-        E = cutlass.const_expr(self.E)
+        EPN = cutlass.const_expr(self.EPN)
         H = cutlass.const_expr(self.H)
         Hp = cutlass.const_expr(self.Hp)
         R = cutlass.const_expr(self.R)
-        B = cutlass.const_expr(self.B)
         M_BLOCK = cutlass.const_expr(self.M_BLOCK)
         N_BLOCK = cutlass.const_expr(self.N_BLOCK)
         meta_stride = cutlass.const_expr(self.meta_stride)
@@ -173,7 +173,6 @@ class GradReduceKernel:
         MTILES = cutlass.const_expr(H // M_BLOCK)
         NTILES = cutlass.const_expr(Hp // N_BLOCK)
         TILES_PER_EXPERT = cutlass.const_expr(MTILES * NTILES)
-        EPN = cutlass.const_expr(E // R)
 
         STAGES = cutlass.const_expr(self.STAGES)
         ACC_THREADS = cutlass.const_expr(self.ACC_THREADS)
@@ -202,38 +201,38 @@ class GradReduceKernel:
         # compacted list of active local experts (off[le+1] > off[le]).
         alist = smem.allocate_tensor(Int32, cute.make_layout((EPN,)), byte_alignment=16)
         acnt = smem.allocate_tensor(Int32, cute.make_layout((1,)), byte_alignment=16)
-        slist = smem.allocate_tensor(Int32, cute.make_layout((R * B,)), byte_alignment=16)
+        slist = smem.allocate_tensor(Int32, cute.make_layout((R * EPN,)), byte_alignment=16)
         # smem stage of experts[] (pre-biased to local ids) for the prescan.
-        sexp = smem.allocate_tensor(Int32, cute.make_layout((R * B,)), byte_alignment=16)
+        sexp = smem.allocate_tensor(Int32, cute.make_layout((R * EPN,)), byte_alignment=16)
         # slist fill cursors; cur[EPN] is a dummy bucket for invalid lanes.
         cur = smem.allocate_tensor(Int32, cute.make_layout((EPN + 1,)), byte_alignment=16)
         # this rank's own consumed slots (experts[rank,b] >= 0) for clearing.
-        clist = smem.allocate_tensor(Int32, cute.make_layout((B,)), byte_alignment=16)
+        clist = smem.allocate_tensor(Int32, cute.make_layout((EPN,)), byte_alignment=16)
         ccnt = smem.allocate_tensor(Int32, cute.make_layout((1,)), byte_alignment=16)
 
         rank_epn = rank * EPN
 
         # ---- prescan experts once (parallel): bucket slots per local expert.
-        # A single-thread gmem scan of all R*B entries is bottlenecked by a
+        # A single-thread gmem scan of all R*EPN entries is bottlenecked by a
         # serial load latency chain, so it must be cooperative: stage the
         # table to smem with all threads, count with cta atomics, then have
         # warp 0 fill slist chunk-by-chunk with match_any so the final order
         # stays rb-ascending (bitwise-identical to the serial scan).
-        for i in cutlass.range(tidx, R * B, self.NUM_THREADS, unroll=1):
+        for i in cutlass.range(tidx, R * EPN, self.NUM_THREADS, unroll=1):
             sexp[i] = experts[i] - rank_epn
         for i in cutlass.range(tidx, EPN + 1, self.NUM_THREADS, unroll=1):
             off[i] = Int32(0)
         if tidx == 0:
             ccnt[0] = Int32(0)
         cute.arch.sync_threads()
-        for i in cutlass.range(tidx, R * B, self.NUM_THREADS, unroll=1):
+        for i in cutlass.range(tidx, R * EPN, self.NUM_THREADS, unroll=1):
             e = sexp[i]
             if e >= Int32(0) and e < Int32(EPN):
                 cute.arch.atomic_add(off.iterator + (e + Int32(1)), Int32(1),
                                      scope="cta")
         # this rank's own consumed slots (experts[rank,b] >= 0), unordered.
-        for b in cutlass.range(tidx, B, self.NUM_THREADS, unroll=1):
-            if sexp[rank * B + b] >= Int32(0) - rank_epn:
+        for b in cutlass.range(tidx, EPN, self.NUM_THREADS, unroll=1):
+            if sexp[rank * EPN + b] >= Int32(0) - rank_epn:
                 pos = cute.arch.atomic_add(ccnt.iterator, Int32(1), scope="cta")
                 clist[pos] = Int32(b)
         cute.arch.sync_threads()
@@ -256,11 +255,11 @@ class GradReduceKernel:
         if warp_idx == 0:
             lane = cute.arch.lane_idx()
             lanes_lt = (Uint32(1) << lane) - Uint32(1)
-            NCHUNK = cutlass.const_expr((R * B + 31) // 32)
+            NCHUNK = cutlass.const_expr((R * EPN + 31) // 32)
             for c0 in cutlass.range(NCHUNK, unroll=1):
                 rb = c0 * 32 + lane
                 e = Int32(EPN)
-                if rb < Int32(R * B):
+                if rb < Int32(R * EPN):
                     ee = sexp[rb]
                     if ee >= Int32(0) and ee < Int32(EPN):
                         e = ee
@@ -292,7 +291,7 @@ class GradReduceKernel:
         cd_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, STAGES)
         acc_tid = tidx - 32
         H_PER = cutlass.const_expr(TILE_ELEMS // ACC_THREADS)
-        acc_reg = cute.make_fragment((H_PER,), Float32)
+        acc_reg = cute.make_rmem_tensor((H_PER,), Float32)
 
         # ============ phase 1: warp-specialized accumulate, no clears ========
         total_work = acnt[0] * TILES_PER_EXPERT
@@ -301,7 +300,6 @@ class GradReduceKernel:
             rem = work_idx % TILES_PER_EXPERT
             mt = rem // NTILES
             nt = rem % NTILES
-            expert_id = rank_epn + local_expert
             base_row = mt * M_BLOCK
             base_col = nt * N_BLOCK
             beg = off[local_expert]
@@ -310,10 +308,12 @@ class GradReduceKernel:
             if warp_idx == 0:
                 for s in cutlass.range(nslot, unroll=1):
                     load_pipe.producer_acquire(ld_state)
-                    src_mt = slist[beg + s] * MTILES + mt
+                    rb = slist[beg + s]
+                    src_rank = rb // EPN
+                    src_mt = (rb % EPN) * MTILES + mt
                     cute.copy(
                         tma_g2s_red,
-                        tRgR[(None, (src_mt, nt))],
+                        tRgR[(None, (src_mt, nt, src_rank))],
                         tRsR[(None, ld_state.index)],
                         tma_bar_ptr=load_pipe.producer_get_barrier(ld_state),
                     )
@@ -324,15 +324,15 @@ class GradReduceKernel:
             # thread owns groups of 4 consecutive elements:
             #   e = (j//4)*4*ACC_THREADS + acc_tid*4 + j%4.
             elif warp_idx >= 1:
-                grad0 = expert_id * H + base_row
+                grad0 = local_expert * H + base_row
                 row_off = acc_tid // Int32(32)
                 col0 = (acc_tid % Int32(32)) * Int32(4)
                 base_t = row_off * N_BLOCK + col0
                 # per-thread (32 groups x 4 consecutive elems) view of the
                 # grad tile. The strides must stay static and the offset 16B
                 # aligned for autovec_copy to emit 128-bit accesses. The row
-                # offset must be widened to i64 BEFORE multiplying by Hp:
-                # expert_id * H * Hp exceeds 2^31 at production shapes.
+                # offset must be widened to i64 BEFORE multiplying by Hp so
+                # large local gradient layouts cannot overflow i32 arithmetic.
                 goff = (cutlass.Int64(grad0 + row_off) * cutlass.Int64(Hp)
                         + cutlass.Int64(base_col + col0))
                 gview = cute.make_tensor(
@@ -379,8 +379,8 @@ class GradReduceKernel:
         cons = ccnt[0]
         VECS = cutlass.const_expr(H * Hp // 4)
         for k in cutlass.range(cons, unroll=1):
-            sbase = (cutlass.Int64(rank * B + clist[k])
-                     * cutlass.Int64(H) * cutlass.Int64(Hp))
+            sbase = (cutlass.Int64(rank) * cutlass.Int64(self.rank_stride)
+                     + cutlass.Int64(clist[k]) * cutlass.Int64(H) * cutlass.Int64(Hp))
             for v in cutlass.range(bidx * self.NUM_THREADS + tidx, VECS,
                                    self.num_sms * self.NUM_THREADS, unroll=1):
                 addr = (reduce_buf.iterator
@@ -396,22 +396,22 @@ def _max_smem_per_block_optin(device_index: int) -> int:
 
 @functools.lru_cache(maxsize=None)
 def _get_compiled(
-    E: int,
+    epn: int,
     H: int,
     Hp: int,
     R: int,
-    B: int,
+    rank_stride: int,
     meta_stride: int,
     num_sms: int,
     device_index: int,
 ):
     smem_budget = _max_smem_per_block_optin(device_index) - 1024
     kernel = GradReduceKernel(
-        E=E,
+        EPN=epn,
         H=H,
         Hp=Hp,
         R=R,
-        B=B,
+        rank_stride=rank_stride,
         meta_stride=meta_stride,
         num_sms=num_sms,
         smem_budget=smem_budget,
@@ -435,8 +435,8 @@ def _get_compiled(
 
 
 def launch_grad_reduce(
-    remote_expert_grads: torch.Tensor,
-    remote_reduce_buffers: torch.Tensor,
+    local_expert_grads: torch.Tensor,
+    reduce_buffers: torch.Tensor,
     experts_to_copy: torch.Tensor,
     rank: int,
     num_sms: int,
@@ -448,16 +448,16 @@ def launch_grad_reduce(
     """Launch remote expert grad reduction.
 
     Args:
-        remote_expert_grads: contiguous fp32 tensor shaped [E, H, H'].
-            The current rank owns expert ids
-            ``rank * (E // R) : (rank + 1) * (E // R)``; only that range is
-            updated.
-        remote_reduce_buffers: contiguous fp32 tensor shaped [R, B, H, H'].
+        local_expert_grads: contiguous fp32 tensor shaped [epn, H, H'].
+            Global expert ids owned by this rank are mapped to local rows by
+            subtracting ``rank * epn``.
+        reduce_buffers: fp32 tensor shaped [R, epn, H, H'], contiguous
+            within each rank with optional padding between ranks.
             Slots whose ``experts_to_copy[r, b]`` belongs to this rank's owner
-            range are accumulated into ``remote_expert_grads``; afterwards a
+            range are accumulated into ``local_expert_grads``; afterwards a
             cross-rank barrier fences peers and each rank clears its own
             consumed slots locally.
-        experts_to_copy: contiguous int32 tensor shaped [R, B].
+        experts_to_copy: contiguous int32 tensor shaped [R, epn].
         rank: current EP rank.
         num_sms: number of persistent CTAs to launch.
         meta_buf: int32 NVL-distributed meta buffer holding the barrier slots.
@@ -465,59 +465,63 @@ def launch_grad_reduce(
         barrier_off: offset of the barrier slots within each rank's chunk.
         grid_sync_bar: int32 [1] grid-barrier counter.
 
-    The caller must ensure all ranks have finished writing
-    ``remote_reduce_buffers`` before launching this kernel on any rank.
+    The caller must ensure all ranks' writes to ``reduce_buffers`` are
+    visible to phase-1 TMA reads and prior launches' clears have completed
+    before reusing the buffers. All ranks must launch collectively (or all
+    skip via the empty-input early return).
     """
-    if remote_reduce_buffers.numel() == 0 or experts_to_copy.numel() == 0:
+    if reduce_buffers.numel() == 0 or experts_to_copy.numel() == 0:
         return
 
-    assert remote_expert_grads.dtype == torch.float32 and remote_expert_grads.is_contiguous(), \
-        "remote_expert_grads must be contiguous fp32 [E, H, H']"
-    assert remote_reduce_buffers.dtype == torch.float32 and remote_reduce_buffers.is_contiguous(), \
-        "remote_reduce_buffers must be contiguous fp32 [R, B, H, H']"
+    assert local_expert_grads.dtype == torch.float32 and local_expert_grads.is_contiguous(), \
+        "local_expert_grads must be contiguous fp32 [epn, H, H']"
+    assert reduce_buffers.dtype == torch.float32, \
+        "reduce_buffers must be fp32 [R, epn, H, H']"
     assert experts_to_copy.dtype == torch.int32 and experts_to_copy.is_contiguous(), \
-        "experts_to_copy must be contiguous int32 [R, B]"
-    assert remote_expert_grads.ndim == 3, \
-        f"remote_expert_grads must have rank 3, got shape={tuple(remote_expert_grads.shape)}"
-    assert remote_reduce_buffers.ndim == 4, \
-        f"remote_reduce_buffers must have rank 4, got shape={tuple(remote_reduce_buffers.shape)}"
+        "experts_to_copy must be contiguous int32 [R, epn]"
+    assert local_expert_grads.ndim == 3, \
+        f"local_expert_grads must have rank 3, got shape={tuple(local_expert_grads.shape)}"
+    assert reduce_buffers.ndim == 4, \
+        f"reduce_buffers must have rank 4, got shape={tuple(reduce_buffers.shape)}"
     assert experts_to_copy.ndim == 2, \
         f"experts_to_copy must have rank 2, got shape={tuple(experts_to_copy.shape)}"
 
-    E, H, Hp = (int(x) for x in remote_expert_grads.shape)
-    R, B, buf_H, buf_Hp = (int(x) for x in remote_reduce_buffers.shape)
-    assert tuple(experts_to_copy.shape) == (R, B), \
-        f"experts_to_copy shape {tuple(experts_to_copy.shape)} must match [R, B]=[{R}, {B}]"
+    rank_stride = int(reduce_buffers.stride(0))
+    epn, H, Hp = (int(x) for x in local_expert_grads.shape)
+    R, _, buf_H, buf_Hp = (int(x) for x in reduce_buffers.shape)
+    assert tuple(reduce_buffers.shape[:2]) == (R, epn), \
+        f"reduce_buffers must have leading shape [R, epn]=[{R}, {epn}]"
+    assert tuple(experts_to_copy.shape) == (R, epn), \
+        f"experts_to_copy must be [R, epn]=[{R}, {epn}]"
     assert buf_H == H and buf_Hp == Hp, (
-        f"remote_reduce_buffers shape {tuple(remote_reduce_buffers.shape)} "
-        f"incompatible with remote_expert_grads {tuple(remote_expert_grads.shape)}"
+        f"reduce_buffers shape {tuple(reduce_buffers.shape)} "
+        f"incompatible with local_expert_grads {tuple(local_expert_grads.shape)}"
     )
-    assert E % R == 0, f"E ({E}) must be divisible by R ({R})"
     assert 0 <= int(rank) < R, f"rank must be in [0, {R}), got {rank}"
     assert H % GradReduceKernel.M_BLOCK == 0 and Hp % GradReduceKernel.N_BLOCK == 0, \
         f"H and H' must be multiples of ({GradReduceKernel.M_BLOCK}, {GradReduceKernel.N_BLOCK}), got ({H}, {Hp})"
     assert isinstance(num_sms, int) and num_sms > 0, \
         f"num_sms must be a positive int, got {num_sms}"
 
-    device_index = remote_expert_grads.device.index
-    assert device_index is not None, "remote_expert_grads must be a CUDA tensor"
-    assert remote_reduce_buffers.device.index == device_index, \
-        "remote_reduce_buffers must be on the same CUDA device as remote_expert_grads"
+    device_index = local_expert_grads.device.index
+    assert device_index is not None, "local_expert_grads must be a CUDA tensor"
+    assert reduce_buffers.device.index == device_index, \
+        "reduce_buffers must be on the same CUDA device as local_expert_grads"
     assert experts_to_copy.device.index == device_index, \
-        "experts_to_copy must be on the same CUDA device as remote_expert_grads"
+        "experts_to_copy must be on the same CUDA device as local_expert_grads"
 
-    compiled = _get_compiled(E, H, Hp, R, B, int(meta_stride), int(num_sms),
+    compiled = _get_compiled(epn, H, Hp, R, rank_stride, int(meta_stride), int(num_sms),
                              int(device_index))
 
     grad_ptr = make_ptr(
         Float32,
-        remote_expert_grads.data_ptr(),
+        local_expert_grads.data_ptr(),
         cute.AddressSpace.gmem,
         assumed_align=16,
     )
     reduce_ptr = make_ptr(
         Float32,
-        remote_reduce_buffers.data_ptr(),
+        reduce_buffers.data_ptr(),
         cute.AddressSpace.gmem,
         assumed_align=16,
     )
