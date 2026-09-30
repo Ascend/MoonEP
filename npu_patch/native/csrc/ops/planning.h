@@ -18,7 +18,7 @@ int64_t PlanningLocalWorkspaceElements(
     int64_t world_size,
     int64_t core_num);
 
-void Planning(
+torch::Tensor Planning(
     torch::Tensor topk_idx,
     torch::Tensor dst,
     torch::Tensor cu_seqlens,
@@ -37,6 +37,17 @@ void Planning(
     int64_t core_num,
     int64_t rank,
     int64_t world_size,
-    bool use_udma);
+    bool use_udma,
+    torch::Tensor combine_workspace = {}, int64_t hidden_size = 0);
+
+torch::Tensor AllocateCombinePlan(
+    torch::Tensor workspace, torch::Tensor dst, torch::Tensor groups,
+    torch::Tensor dups, torch::Tensor counts,
+    int64_t S, int64_t H, int64_t K, int64_t R, int64_t rank);
+
+torch::Tensor PlanningPrepareCombinePlan(
+    torch::Tensor workspace, torch::Tensor dst, torch::Tensor groups,
+    torch::Tensor dups, torch::Tensor counts,
+    int64_t S, int64_t H, int64_t K, int64_t R, int64_t rank);
 
 }  // namespace ascend_moonep::ops

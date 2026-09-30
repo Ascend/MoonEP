@@ -613,6 +613,7 @@ def run_rank(local_rank: int, args) -> None:
             K=args.K,
         )
 
+        buffer.prepare_combine_plan(plan)
         output_sh, output_sk, done = buffer.combine(
             plan=plan,
             hidden_nvsh=hidden_input,

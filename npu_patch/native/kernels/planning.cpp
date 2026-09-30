@@ -18,6 +18,7 @@ constexpr int32_t kFillTileElems = 1024; // must be 32B aligned
 constexpr int32_t kInt32Bytes = 4;
 constexpr int32_t kMaxPlanningCores = 56;
 constexpr int32_t kMaxPlanningRanks = 1024;
+constexpr int32_t kPlanningRanksPerServer = ascend_moonep::kMoonEPDispatchRanksPerServer;
 constexpr int32_t kAscend950MixedUbSizeBytes = 216 * 1024;
 constexpr int32_t kPlanningUbSizeBytes = 216 * 1024;
 constexpr int32_t kCoreCursorSimtMaxThreads = 256;
@@ -69,7 +70,8 @@ static_assert(kCoreCursorCarryBytes % 32 == 0);
 static_assert(kCursorWorkerScratchRowElems * kInt32Bytes == 32);
 static_assert(kSourceDupInboxSlotElems * kInt32Bytes == 32);
 static_assert(
-    kMaxPlanningRanks * kSourceDupInboxSlotElems * kInt32Bytes + 32 <=
+    kMaxPlanningRanks * kSourceDupInboxSlotElems * kInt32Bytes +
+        ((kMaxPlanningRanks + 2 + 7) / 8) * 32 <=
     kPlanningUbSizeBytes);
 
 // Pointer fields are int32 element offsets from the single UB workspace base.
@@ -116,6 +118,7 @@ struct SourceDupConfig {
     int32_t core_idx;
     int32_t core_num;
     int32_t tokens_per_tile;
+    int32_t server_dedup;
 };
 
 struct SourceDupPartition {
@@ -513,8 +516,10 @@ __simt_vf__ __launch_bounds__(kSourceDupSimtMaxThreads) inline void DedupRouteTi
     __ubuf__ int32_t* tile_counts,
     int32_t tile_tokens,
     int32_t topk,
-    int32_t max_tokens_per_rank) {
+    int32_t max_tokens_per_rank,
+    int32_t server_dedup) {
     const int32_t token = static_cast<int32_t>(threadIdx.x);
+    // Tail-padding SIMT threads process no token, so the next tile is never overwritten.
     if (token >= tile_tokens) {
         return;
     }
@@ -525,36 +530,46 @@ __simt_vf__ __launch_bounds__(kSourceDupSimtMaxThreads) inline void DedupRouteTi
     int32_t group_count = 0;
     int32_t loff_count = 0;
 
+    // The first actual route in K order of each dedup domain is the primary; a rank domain is 1 card, a server domain
+    // is 8 cards.
     for (int32_t kidx = 0; kidx < topk; ++kidx) {
         const int32_t raw = dst[route_base + kidx];
+        // Negatively marked routes already belong to an earlier primary and must not form a new group.
         if (raw < 0) {
             continue;
         }
 
-        const int32_t dest = raw / max_tokens_per_rank;
-        const int32_t dest_base = dest * max_tokens_per_rank;
-        const int32_t dest_end = dest_base + max_tokens_per_rank;
+        const int32_t primary_rank = raw / max_tokens_per_rank;
+        const int32_t primary_base = primary_rank * max_tokens_per_rank;
+        const int32_t ranks_per_group = server_dedup ? kPlanningRanksPerServer : 1;
+        const int32_t rank_begin = (primary_rank / ranks_per_group) * ranks_per_group;
+        const int32_t address_begin = rank_begin * max_tokens_per_rank;
+        const int32_t address_end = address_begin + ranks_per_group * max_tokens_per_rank;
         const int32_t group_loff_start = loff_count;
         int32_t duplicate_count = 0;
+        // Rank mode stores the in-card offset and server mode the full destination encoding; the swap destination is
+        // still the actual primary card.
         for (int32_t next_kidx = kidx + 1; next_kidx < topk; ++next_kidx) {
             const int32_t next_raw = dst[route_base + next_kidx];
-            if (next_raw < dest_base || next_raw >= dest_end) {
+            // Negative values and addresses from other dedup domains never belong to the current group.
+            if (next_raw < address_begin || next_raw >= address_end) {
                 continue;
             }
-            token_loffs[loff_base + loff_count] = next_raw - dest_base;
+            token_loffs[loff_base + loff_count] = server_dedup ? next_raw : next_raw - primary_base;
             ++loff_count;
             ++duplicate_count;
             dst[route_base + next_kidx] = -next_raw - 1;
         }
 
+        // Counts are still organized over R primary cards and must not collapse into R/8 servers.
         if (duplicate_count > 0) {
             const int32_t group_pos = group_base + group_count * 4;
-            token_groups[group_pos] = dest;
-            token_groups[group_pos + 1] = raw - dest_base;
+            token_groups[group_pos] = primary_rank;
+            token_groups[group_pos + 1] = raw - primary_base;
             token_groups[group_pos + 2] = loff_base + group_loff_start;
             token_groups[group_pos + 3] = duplicate_count;
-            asc_atomic_add(tile_counts + dest * 2, 1);
-            asc_atomic_add(tile_counts + dest * 2 + 1, duplicate_count);
+            asc_atomic_add(tile_counts + primary_rank * 2, 1);
+            asc_atomic_add(tile_counts + primary_rank * 2 + 1, duplicate_count);
             ++group_count;
         }
     }
@@ -694,6 +709,8 @@ PackSourceDupByDestSimt(
             packed_groups[group_pos] = primary_loff;
             packed_groups[group_pos + 1] = loff_ordinal;
             packed_groups[group_pos + 2] = duplicate_count;
+            // Only the full destination encoding is packed here; the card number and slot the secondary points to are
+            // untouched.
             for (int32_t i = 0; i < duplicate_count; ++i) {
                 packed_loffs[loff_pos + i] =
                     compact_loffs[raw_loff_start + i];
@@ -725,6 +742,7 @@ AdjustSourceDupGroupLoffsSimt(
              group < group_count;
              group += threads_per_dest) {
             const int32_t loff_field = group_start + group * 3 + 1;
+            // Only the group list start is corrected; the secondary full destination encoding is left as is.
             groups[loff_field] = global_loff_base + groups[loff_field];
         }
     }
@@ -763,20 +781,27 @@ BuildSourceDupDestinationPrefixesSimt(
     __ubuf__ int32_t* count_slots,
     __ubuf__ int32_t* totals,
     int32_t rank_count) {
-    const int32_t count_lane = static_cast<int32_t>(threadIdx.x);
-    if (count_lane >= 2) {
+    const int32_t count_kind = static_cast<int32_t>(threadIdx.x);
+    // Two threads handle the group and secondary prefixes separately; other threads write no output.
+    if (count_kind >= 2) {
         return;
     }
 
     int32_t prefix = 0;
+    // Receive intervals are assigned contiguously in original-source order, and the group starts dispatch needs are
+    // exported.
     for (int32_t source_rank = 0; source_rank < rank_count; ++source_rank) {
         const int32_t offset =
-            source_rank * kSourceDupInboxSlotElems + count_lane;
+            source_rank * kSourceDupInboxSlotElems + count_kind;
         const int32_t count = count_slots[offset];
         count_slots[offset] = prefix;
+        // Empty sources also write the current start; the end boundary of the last source is given by the total G.
+        if (count_kind == 0) {
+            totals[2 + source_rank] = prefix;
+        }
         prefix += count;
     }
-    totals[count_lane] = prefix;
+    totals[count_kind] = prefix;
 }
 
 __simt_vf__ __launch_bounds__(kSourceDupSimtMaxThreads) inline void
@@ -1546,6 +1571,8 @@ __aicore__ inline void BuildSourceDupDestinationPrefixes(
     const int32_t inbox_bytes = inbox_elems * kInt32Bytes;
     AscendC::LocalTensor<int32_t> count_slots_ub =
         resource.ubBuf.template GetBufferByByte<int32_t>(0);
+    // An aligned [G,D,P...] region is reserved after the inbox; its capacity is bound by the host budget and the top
+    // assertions.
     AscendC::LocalTensor<int32_t> totals_ub =
         resource.ubBuf.template GetBufferByByte<int32_t>(
             static_cast<uint32_t>(inbox_bytes));
@@ -1573,9 +1600,12 @@ __aicore__ inline void BuildSourceDupDestinationPrefixes(
         dup_key_workspace_gm[0],
         count_slots_ub,
         prefix_copy_params);
+    // Internally the source prefix is still shared; rank outputs carry only G and D, and P must not be written outside
+    // its logical bound.
+    const int32_t count_size = config.server_dedup ? config.rank_count + 2 : 2;
     AscendC::DataCopyExtParams total_copy_params(
         1,
-        static_cast<uint32_t>(2 * kInt32Bytes),
+        static_cast<uint32_t>(count_size * kInt32Bytes),
         0,
         0,
         0);
@@ -1901,7 +1931,8 @@ __aicore__ inline void ProcessSourceDupTile(
         (__ubuf__ int32_t*)tile_count_ub.GetPhyAddr(),
         tile_tokens,
         config.topk,
-        config.max_tokens_per_rank);
+        config.max_tokens_per_rank,
+        config.server_dedup);
     AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
     AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
     int32_t raw_group_count = 0;
@@ -2326,6 +2357,10 @@ __aicore__ inline void PublishSourceDupPayloads(
 
 }  // namespace
 
+__aicore__ __attribute__((noinline)) void RunCombinePlanning(
+    GM_ADDR dst, GM_ADDR groups, GM_ADDR dups, GM_ADDR counts,
+    ascend_moonep::PlanningTilingData tiling, uint64_t begin, uint64_t baseEnd);
+
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void planning_kernel(
     GM_ADDR topk_idx,
     GM_ADDR symmetric_buffer,
@@ -2348,6 +2383,13 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void planning_ker
     ascend_moonep::PlanningTilingData tiling,
     uint64_t ffts_addr) {
     (void)ffts_addr;
+    const uint64_t planning_begin = tiling.combine_mode ? GetSystemCycle() : 0U;
+    // Hand-built/synthetic dst uses this SAME entry point, skipping only base routing.
+    if (tiling.combine_mode == 2U) {
+        RunCombinePlanning(dst, dup_groups, dup_loffs, dup_counts,
+                           tiling, planning_begin, planning_begin);
+        return;
+    }
 
     const int32_t core_idx = get_block_idx() * get_subblockdim() + get_subblockid();
     const int32_t core_num = get_block_num() * get_subblockdim();
@@ -2374,6 +2416,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void planning_ker
         dup_payload_done_flag_off + ((R + 7) / 8) * 8;
     const int32_t dup_loffs_scratch_off =
         dup_groups_scratch_off + ((NvS * 3 + 7) / 8) * 8;
+    // The secondary scratch is the last region with an unchanged start; the host sizes it as 8*NvS int32s.
     const int32_t source_dup_tokens_per_tile =
         static_cast<int32_t>(tiling.source_dup_tokens_per_tile);
     const int32_t owner_reduce_tile_elems =
@@ -3625,7 +3668,8 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void planning_ker
             NvS,
             core_idx,
             core_num,
-            source_dup_tokens_per_tile};
+            source_dup_tokens_per_tile,
+            static_cast<int32_t>(tiling.server_dedup)};
         SourceDupPartition source_dup_partition{};
         SourceDupUbLayout source_dup_ub_layout{};
         SourceDupWorkspaceLayout source_dup_workspace_layout{};
@@ -3637,6 +3681,8 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void planning_ker
             source_dup_ub_layout,
             source_dup_workspace_layout);
 
+        // 1. The source side scans tokens under the chosen rank/server domain and pre-packs group and secondary
+        // addresses by the actual primary card.
         CountAndPrebuildSourceDupTiles(
             source_dup_config,
             source_dup_partition,
@@ -3659,6 +3705,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void planning_ker
 
         // Each destination waits on its local inbox, computes source-rank
         // prefixes, and stages them for a parallel return to the sources.
+        // Server mode additionally exports the group starts ordered by src_rank.
         if (core_idx == 0) {
             BuildSourceDupDestinationPrefixes(
                 source_dup_config,
@@ -3669,6 +3716,8 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void planning_ker
                 dup_count_inbox_off);
         }
         AscendC::SyncAll<true>();
+        // 4. Return both prefix kinds to the source side as the receive bases for each source to send groups and
+        // secondaries.
         PublishSourceDupPrefixes(
             source_dup_config,
             resource,
@@ -3690,6 +3739,8 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void planning_ker
         AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
         AscendC::SyncAll<true>();
 
+        // 6. Send metadata over non-overlapping intervals and publish this source completion notice only after all
+        // local cores finish.
         PublishSourceDupPayloads(
             source_dup_config,
             source_dup_partition,
@@ -3703,6 +3754,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void planning_ker
             dup_groups_scratch_off,
             dup_loffs_scratch_off);
 
+        // 7. After all source metadata arrives, copy into this card output tensor in chunks by the actual G/D.
         WaitForSourceDupPayloadDoneFlags(
             source_dup_config,
             resource,
@@ -3722,6 +3774,15 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void planning_ker
             dup_loffs_scratch_off);
     }
 
+    if (tiling.combine_mode == 1U) {
+        // Replace the old inter-kernel boundary: finish every base-planner DMA
+        // before reusing UB and let every local core observe complete routing.
+        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+        AscendC::SyncAll<true>();
+        RunCombinePlanning(dst, dup_groups, dup_loffs, dup_counts,
+                           tiling, planning_begin, GetSystemCycle());
+    }
 }
 
 extern "C" ASCEND_MOONEP_EXPORT void planning_kernel_do(
@@ -3768,4 +3829,1327 @@ extern "C" ASCEND_MOONEP_EXPORT void planning_kernel_do(
         dup_key_workspace,
         *td,
         ffts_addr);
+}
+
+namespace CombineExecutionPlanning {
+
+// ---- Begin combine planning SIMT functions ----
+// Internal vector functions of planning_kernel, NOT separately launched kernels.
+// All SIMT stores target private UB. Packed GM tables are still written by MTE3.
+constexpr uint32_t kPlanSimtTokens = 64U;
+constexpr uint32_t kPlanSimtColumns = 21U;
+constexpr uint32_t kPlanDecodedUb = 16384U; // 64 * 40 words
+constexpr uint32_t kPlanPrefixUb = 26624U;  // 21 * 64 words
+constexpr uint32_t kPlanTotalsUb = 32000U;  // end[0:21], begin[32:53]
+constexpr uint32_t kPlanChunksUb = 32256U; // 21 columns * eight 8-token chunks
+constexpr uint32_t kPlanTxUb = 98304U;     // 64 * 16 * 4 words
+constexpr uint32_t kPlanContributorUb = 114688U;
+constexpr uint32_t kPlanRelayUb = 131072U; // 8 lanes, each 64 * 16 * 2 words
+constexpr uint32_t kPlanRelayLaneBytes = 8192U;
+static_assert(kPlanRelayUb + 8U * kPlanRelayLaneBytes <= 216U * 1024U);
+// Route ping-pong uses [0,16KiB) and [64KiB,80KiB). No writer aliases it.
+static_assert(kPlanDecodedUb + 64U * 40U * 4U == kPlanPrefixUb);
+static_assert(kPlanPrefixUb + 21U * 64U * 4U == kPlanTotalsUb);
+static_assert(kPlanTotalsUb + 64U * 4U <= 65536U);
+static_assert(kPlanChunksUb + 21U * 8U * 4U <= 65536U);
+
+// One thread decodes one token. Keep only our active rows and our domain's
+// suppressed members; representative order is the original top-k order.
+__simt_callee__ inline void DecodeCombineTokensSimt(
+    __ubuf__ int32_t* routes, __ubuf__ uint32_t* decoded,
+    __ubuf__ uint32_t* prefix, uint32_t tokens, uint32_t k,
+    uint32_t n, uint32_t r, uint32_t rank, uint32_t source, uint32_t server) {
+    const uint32_t t = threadIdx.x;
+    if (t >= kPlanSimtTokens) return;
+    for (uint32_t col = 0U; col < kPlanSimtColumns; ++col)
+        prefix[col * kPlanSimtTokens + t] = 0U;
+    if (t >= tokens) return;
+    auto row = decoded + t * 40U;
+    uint32_t own = 0U, suppressed = 0U, primaries = 0U, finalBase = 0U;
+    uint32_t representative = 0U, representativePeer = 0U, ownRepresentative = 0U;
+    uint32_t ownSuppressed = 0U, error = 0U;
+    for (uint32_t j = 0U; j < k; ++j) {
+        const int32_t encoded = routes[t * k + j];
+        const uint32_t bits = static_cast<uint32_t>(encoded);
+        const bool forwarded = (bits & 0xc0000000U) == 0x80000000U;
+        const uint32_t address = forwarded ? bits & 0x3fffffffU :
+            encoded >= 0 ? bits : ~bits;
+        const uint32_t peer = address / n;
+        const bool primary = encoded >= 0 || forwarded;
+        const bool active = primary || (server && peer / 8U == source / 8U);
+        error |= uint32_t(peer >= r);
+        finalBase += uint32_t(active && peer < rank);
+        if (peer == rank && active) {
+            if (primary) ownRepresentative = own;
+            row[own++] = address - peer * n;
+        }
+        if (server ? peer / 8U == rank / 8U : peer == rank) {
+            if (primary) {
+                ++primaries; representative = address; representativePeer = peer;
+            } else {
+                row[16U + suppressed++] = address;
+                ownSuppressed += uint32_t(peer == rank);
+            }
+        }
+    }
+    error |= uint32_t(suppressed && primaries != 1U);
+    const bool remote = !(server && source / 8U == rank / 8U);
+    const bool group = suppressed && representativePeer == rank;
+    const uint32_t lane = server ? representativePeer % 8U : 0U;
+    row[32] = representative; row[33] = representativePeer;
+    row[34] = ownRepresentative; row[35] = own; row[36] = suppressed;
+    prefix[t] = own;
+    prefix[64U + t] = uint32_t(group);
+    prefix[128U + t] = finalBase;
+    prefix[192U + t] = own - uint32_t(remote && group);
+    if (remote && suppressed) {
+        prefix[(4U + lane) * 64U + t] = suppressed + 1U;
+        prefix[(12U + lane) * 64U + t] = ownSuppressed + uint32_t(representativePeer == rank);
+    }
+    prefix[20U * 64U + t] = error;
+}
+
+__simt_callee__ inline void EmitCombineTokensSimt(
+    __ubuf__ uint32_t* decoded, __ubuf__ uint32_t* prefix,
+    __ubuf__ uint32_t* totals, __ubuf__ uint32_t* tx,
+    __ubuf__ uint32_t* contributors, __ubuf__ uint32_t* relays,
+    uint32_t tokens, uint32_t n, uint32_t rank, uint32_t source, uint32_t server) {
+    const uint32_t t = threadIdx.x;
+    if (t >= tokens) return;
+    auto row = decoded + t * 40U;
+    const uint32_t representative = row[32], peer = row[33];
+    const uint32_t ownRepresentative = row[34], own = row[35], suppressed = row[36];
+    const bool group = suppressed && peer == rank;
+    const bool remote = !(server && source / 8U == rank / 8U);
+    const uint32_t lane = server ? peer % 8U : 0U;
+    const uint32_t txIndex = prefix[t];
+    const uint32_t head = prefix[(4U + lane) * 64U + t];
+    if (remote && suppressed) {
+        uint32_t request = prefix[(12U + lane) * 64U + t] - totals[32U + 12U + lane];
+        for (uint32_t member = 0U; member <= suppressed; ++member) {
+            const uint32_t address = member ? row[16U + member - 1U] : representative;
+            if (peer == rank) {
+                const uint32_t pos = (head - totals[32U + 4U + lane] + member) * 4U;
+                contributors[pos] = member ? 0U : txIndex + ownRepresentative;
+                contributors[pos + 1U] = member ? 0U : suppressed + 1U;
+                contributors[pos + 2U] = server ? address : address % n;
+                contributors[pos + 3U] = 0U;
+            }
+            if (address / n == rank) {
+                const uint32_t pos = lane * (kPlanRelayLaneBytes / 4U) + request++ * 2U;
+                relays[pos] = address % n;
+                relays[pos + 1U] = head + member;
+            }
+        }
+    }
+    for (uint32_t j = 0U; j < own; ++j) {
+        const bool isHead = group && j == ownRepresentative;
+        const uint32_t pos = (txIndex - totals[32] + j) * 4U;
+        tx[pos] = row[j];
+        tx[pos + 1U] = isHead ? prefix[64U + t] : 0xffffffffU;
+        tx[pos + 2U] = isHead && remote ? head : 0xffffffffU;
+        tx[pos + 3U] = isHead && remote ? suppressed + 1U : 1U;
+    }
+}
+// Three prefix phases: eight independent chunks per column; chunk carries;
+// then add each carry. Every phase is separated by a full VF block barrier.
+__simt_callee__ inline void CombineChunkPrefixSimt(
+    __ubuf__ uint32_t* prefix, __ubuf__ uint32_t* chunks) {
+    for (uint32_t job = threadIdx.x; job < 21U * 8U; job += 64U) {
+        const uint32_t col = job / 8U, begin = (job % 8U) * 8U;
+        uint32_t sum = 0U;
+        for (uint32_t t = begin; t < begin + 8U; ++t) {
+            const uint32_t count = prefix[col * 64U + t];
+            prefix[col * 64U + t] = sum; sum += count;
+        }
+        chunks[job] = sum;
+    }
+}
+__simt_callee__ inline void CombineChunkCarrySimt(
+    __ubuf__ uint32_t* chunks, __ubuf__ uint32_t* totals) {
+    const uint32_t col = threadIdx.x;
+    if (col >= 21U) return;
+    uint32_t sum = totals[col];
+    totals[32U + col] = sum;
+    for (uint32_t chunk = 0U; chunk < 8U; ++chunk) {
+        const uint32_t count = chunks[col * 8U + chunk];
+        chunks[col * 8U + chunk] = sum; sum += count;
+    }
+    totals[col] = sum;
+}
+__simt_callee__ inline void CombineApplyCarrySimt(
+    __ubuf__ uint32_t* prefix, __ubuf__ uint32_t* chunks) {
+    const uint32_t t = threadIdx.x;
+    for (uint32_t col = 0U; col < 21U; ++col)
+        prefix[col * 64U + t] += chunks[col * 8U + t / 8U];
+}
+
+__simt_vf__ __launch_bounds__(64) inline void BuildCombineSliceSimt(
+    __ubuf__ int32_t* routes, __ubuf__ uint32_t* decoded,
+    __ubuf__ uint32_t* prefix, __ubuf__ uint32_t* totals,
+    __ubuf__ uint32_t* chunks, __ubuf__ uint32_t* tx,
+    __ubuf__ uint32_t* contributors, __ubuf__ uint32_t* relays,
+    uint32_t tokens, uint32_t k, uint32_t n, uint32_t r,
+    uint32_t rank, uint32_t source, uint32_t server) {
+    DecodeCombineTokensSimt(routes, decoded, prefix, tokens, k, n, r, rank, source, server);
+    asc_syncthreads();
+    CombineChunkPrefixSimt(prefix, chunks);
+    asc_syncthreads();
+    CombineChunkCarrySimt(chunks, totals);
+    asc_syncthreads();
+    CombineApplyCarrySimt(prefix, chunks);
+    asc_syncthreads();
+    // Uniform test AFTER all barriers, including inactive tail threads.
+    // Never emit records from invalid routes; host reports the error after VF.
+    if (!totals[20U])
+        EmitCombineTokensSimt(decoded, prefix, totals, tx, contributors, relays,
+                              tokens, n, rank, source, server);
+}
+
+__simt_vf__ __launch_bounds__(64) inline void AdjustCombineRowsSimt(
+    __ubuf__ uint32_t* rows, uint32_t size, uint32_t kind,
+    uint32_t txBase, uint32_t groupBase, uint32_t scratchBase) {
+    const uint32_t j = threadIdx.x;
+    if (j >= size) return;
+    const uint32_t off = j * (kind == 2U ? 2U : 4U);
+    if (kind == 0U) {
+        if (rows[off + 1U] != 0xffffffffU) rows[off + 1U] += groupBase;
+        if (rows[off + 2U] != 0xffffffffU) rows[off + 2U] += scratchBase;
+    } else if (kind == 1U) {
+        if (rows[off + 1U]) rows[off] += txBase;
+    } else rows[off + 1U] += scratchBase;
+}
+
+__simt_vf__ __launch_bounds__(32) inline void PrefixCombineTaskStatsSimt(
+    __ubuf__ uint32_t* stats, __ubuf__ uint32_t* totals,
+    uint32_t tiles, uint32_t width) {
+    const uint32_t col = threadIdx.x;
+    if (col >= 4U + 2U * width) return;
+    const uint32_t lane = col < 4U ? 0U : (col - 4U) % width;
+    const uint32_t field = col < 4U ? col : 16U + lane * 4U + uint32_t(col >= 4U + width);
+    uint32_t sum = 0U;
+    for (uint32_t tile = 0U; tile < tiles; ++tile) {
+        auto row = stats + tile * 64U;
+        if (col < 2U) row[4U + col] = sum;
+        else if (col >= 4U) row[field + 2U] = sum;
+        sum += row[field];
+    }
+    totals[col] = sum;
+}
+
+__simt_vf__ __launch_bounds__(256) inline void CountFinalRoutesSimt(
+    __ubuf__ int32_t* routes, __ubuf__ uint32_t* counts,
+    uint32_t size, uint32_t n, uint32_t rank, uint32_t server) {
+    for (uint32_t j = threadIdx.x; j < size; j += 256U) {
+        const int32_t v = routes[j];
+        const uint32_t bits = static_cast<uint32_t>(v);
+        const bool forwarded = (bits & 0xc0000000U) == 0x80000000U;
+        const uint32_t raw = forwarded ? bits & 0x3fffffffU : v >= 0 ? bits : ~bits;
+        const uint32_t peer = raw / n;
+        if (v >= 0 || forwarded || (server && peer / 8U == rank / 8U))
+            asc_atomic_add(counts + peer * 8U, 1U);
+    }
+}
+
+// Each chunk owns two consecutive tokens; its private peer cursors make
+// emission deterministic. 32*(R+1) words fit in remaining UB even at R=1024.
+constexpr uint32_t kFinalChunksUb = 81920U;
+static_assert(kFinalChunksUb + 32U * 1025U * 4U <= 216U * 1024U);
+__simt_callee__ inline void CountFinalChunksSimt(
+    __ubuf__ int32_t* routes, __ubuf__ uint32_t* hist,
+    __ubuf__ uint32_t* packed, uint32_t tokens, uint32_t k,
+    uint32_t n, uint32_t r, uint32_t rank, uint32_t server) {
+    const uint32_t thread = threadIdx.x;
+    for (uint32_t i = thread; i < tokens * 32U; i += 128U) packed[i] = 0U;
+    if (thread >= 32U) return;
+    auto row = hist + thread * (r + 1U);
+    for (uint32_t peer = 0U; peer < r; ++peer) row[peer] = 0U;
+    const uint32_t end = thread * 2U + 2U < tokens ? thread * 2U + 2U : tokens;
+    for (uint32_t t = thread * 2U; t < end; ++t) for (uint32_t j = 0U; j < k; ++j) {
+        const int32_t v = routes[t * k + j];
+        const uint32_t bits = static_cast<uint32_t>(v);
+        const bool forwarded = (bits & 0xc0000000U) == 0x80000000U;
+        const uint32_t raw = forwarded ? bits & 0x3fffffffU : v >= 0 ? bits : ~bits;
+        const uint32_t peer = raw / n;
+        if (v >= 0 || forwarded || (server && peer / 8U == rank / 8U)) ++row[peer];
+    }
+}
+__simt_callee__ inline void PrefixFinalChunksSimt(
+    __ubuf__ uint32_t* hist, __ubuf__ uint32_t* cursors, uint32_t r) {
+    for (uint32_t peer = threadIdx.x; peer < r; peer += 128U) {
+        uint32_t sum = cursors[peer];
+        for (uint32_t chunk = 0U; chunk < 32U; ++chunk) {
+            const uint32_t off = chunk * (r + 1U) + peer, count = hist[off];
+            hist[off] = sum; sum += count;
+        }
+        cursors[peer] = sum;
+    }
+}
+__simt_callee__ inline void EmitFinalChunksSimt(
+    __ubuf__ int32_t* routes, __ubuf__ uint32_t* hist,
+    __ubuf__ uint32_t* packed, uint32_t tokens, uint32_t k,
+    uint32_t n, uint32_t r, uint32_t rank, uint32_t server) {
+    const uint32_t chunk = threadIdx.x;
+    if (chunk >= 32U) return;
+    auto row = hist + chunk * (r + 1U);
+    const uint32_t end = chunk * 2U + 2U < tokens ? chunk * 2U + 2U : tokens;
+    for (uint32_t t = chunk * 2U; t < end; ++t) {
+        uint32_t count = 0U;
+        for (uint32_t j = 0U; j < k; ++j) {
+            const int32_t v = routes[t * k + j];
+            const uint32_t bits = static_cast<uint32_t>(v);
+            const bool forwarded = (bits & 0xc0000000U) == 0x80000000U;
+            const uint32_t raw = forwarded ? bits & 0x3fffffffU : v >= 0 ? bits : ~bits;
+            const uint32_t peer = raw / n;
+            if (!(v >= 0 || forwarded || (server && peer / 8U == rank / 8U))) continue;
+            const uint32_t ordinal = row[peer]++;
+            packed[t * 32U + 1U + count++] = peer == rank ? 0x80000000U | (raw % n) : ordinal;
+        }
+        packed[t * 32U] = count;
+    }
+}
+__simt_vf__ __launch_bounds__(128) inline void BuildFinalRoutesSimt(
+    __ubuf__ int32_t* routes, __ubuf__ uint32_t* hist,
+    __ubuf__ uint32_t* cursors, __ubuf__ uint32_t* packed,
+    uint32_t tokens, uint32_t k, uint32_t n, uint32_t r, uint32_t rank, uint32_t server) {
+    CountFinalChunksSimt(routes, hist, packed, tokens, k, n, r, rank, server);
+    asc_syncthreads();
+    PrefixFinalChunksSimt(hist, cursors, r);
+    asc_syncthreads();
+    EmitFinalChunksSimt(routes, hist, packed, tokens, k, n, r, rank, server);
+}
+// ---- End combine planning SIMT functions ----
+
+using namespace ascend_moonep;
+constexpr uint32_t kCores = kCombinePutCores, kBatch = kCombinePutBatchRows, kTile = 8192U;
+
+template <typename T>
+__aicore__ inline LocalTensor<T> Ub(uint32_t bytes, uint32_t count) {
+    LocalTensor<T> t;
+    t.address_.logicPos = static_cast<uint8_t>(TPosition::VECIN);
+    t.address_.bufferAddr = bytes;
+    t.address_.dataLen = count * sizeof(T);
+    return t;
+}
+
+template <typename T>
+__aicore__ inline void Load(LocalTensor<T> ub, const __gm__ T* p, uint32_t n) {
+    GlobalTensor<T> gm;
+    gm.SetGlobalBuffer(const_cast<__gm__ T*>(p), n);
+    DataCopyExtParams cp{1, n * static_cast<uint32_t>(sizeof(T)), 0, 0, 0};
+    DataCopyPadExtParams<T> pad{false, 0, 0, 0};
+    DataCopyPad(ub, gm, cp, pad);
+}
+
+template <typename T>
+__aicore__ inline void Store(__gm__ T* p, LocalTensor<T> ub, uint32_t n) {
+    GlobalTensor<T> gm;
+    gm.SetGlobalBuffer(p, n);
+    DataCopyExtParams cp{1, n * static_cast<uint32_t>(sizeof(T)), 0, 0, 0};
+    DataCopyPad(gm, ub, cp);
+}
+
+__aicore__ inline void Flush(__gm__ void* p) {
+    dcci_cacheline(reinterpret_cast<__gm__ uint8_t*>(p));
+}
+
+__aicore__ inline uint32_t Raw(int32_t v) {
+    return ascend_moonep::IsMoonEPServerForwardedRoute(v)
+        ? ascend_moonep::DecodeMoonEPServerForwardedRoute(v)
+        : v >= 0 ? static_cast<uint32_t>(v)
+                 : static_cast<uint32_t>(-static_cast<int64_t>(v) - 1);
+}
+
+__aicore__ inline bool Primary(int32_t v) {
+    return v >= 0 || ascend_moonep::IsMoonEPServerForwardedRoute(v);
+}
+
+
+struct CombinePlanBuilder {
+    __gm__ uint8_t* ws;
+    // groups/dups/counts remain launch-ABI inputs for existing callers; the
+    // combine metadata builder derives all its tables from published dst.
+    const __gm__ int32_t *dst, *groups, *dups, *counts;
+    CombinePutLayout p;
+    uint32_t n, h, k, r, rank, core;
+    bool server;
+    __gm__ uint8_t* plan;
+    CombineExecutionPlanLayout q;
+    uint32_t coreCount = kCores; // Fused planner inherits num_sms (default 32).
+    struct TokenRoutes {
+        uint32_t raw[16], peer[16], members[16];
+        bool primary[16], active[16];
+        uint32_t suppressed[16], suppressedCount, ownSuppressed;
+    };
+
+    __aicore__ __gm__ int32_t* Meta(uint64_t base, uint64_t index) {
+        // Only scalar-written outputs use Meta; packed tables are MTE3-written.
+        if (base == p.source_counts)
+            return reinterpret_cast<__gm__ int32_t*>(plan + q.source_counts + index * 64U);
+        if (base == p.relay_ranges)
+            return reinterpret_cast<__gm__ int32_t*>(plan + q.relay_ranges + index * 64U);
+        return reinterpret_cast<__gm__ int32_t*>(ws + base + index * 64U);
+    }
+    __aicore__ uint32_t Width() const { return server ? 8U : 1U; }
+    __aicore__ uint32_t Lane(uint32_t peer) const { return server ? peer % 8U : 0U; }
+    __aicore__ bool LocalSource(uint32_t source) const {
+        return server && source / 8U == rank / 8U;
+    }
+    __aicore__ bool LocalDomain(uint32_t peer) const {
+        return server ? peer / 8U == rank / 8U : peer == rank;
+    }
+    // Each core owns disjoint source intervals. Adjacent intervals can share a
+    // GM cacheline: never scalar-write packed records (DCCI is a full-line RMW).
+    // Buffer up to 64 records in private UB, then MTE3 stores only valid bytes.
+    // No padding is written to GM, including the final partial batch.
+    struct PlanWriter {
+        LocalTensor<uint32_t> buf;
+        __gm__ uint32_t* out;
+        uint32_t words, count, ubOffset, bank;
+    };
+    // One outstanding MTE3 submission, with two private UB banks per writer.
+    // Wait only before the next submission, not immediately after every 64 rows.
+    bool writerPending = false;
+    __aicore__ void WaitWriter() {
+        if (writerPending) {
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            writerPending = false;
+        }
+    }
+    __aicore__ PlanWriter Writer(uint32_t ubOffset, uint64_t table,
+                                uint64_t first, uint32_t words) {
+        return {Ub<uint32_t>(ubOffset, 64U * words),
+                reinterpret_cast<__gm__ uint32_t*>(plan + table) + first * words,
+                words, 0U, ubOffset, 0U};
+    }
+    // During planning relay_hidden has no live payload (Init fences the previous
+    // invocation). Use it as source-private staging, then compact only valid rows.
+    // Each source owns N TX rows, N contributors and Width()*N relay requests.
+    // This removes the count-only route pass, without changing any output order.
+    __aicore__ bool UseStagedPlan() const {
+        return r <= 128U && uint64_t(r) * (32U + 8U * Width()) <= uint64_t(h) * 16U;
+    }
+    __aicore__ uint64_t StagedTable(uint32_t kind, uint32_t source,
+                                   uint32_t lane = 0U) const {
+        const uint64_t segment = uint64_t(r) * n * 16U;
+        return kind == 0U ? uint64_t(source) * n * 16U :
+               kind == 1U ? segment + uint64_t(source) * n * 16U :
+               2U * segment + (uint64_t(lane) * r + source) * n * 8U;
+    }
+    __aicore__ PlanWriter StagedWriter(uint32_t ubOffset, uint32_t kind,
+                                      uint32_t source, uint32_t lane = 0U) {
+        const uint32_t words = kind == 2U ? 2U : 4U;
+        return {Ub<uint32_t>(ubOffset, 64U * words),
+                reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden +
+                    StagedTable(kind, source, lane)), words, 0U, ubOffset, 0U};
+    }
+    __aicore__ void FinishWriter(PlanWriter& w) {
+        if (!w.count) return;
+        WaitWriter();
+        SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        Store(w.out, w.buf, w.count * w.words);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        writerPending = true;
+        w.out += w.count * w.words;
+        w.count = 0U;
+        w.bank ^= 1U;
+        w.buf = Ub<uint32_t>(w.ubOffset + w.bank * 65536U, 64U * w.words);
+    }
+    __aicore__ void Append(PlanWriter& w, uint32_t a, uint32_t b,
+                           uint32_t c = 0U, uint32_t d = 0U) {
+        const uint32_t off = w.count * w.words;
+        w.buf.SetValue(off, a); w.buf.SetValue(off + 1U, b);
+        if (w.words == 4U) {
+            w.buf.SetValue(off + 2U, c); w.buf.SetValue(off + 3U, d);
+        }
+        if (++w.count == 64U) FinishWriter(w);
+    }
+    template <typename T>
+    __aicore__ inline void Copy(__gm__ T* to, const __gm__ T* from, uint32_t size) {
+        auto buf = Ub<T>(0, kTile);
+        for (uint32_t off = 0; off < size; off += kTile) {
+            uint32_t count = size - off < kTile ? size - off : kTile;
+            Load(buf, from + off, count);
+            SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+            Store(to + off, buf, count);
+            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+        }
+    }
+    __aicore__ void ClearReadyFlags() {
+        // Same 8-byte fields as before, NOT a memset of the padded ready arena.
+        // A strided MTE transfer replaces thousands of scalar store+DCCI pairs.
+        // UB has one zero-padded 32-byte source block per 8-byte destination.
+        auto zero = Ub<int32_t>(0U, 8192U);
+        Duplicate(zero, int32_t(0), 8192U);
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        const uint64_t end = p.magic + uint64_t(kCores) * 512U;
+        const uint64_t stride = uint64_t(coreCount) * 512U;
+        for (uint64_t off = p.relay_ready + uint64_t(core) * 512U; off < end;) {
+            const uint64_t left = (end - 1U - off) / stride + 1U;
+            const uint32_t count = left < 1024U ? static_cast<uint32_t>(left) : 1024U;
+            GlobalTensor<int32_t> gm;
+            gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(ws + off));
+            DataCopyExtParams cp{static_cast<uint16_t>(count), 8U, 0U,
+                                 static_cast<uint32_t>(stride - 8U), 0U};
+            DataCopyPad(gm, zero, cp);
+            off += uint64_t(count) * stride;
+        }
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    }
+    __aicore__ void Init() {
+        aclshmemx_sync_vec_all(); // exclude an earlier plan/payload using this workspace
+        // Once per plan, never once per combine. No reverse/group table clears.
+        ClearReadyFlags();
+        for (uint32_t s = core; s < r; s += coreCount) {
+            auto flag = reinterpret_cast<__gm__ uint64_t*>(
+                ws + p.source_input_ready + uint64_t(s) * 512U);
+            *flag = 0U; Flush(flag);
+        }
+        if (core == 0U) {
+            auto flag = reinterpret_cast<__gm__ uint64_t*>(ws + p.final_gate);
+            *flag = 0U; Flush(flag);
+        }
+    }
+    __aicore__ void PublishRoutes() {
+        // TileXR-style published base routes. Reuse the retired reverse_send
+        // arena, but pack int32 routes contiguously (not 64-byte records).
+        auto published = reinterpret_cast<__gm__ int32_t*>(ws + p.reverse_send);
+        for (uint32_t first = core * kTile; first < n; first += coreCount * kTile) {
+            const uint32_t size = n - first < kTile ? n - first : kTile;
+            Copy(published + first, dst + first, size);
+        }
+        PipeBarrier<PIPE_ALL>();
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemx_sync_vec_all(); // publish completion and ready initialization on every rank
+    }
+    __aicore__ LocalTensor<int32_t> LoadRoutes(uint32_t source, uint32_t first,
+                                             uint32_t size) {
+        auto local = reinterpret_cast<__gm__ int32_t*>(ws + p.reverse_send);
+        auto remote = reinterpret_cast<__gm__ int32_t*>(aclshmem_ptr(local, source));
+        auto routes = Ub<int32_t>(0U, kTile);
+        SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+        WaitFlag<HardEvent::S_MTE2>(EVENT_ID0); // previous scalar route reads retired
+        Load(routes, remote + first, size);
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        return routes;
+    }
+    // The retired relay_publish arena is 8*N*64 bytes: it holds R complete
+    // int32 route arrays for R<=128. No workspace/plan ABI or allocation change.
+    // Larger topologies retain the original second remote read.
+    __aicore__ bool CacheRoutesEnabled() const { return r <= 128U; }
+    __aicore__ void PrefetchRoutes(uint32_t source, uint32_t first, uint32_t size,
+                                   uint32_t bank, bool cached) {
+        // Also fences a previous route-cache store before its UB bank is reused.
+        WaitWriter();
+        const __gm__ int32_t* from;
+        if (cached && CacheRoutesEnabled()) {
+            from = reinterpret_cast<__gm__ int32_t*>(ws + p.relay_publish) +
+                   uint64_t(source) * n;
+        } else {
+            auto published = reinterpret_cast<__gm__ int32_t*>(ws + p.reverse_send);
+            from = reinterpret_cast<__gm__ int32_t*>(aclshmem_ptr(published, source));
+        }
+        const event_t event = bank == 0U ? EVENT_ID0 : EVENT_ID1;
+        SetFlag<HardEvent::S_MTE2>(event);
+        WaitFlag<HardEvent::S_MTE2>(event);
+        Load(Ub<int32_t>(bank * 65536U, kTile), from + first, size);
+        SetFlag<HardEvent::MTE2_S>(event);
+    }
+    __aicore__ LocalTensor<int32_t> AwaitRoutes(uint32_t bank) {
+        WaitFlag<HardEvent::MTE2_S>(bank == 0U ? EVENT_ID0 : EVENT_ID1);
+        return Ub<int32_t>(bank * 65536U, kTile);
+    }
+    __aicore__ void CacheRoutes(uint32_t source, uint32_t first, uint32_t size,
+                                LocalTensor<int32_t> routes) {
+        if (!CacheRoutesEnabled()) return;
+        WaitWriter();
+        SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        Store(reinterpret_cast<__gm__ int32_t*>(ws + p.relay_publish) +
+              uint64_t(source) * n + first, routes, size);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        writerPending = true;
+    }
+    __aicore__ void DecodeToken(LocalTensor<int32_t> routes, uint32_t offset,
+                               uint32_t source, TokenRoutes& token) {
+        uint32_t primaries = 0U, representative = 0U;
+        token.suppressedCount = 0U;
+        token.ownSuppressed = 0U;
+        for (uint32_t j = 0U; j < k; ++j) {
+            const int32_t encoded = routes.GetValue(offset + j);
+            token.raw[j] = Raw(encoded);
+            token.peer[j] = token.raw[j] / n;
+            if (token.peer[j] >= r)
+                aclshmemi_kernel_abort("combine plan invalid dst source=%u rank=%u\n", source, rank);
+            token.primary[j] = Primary(encoded);
+            token.active[j] = token.primary[j] ||
+                (server && token.peer[j] / 8U == source / 8U);
+            token.members[j] = 1U;
+            if (LocalDomain(token.peer[j])) {
+                if (token.primary[j]) { ++primaries; representative = j; }
+                else {
+                    token.suppressed[token.suppressedCount++] = j;
+                    if (token.peer[j] == rank) ++token.ownSuppressed;
+                }
+            }
+        }
+        // Every LocalDomain route is in the same domain. Collect its suppressed
+        // members once (in top-k order), instead of rescanning K for every j.
+        // Keep the upstream representative, including a primary not at index 0.
+        if (token.suppressedCount && primaries != 1U)
+            aclshmemi_kernel_abort("combine plan ambiguous primary source=%u rank=%u\n", source, rank);
+        if (token.suppressedCount)
+            token.members[representative] += token.suppressedCount;
+    }
+    // Count directly from K encoded routes. Do not materialize TokenRoutes or
+    // traverse its arrays again; the full decoding is needed only by the fill.
+    __aicore__ void CountToken(LocalTensor<int32_t> routes, uint32_t offset,
+        uint32_t source, uint32_t& results, uint32_t& finalBase,
+        uint32_t& direct, uint32_t& groupCount, uint32_t* scratch,
+        uint32_t* requests) {
+        uint32_t primaries = 0U, representative = 0U;
+        uint32_t suppressed = 0U, ownSuppressed = 0U;
+        const bool local = LocalSource(source);
+        for (uint32_t j = 0U; j < k; ++j) {
+            const int32_t encoded = routes.GetValue(offset + j);
+            const uint32_t peer = Raw(encoded) / n;
+            if (peer >= r)
+                aclshmemi_kernel_abort("combine plan invalid dst source=%u rank=%u\n", source, rank);
+            const bool primary = Primary(encoded);
+            const bool active = primary || (server && peer / 8U == source / 8U);
+            if (active && peer < rank) ++finalBase;
+            if (active && peer == rank) { ++results; ++direct; }
+            if (LocalDomain(peer)) {
+                if (primary) { ++primaries; representative = peer; }
+                else { ++suppressed; ownSuppressed += peer == rank; }
+            }
+        }
+        if (!suppressed) return;
+        if (primaries != 1U)
+            aclshmemi_kernel_abort("combine plan ambiguous primary source=%u rank=%u\n", source, rank);
+        if (representative == rank) {
+            ++groupCount;
+            if (!local) --direct; // This primary is a reduced, not DIRECT, row.
+        }
+        if (!local) {
+            const uint32_t lane = Lane(representative);
+            scratch[lane] += suppressed + 1U;
+            requests[lane] += ownSuppressed + uint32_t(representative == rank);
+        }
+    }
+    __aicore__ void CountSources(bool synchronize = true) {
+        const uint32_t pageRows = (kTile / k) * k;
+        for (uint32_t source = core; source < r; source += coreCount) {
+            uint32_t results = 0U, finalBase = 0U, direct = 0U, groupCount = 0U;
+            uint32_t scratch[8] = {}, requests[8] = {};
+            PrefetchRoutes(source, 0U, n < pageRows ? n : pageRows, 0U, false);
+            for (uint32_t first = 0U; first < n; first += pageRows) {
+                const uint32_t size = n - first < pageRows ? n - first : pageRows;
+                const uint32_t bank = (first / pageRows) & 1U;
+                auto routes = AwaitRoutes(bank);
+                const uint32_t next = first + size;
+                if (next < n)
+                    PrefetchRoutes(source, next, n - next < pageRows ? n - next : pageRows,
+                                   bank ^ 1U, false);
+                CacheRoutes(source, first, size, routes);
+                for (uint32_t offset = 0U; offset < size; offset += k) {
+                    CountToken(routes, offset, source, results, finalBase,
+                               direct, groupCount, scratch, requests);
+                }
+            }
+            WaitWriter();
+            auto sc = Meta(p.source_counts, source);
+            sc[0] = results; sc[1] = finalBase; sc[2] = 0;
+            sc[3] = direct; sc[4] = 0; sc[5] = scratch[Lane(rank)]; sc[6] = 0;
+            Flush(sc);
+            auto gc = Meta(p.counts_send, source);
+            gc[0] = groupCount; gc[1] = 0; Flush(gc);
+            for (uint32_t lane = 0U; lane < Width(); ++lane) {
+                // Planner-only local stats: {scratchCount, requestCount,
+                // scratchPrefix, requestPrefix}; no remote metadata PUT.
+                auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source);
+                stats[0] = scratch[lane]; stats[1] = requests[lane];
+                stats[2] = 0; stats[3] = 0; Flush(stats);
+            }
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        if (synchronize) aclshmemi_sync_core<true>();
+    }
+    __aicore__ void BuildSourcePrefixes() {
+        for (uint32_t laneIndex = core; laneIndex < Width(); laneIndex += coreCount) {
+            uint32_t scratch = 0U, requests = 0U, results = 0U, groups = 0U;
+            for (uint32_t source = 0U; source < r; ++source) {
+                auto stats = Meta(p.relay_ranges_send, uint64_t(laneIndex) * r + source);
+                Flush(stats);
+                if (static_cast<uint32_t>(stats[0]) > n ||
+                    uint64_t(scratch) + stats[0] > 8ULL * n ||
+                    uint64_t(requests) + stats[1] > n)
+                    aclshmemi_kernel_abort("combine plan scratch/relay capacity rank=%u source=%u\n", rank, source);
+                stats[2] = scratch; stats[3] = requests; Flush(stats);
+                auto range = Meta(p.relay_ranges, uint64_t(laneIndex) * r + source);
+                range[0] = requests; range[1] = stats[1]; Flush(range);
+                if (laneIndex == Lane(rank)) {
+                    auto sc = Meta(p.source_counts, source); Flush(sc);
+                    if (uint64_t(results) + sc[0] > n)
+                        aclshmemi_kernel_abort("combine plan tx capacity rank=%u\n", rank);
+                    sc[2] = results; sc[4] = scratch; Flush(sc);
+                    results += sc[0];
+                    auto gc = Meta(p.counts_send, source); Flush(gc);
+                    gc[1] = groups; groups += gc[0]; Flush(gc);
+                }
+                scratch += stats[0]; requests += stats[1];
+            }
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemi_sync_core<true>();
+    }
+    __aicore__ void WriteMember(uint32_t ingress, uint32_t head, uint32_t txIndex,
+        uint32_t count, uint32_t member, uint32_t address, uint32_t* requests,
+        PlanWriter& contributors, PlanWriter* relays) {
+        if (ingress == rank) {
+            Append(contributors, member == 0U ? txIndex : 0U,
+                   member == 0U ? count : 0U, server ? address : address % n, 0U);
+        }
+        if (address / n == rank) {
+            const uint32_t lane = Lane(ingress), ordinal = requests[lane]++;
+            if (ordinal >= n)
+                aclshmemi_kernel_abort("combine plan relay row capacity rank=%u\n", rank);
+            Append(relays[lane], address % n, head + member);
+        }
+    }
+    // Fused decode/count/emit for the staged path. Most top-k routes belong to
+    // other servers: retain only this rank's active rows and our domain's
+    // suppressed contributors, instead of populating and revisiting K-wide
+    // raw/peer/active/primary/member arrays for every token.
+    __aicore__ void StageToken(LocalTensor<int32_t> routes, uint32_t offset,
+        uint32_t source, uint32_t& txIndex, uint32_t& groupIndex,
+        uint32_t& finalBase, uint32_t& direct, uint32_t* scratch,
+        uint32_t* requests, PlanWriter& txWriter, PlanWriter& contributors,
+        PlanWriter* relays) {
+        uint32_t ownRows[16], suppressedRows[16];
+        uint32_t ownCount = 0U, suppressedCount = 0U, primaries = 0U;
+        uint32_t representative = 0U, representativePeer = 0U, ownRepresentative = 0U;
+        const bool local = LocalSource(source);
+        for (uint32_t j = 0U; j < k; ++j) {
+            const int32_t encoded = routes.GetValue(offset + j);
+            const uint32_t address = Raw(encoded), peer = address / n;
+            if (peer >= r)
+                aclshmemi_kernel_abort("combine plan invalid dst source=%u rank=%u\n", source, rank);
+            const bool primary = Primary(encoded);
+            const bool active = primary || (server && peer / 8U == source / 8U);
+            if (active && peer < rank) ++finalBase;
+            if (peer == rank && active) {
+                if (primary) ownRepresentative = ownCount;
+                ownRows[ownCount++] = address % n;
+            }
+            if (LocalDomain(peer)) {
+                if (primary) {
+                    ++primaries; representative = address; representativePeer = peer;
+                } else {
+                    suppressedRows[suppressedCount++] = address;
+                }
+            }
+        }
+        direct += ownCount;
+        uint32_t group = 0xffffffffU, head = 0xffffffffU, members = 1U;
+        if (suppressedCount) {
+            if (primaries != 1U)
+                aclshmemi_kernel_abort("combine plan ambiguous primary source=%u rank=%u\n", source, rank);
+            if (representativePeer == rank) group = groupIndex++;
+            if (!local) {
+                const uint32_t lane = Lane(representativePeer);
+                const uint32_t groupHead = scratch[lane], count = suppressedCount + 1U;
+                WriteMember(representativePeer, groupHead, txIndex + ownRepresentative,
+                            count, 0U, representative, requests, contributors, relays);
+                for (uint32_t member = 0U; member < suppressedCount; ++member)
+                    WriteMember(representativePeer, groupHead, txIndex + ownRepresentative,
+                                count, member + 1U, suppressedRows[member], requests, contributors, relays);
+                scratch[lane] += count;
+                if (representativePeer == rank) {
+                    head = groupHead; members = count; --direct;
+                }
+            }
+        }
+        for (uint32_t j = 0U; j < ownCount; ++j) {
+            const bool isHead = group != 0xffffffffU && j == ownRepresentative;
+            Append(txWriter, ownRows[j], isHead ? group : 0xffffffffU,
+                   isHead ? head : 0xffffffffU, isHead ? members : 1U);
+        }
+        txIndex += ownCount;
+    }
+    __aicore__ void BuildCombineMetadata(bool staged = false, bool synchronize = true) {
+        const uint32_t pageRows = (kTile / k) * k;
+        for (uint32_t source = core; source < r; source += coreCount) {
+            auto sc = Meta(p.source_counts, source);
+            auto gc = Meta(p.counts_send, source);
+            if (!staged) { Flush(sc); Flush(gc); }
+            uint32_t txIndex = staged ? 0U : sc[2], groupIndex = staged ? 0U : gc[1];
+            uint32_t finalBase = 0U, direct = 0U;
+            uint32_t scratch[8] = {}, requests[8] = {};
+            // Routes: [0,32KiB), [64,96KiB). Writer banks: [32,38KiB),
+            // [96,102KiB). Disjoint banks allow load/store overlap with scalar fill.
+            auto txWriter = staged ? StagedWriter(32768U, 0U, source) :
+                                     Writer(32768U, q.tx_rows, txIndex, 4U);
+            auto contributors = staged ? StagedWriter(33792U, 1U, source) :
+                                         Writer(33792U, q.contributor, sc[4], 4U);
+            PlanWriter relays[8];
+            for (uint32_t lane = 0U; lane < Width(); ++lane) {
+                auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source);
+                if (!staged) {
+                    Flush(stats); scratch[lane] = stats[2]; requests[lane] = stats[3];
+                }
+                relays[lane] = staged ? StagedWriter(34816U + lane * 512U, 2U, source, lane) :
+                    Writer(34816U + lane * 512U, q.relay_send,
+                           uint64_t(lane) * n + requests[lane], 2U);
+            }
+            PrefetchRoutes(source, 0U, n < pageRows ? n : pageRows, 0U, !staged);
+            for (uint32_t first = 0U; first < n; first += pageRows) {
+                const uint32_t size = n - first < pageRows ? n - first : pageRows;
+                const uint32_t bank = (first / pageRows) & 1U;
+                auto routes = AwaitRoutes(bank);
+                const uint32_t next = first + size;
+                if (next < n)
+                    PrefetchRoutes(source, next, n - next < pageRows ? n - next : pageRows,
+                                   bank ^ 1U, !staged);
+                for (uint32_t offset = 0U; offset < size; offset += k) {
+                    if (staged) {
+                        StageToken(routes, offset, source, txIndex, groupIndex, finalBase, direct,
+                                   scratch, requests, txWriter, contributors, relays);
+                        continue;
+                    }
+                    TokenRoutes token;
+                    DecodeToken(routes, offset, source, token);
+                    for (uint32_t j = 0U; j < k; ++j) {
+                        const uint32_t peer = token.peer[j];
+                        const bool ownGroup = peer == rank && token.primary[j] && token.members[j] > 1U;
+                        const uint32_t group = ownGroup ? groupIndex++ : 0xffffffffU;
+                        uint32_t head = 0xffffffffU;
+                        if (LocalDomain(peer) && !LocalSource(source) &&
+                            token.primary[j] && token.members[j] > 1U) {
+                            const uint32_t lane = Lane(peer), count = token.members[j];
+                            head = scratch[lane];
+                            WriteMember(peer, head, txIndex, count, 0U, token.raw[j], requests,
+                                        contributors, relays);
+                            for (uint32_t member = 0U; member < token.suppressedCount; ++member)
+                                WriteMember(peer, head, txIndex, count, member + 1U,
+                                            token.raw[token.suppressed[member]], requests, contributors, relays);
+                            scratch[lane] += count;
+                        }
+                        if (peer == rank && token.active[j]) {
+                            Append(txWriter, token.raw[j] % n, group, head,
+                                   LocalSource(source) ? 1U : token.members[j]);
+                            ++txIndex;
+                        }
+                    }
+                }
+            }
+            FinishWriter(txWriter);
+            FinishWriter(contributors);
+            for (uint32_t lane = 0U; lane < Width(); ++lane) FinishWriter(relays[lane]);
+            WaitWriter();
+            if (staged) {
+                sc[0] = txIndex; sc[1] = finalBase; sc[2] = 0;
+                sc[3] = direct; sc[4] = 0; sc[5] = scratch[Lane(rank)]; sc[6] = 0;
+                Flush(sc);
+                gc[0] = groupIndex; gc[1] = 0; Flush(gc);
+                for (uint32_t lane = 0U; lane < Width(); ++lane) {
+                    auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source);
+                    stats[0] = scratch[lane]; stats[1] = requests[lane];
+                    stats[2] = 0; stats[3] = 0; Flush(stats);
+                }
+                continue;
+            }
+            if (txIndex != uint32_t(sc[2] + sc[0]) || groupIndex != uint32_t(gc[1] + gc[0]))
+                aclshmemi_kernel_abort("combine plan count/fill mismatch rank=%u source=%u\n", rank, source);
+            for (uint32_t lane = 0U; lane < Width(); ++lane) {
+                auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source);
+                if (scratch[lane] != uint32_t(stats[2] + stats[0]) ||
+                    requests[lane] != uint32_t(stats[3] + stats[1]))
+                    aclshmemi_kernel_abort("combine plan relay prefix mismatch rank=%u source=%u\n", rank, source);
+            }
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        if (synchronize) aclshmemi_sync_core<true>();
+    }
+
+    // Split a source into independent 256-token tasks. One source per core
+    // otherwise leaves a 2-vs-1 (64P) / 3-vs-2 (128P) tail with 56 cores.
+    // Temporary record capacity remains N/source: tile t starts at t*256*K.
+    // Prefixes restore exact source/token order; no unordered atomic appends.
+    __aicore__ uint32_t SourceTiles() const { return (n / k + 255U) / 256U; }
+    __aicore__ bool UseTiledPlan() const {
+        return UseStagedPlan() && SourceTiles() > 1U &&
+               uint64_t(r) * SourceTiles() * 256U <= uint64_t(n) * 512U;
+    }
+    __aicore__ __gm__ uint32_t* TileStats(uint32_t task) {
+        // relay_publish is otherwise used only by the mutually exclusive
+        // fallback route cache. Each task owns isolated cachelines (256B).
+        // [0..5]: TX/group/finalBase/direct counts, TX/group prefixes;
+        // [16+4*lane..+3]: scratch/request counts and their tile prefixes.
+        return reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_publish + uint64_t(task) * 256U);
+    }
+    __aicore__ void PrefetchTask(uint32_t task, uint32_t bank) {
+        const uint32_t source = task / SourceTiles();
+        const uint32_t first = (task % SourceTiles()) * 256U * k;
+        const uint32_t size = n - first < 256U * k ? n - first : 256U * k;
+        PrefetchRoutes(source, first, size, bank, false);
+    }
+    __aicore__ void StoreSimtRows(uint32_t kind, uint32_t source, uint32_t lane,
+        uint32_t first, uint32_t column, uint32_t ubOffset) {
+        auto totals = Ub<uint32_t>(kPlanTotalsUb, 64U);
+        const uint32_t begin = totals.GetValue(32U + column);
+        const uint32_t count = totals.GetValue(column) - begin;
+        if (!count) return;
+        const uint32_t words = kind == 2U ? 2U : 4U;
+        auto out = reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden +
+            StagedTable(kind, source, lane)) + uint64_t(first + begin) * words;
+        // All output UB ranges are disjoint and VF is already retired. Queue
+        // every nonempty table, then one completion covers the entire slice.
+        Store(out, Ub<uint32_t>(ubOffset, 64U * 16U * words), count * words);
+        writerPending = true;
+    }
+    __aicore__ void StageTaskSimt(LocalTensor<int32_t> routes, uint32_t source,
+                                  uint32_t first, uint32_t size) {
+        auto decoded = Ub<uint32_t>(kPlanDecodedUb, 64U * 40U);
+        auto prefix = Ub<uint32_t>(kPlanPrefixUb, 21U * 64U);
+        auto totals = Ub<uint32_t>(kPlanTotalsUb, 64U);
+        for (uint32_t col = 0U; col < kPlanSimtColumns; ++col) totals.SetValue(col, 0U);
+        for (uint32_t offset = 0U; offset < size; offset += kPlanSimtTokens * k) {
+            const uint32_t left = (size - offset) / k;
+            const uint32_t tokens = left < kPlanSimtTokens ? left : kPlanSimtTokens;
+            // Finish the preceding slice's byte-exact stores before VF reuses UB.
+            WaitWriter();
+            SetFlag<HardEvent::S_V>(EVENT_ID0);
+            WaitFlag<HardEvent::S_V>(EVENT_ID0);
+            asc_vf_call<BuildCombineSliceSimt>(dim3(64),
+                (__ubuf__ int32_t*)routes.GetPhyAddr() + offset,
+                (__ubuf__ uint32_t*)decoded.GetPhyAddr(),
+                (__ubuf__ uint32_t*)prefix.GetPhyAddr(),
+                (__ubuf__ uint32_t*)totals.GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(kPlanChunksUb, 21U * 8U).GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(kPlanTxUb, 4096U).GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(kPlanContributorUb, 4096U).GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(kPlanRelayUb, 16384U).GetPhyAddr(),
+                tokens, k, n, r, rank, source, static_cast<uint32_t>(server));
+            SetFlag<HardEvent::V_S>(EVENT_ID0);
+            WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            if (totals.GetValue(20U))
+                aclshmemi_kernel_abort("combine SIMT plan invalid routes rank=%u source=%u\n", rank, source);
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            StoreSimtRows(0U, source, 0U, first, 0U, kPlanTxUb);
+            StoreSimtRows(1U, source, 0U, first, 4U + Lane(rank), kPlanContributorUb);
+            for (uint32_t lane = 0U; lane < Width(); ++lane)
+                StoreSimtRows(2U, source, lane, first, 12U + lane,
+                              kPlanRelayUb + lane * kPlanRelayLaneBytes);
+            if (writerPending) SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        }
+        WaitWriter();
+    }
+    __aicore__ void BuildTiledMetadata() {
+        const uint32_t tiles = SourceTiles(), tasks = r * tiles;
+        if (core < tasks) PrefetchTask(core, 0U);
+        for (uint32_t task = core; task < tasks; task += coreCount) {
+            const uint32_t source = task / tiles, first = (task % tiles) * 256U * k;
+            const uint32_t size = n - first < 256U * k ? n - first : 256U * k;
+            const uint32_t bank = (task / coreCount) & 1U;
+            auto routes = AwaitRoutes(bank);
+            if (task + coreCount < tasks) PrefetchTask(task + coreCount, bank ^ 1U);
+            StageTaskSimt(routes, source, first, size);
+            auto totals = Ub<uint32_t>(kPlanTotalsUb, 64U);
+            auto stats = TileStats(task);
+            stats[0] = totals.GetValue(0U); stats[1] = totals.GetValue(1U);
+            stats[2] = totals.GetValue(2U); stats[3] = totals.GetValue(3U);
+            for (uint32_t lane = 0U; lane < Width(); ++lane) {
+                stats[16U + lane * 4U] = totals.GetValue(4U + lane);
+                stats[17U + lane * 4U] = totals.GetValue(12U + lane);
+            }
+            Flush(stats); Flush(stats + 16U);
+            if (Width() > 4U) Flush(stats + 32U);
+        }
+        // Caller joins all writers before reading tile statistics. This also
+        // permits scan compute time and the load-imbalance wait to be separated.
+        DataSyncBarrier<MemDsbT::DDR>();
+    }
+    __aicore__ bool TryBuildTiledSourceCountsSimt() {
+        const uint32_t tiles = SourceTiles();
+        if (tiles > 256U) return false; // Bounded UB, scalar fallback for huge S.
+        auto rows = Ub<uint32_t>(0U, tiles * 64U);
+        auto totals = Ub<uint32_t>(65536U, 32U);
+        for (uint32_t source = core; source < r; source += coreCount) {
+            SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            Load(rows, TileStats(source * tiles), tiles * 64U);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            asc_vf_call<PrefixCombineTaskStatsSimt>(dim3(32),
+                (__ubuf__ uint32_t*)rows.GetPhyAddr(),
+                (__ubuf__ uint32_t*)totals.GetPhyAddr(), tiles, Width());
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            Store(TileStats(source * tiles), rows, tiles * 64U);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            SetFlag<HardEvent::V_S>(EVENT_ID0);
+            WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            auto sc = Meta(p.source_counts, source);
+            sc[0] = totals.GetValue(0U); sc[1] = totals.GetValue(2U); sc[2] = 0;
+            sc[3] = totals.GetValue(3U); sc[4] = 0;
+            sc[5] = totals.GetValue(4U + Lane(rank)); sc[6] = 0; Flush(sc);
+            auto gc = Meta(p.counts_send, source);
+            gc[0] = totals.GetValue(1U); gc[1] = 0; Flush(gc);
+            for (uint32_t lane = 0U; lane < Width(); ++lane) {
+                auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source);
+                stats[0] = totals.GetValue(4U + lane);
+                stats[1] = totals.GetValue(4U + Width() + lane);
+                stats[2] = 0; stats[3] = 0; Flush(stats);
+            }
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemi_sync_core<true>();
+        return true;
+    }
+    __aicore__ void BuildTiledSourceCounts() {
+        if (TryBuildTiledSourceCountsSimt()) return;
+        const uint32_t tiles = SourceTiles();
+        for (uint32_t source = core; source < r; source += coreCount) {
+            uint32_t tx = 0U, groups = 0U, finalBase = 0U, direct = 0U;
+            uint32_t scratch[8] = {}, requests[8] = {};
+            for (uint32_t tile = 0U; tile < tiles; ++tile) {
+                auto stats = TileStats(source * tiles + tile);
+                Flush(stats); Flush(stats + 16U);
+                if (Width() > 4U) Flush(stats + 32U);
+                stats[4] = tx; stats[5] = groups;
+                tx += stats[0]; groups += stats[1]; finalBase += stats[2]; direct += stats[3];
+                for (uint32_t lane = 0U; lane < Width(); ++lane) {
+                    const uint32_t off = 16U + lane * 4U;
+                    stats[off + 2U] = scratch[lane]; stats[off + 3U] = requests[lane];
+                    scratch[lane] += stats[off]; requests[lane] += stats[off + 1U];
+                }
+                Flush(stats); Flush(stats + 16U);
+                if (Width() > 4U) Flush(stats + 32U);
+            }
+            auto sc = Meta(p.source_counts, source);
+            sc[0] = tx; sc[1] = finalBase; sc[2] = 0;
+            sc[3] = direct; sc[4] = 0; sc[5] = scratch[Lane(rank)]; sc[6] = 0;
+            Flush(sc);
+            auto gc = Meta(p.counts_send, source);
+            gc[0] = groups; gc[1] = 0; Flush(gc);
+            for (uint32_t lane = 0U; lane < Width(); ++lane) {
+                auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source);
+                stats[0] = scratch[lane]; stats[1] = requests[lane];
+                stats[2] = 0; stats[3] = 0; Flush(stats);
+            }
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemi_sync_core<true>();
+    }
+    __aicore__ void CompactTiledMetadata() {
+        const uint32_t tiles = SourceTiles();
+        for (uint32_t task = core; task < r * tiles; task += coreCount) {
+            const uint32_t source = task / tiles, first = (task % tiles) * 256U * k;
+            auto tile = TileStats(task);
+            Flush(tile); Flush(tile + 16U);
+            if (Width() > 4U) Flush(tile + 32U);
+            auto sc = Meta(p.source_counts, source); Flush(sc);
+            auto gc = Meta(p.counts_send, source); Flush(gc);
+            const uint32_t txBase = sc[2] + tile[4], groupBase = gc[1] + tile[5];
+            const uint32_t own = 16U + Lane(rank) * 4U, scratchBase = sc[4] + tile[own + 2U];
+            CompactTable(0U, source, 0U, tile[0], q.tx_rows + uint64_t(txBase) * 16U,
+                         txBase, groupBase, scratchBase, first);
+            CompactTable(1U, source, 0U, tile[own], q.contributor + uint64_t(scratchBase) * 16U,
+                         txBase, 0U, 0U, first);
+            for (uint32_t lane = 0U; lane < Width(); ++lane) {
+                auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source); Flush(stats);
+                const uint32_t off = 16U + lane * 4U;
+                CompactTable(2U, source, lane, tile[off + 1U],
+                    q.relay_send + (uint64_t(lane) * n + stats[3] + tile[off + 3U]) * 8U,
+                    0U, 0U, stats[2] + tile[off + 2U], first);
+            }
+        }
+    }
+    __aicore__ void CompactTable(uint32_t kind, uint32_t source, uint32_t lane,
+        uint32_t count, uint64_t output, uint32_t txBase, uint32_t groupBase,
+        uint32_t scratchBase, uint32_t inputFirst = 0U) {
+        const uint32_t words = kind == 2U ? 2U : 4U;
+        auto input = reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden +
+            StagedTable(kind, source, lane)) + uint64_t(inputFirst) * words;
+        auto dest = reinterpret_cast<__gm__ uint32_t*>(plan + output);
+        // Only valid records are copied. MTE byte stores are required: adjacent
+        // source segments may share cachelines and are compacted by different cores.
+        for (uint32_t first = 0U; first < count; first += 64U) {
+            const uint32_t size = count - first < 64U ? count - first : 64U;
+            auto rows = Ub<uint32_t>(((first / 64U) & 1U) * 4096U, 64U * words);
+            SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            Load(rows, input + uint64_t(first) * words, size * words);
+            SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            SetFlag<HardEvent::S_V>(EVENT_ID0);
+            WaitFlag<HardEvent::S_V>(EVENT_ID0);
+            asc_vf_call<AdjustCombineRowsSimt>(dim3(64),
+                (__ubuf__ uint32_t*)rows.GetPhyAddr(), size, kind, txBase, groupBase, scratchBase);
+            SetFlag<HardEvent::V_S>(EVENT_ID0);
+            WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            WaitWriter();
+            SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+            Store(dest + uint64_t(first) * words, rows, size * words);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            writerPending = true;
+        }
+        WaitWriter();
+    }
+    __aicore__ void CompactStagedMetadata() {
+        for (uint32_t source = core; source < r; source += coreCount) {
+            auto sc = Meta(p.source_counts, source); Flush(sc);
+            auto gc = Meta(p.counts_send, source); Flush(gc);
+            CompactTable(0U, source, 0U, sc[0], q.tx_rows + uint64_t(sc[2]) * 16U,
+                         sc[2], gc[1], sc[4]);
+            CompactTable(1U, source, 0U, sc[5], q.contributor + uint64_t(sc[4]) * 16U,
+                         sc[2], 0U, 0U);
+            for (uint32_t lane = 0U; lane < Width(); ++lane) {
+                auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source); Flush(stats);
+                CompactTable(2U, source, lane, stats[1],
+                    q.relay_send + (uint64_t(lane) * n + stats[3]) * 8U,
+                    0U, 0U, stats[2]);
+            }
+        }
+    }
+    __aicore__ void FinishPlan() {
+        PipeBarrier<PIPE_ALL>();
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemi_sync_core<true>();
+        // relay_ranges_send is dead after BuildCombineMetadata. Reuse its exact
+        // 8*R*64B capacity as R rows of 512B: 64 partition counts/prefixes,
+        // followed by the peer total at word 64. No plan/workspace ABI change.
+        // All histogram accesses below use MTE, never scalar GM cacheline RMW:
+        // simultaneous column writers share cachelines but write disjoint bytes.
+        auto histogram = reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_ranges_send);
+        const uint32_t tokenCount = n / k;
+        const uint32_t begin = uint64_t(tokenCount) * core / coreCount;
+        const uint32_t end = uint64_t(tokenCount) * (core + 1U) / coreCount;
+        const uint32_t pageTokens = kTile / k;
+        // UB: routes [0,32KiB), padded counters [32,64KiB), cursors
+        // [64,68KiB), output [72,80KiB). R<=1024, K<=16.
+        auto counts = Ub<uint32_t>(32768U, r * 8U);
+        for (uint32_t peer = 0U; peer < r; ++peer) counts.SetValue(peer * 8U, 0U);
+        for (uint32_t first = begin; first < end; first += pageTokens) {
+            const uint32_t size = end - first < pageTokens ? end - first : pageTokens;
+            auto routes = LoadRoutes(rank, first * k, size * k);
+            SetFlag<HardEvent::S_V>(EVENT_ID0);
+            WaitFlag<HardEvent::S_V>(EVENT_ID0);
+            asc_vf_call<CountFinalRoutesSimt>(dim3(256),
+                (__ubuf__ int32_t*)routes.GetPhyAddr(),
+                (__ubuf__ uint32_t*)counts.GetPhyAddr(), size * k, n, rank,
+                static_cast<uint32_t>(server));
+            SetFlag<HardEvent::V_S>(EVENT_ID0);
+            WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        }
+        GlobalTensor<uint32_t> gm;
+        gm.SetGlobalBuffer(histogram + core);
+        // UB source block stride is in 32B units; GM destination stride in bytes.
+        DataCopyExtParams column{static_cast<uint16_t>(r), 4U, 0U, 508U, 0U};
+        SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        DataCopyPad(gm, counts, column);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemi_sync_core<true>();
+
+        // Parallel prefix by peer. Include empty partitions so tiny token cases
+        // and R>64 use exactly the same protocol as the 64P/128P perf cases.
+        auto row = Ub<uint32_t>(0U, 128U);
+        for (uint32_t peer = core; peer < r; peer += coreCount) {
+            SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            Load(row, histogram + uint64_t(peer) * 128U, coreCount);
+            SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            uint32_t total = 0U;
+            for (uint32_t part = 0U; part < coreCount; ++part) {
+                const uint32_t count = row.GetValue(part);
+                row.SetValue(part, total); total += count;
+            }
+            for (uint32_t part = coreCount; part < kCores; ++part) row.SetValue(part, 0U);
+            row.SetValue(64U, total);
+            for (uint32_t i = 65U; i < 128U; ++i) row.SetValue(i, 0U);
+            SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+            Store(histogram + uint64_t(peer) * 128U, row, 128U);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemi_sync_core<true>();
+
+        // Read this partition's prefix and all peer totals in two strided DMAs.
+        auto prefixes = Ub<uint32_t>(0U, r * 8U);
+        DataCopyExtParams readColumn{static_cast<uint16_t>(r), 4U, 508U, 0U, 0U};
+        DataCopyPadExtParams<uint32_t> pad{false, 0U, 0U, 0U};
+        SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+        WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+        gm.SetGlobalBuffer(histogram + core);
+        DataCopyPad(prefixes, gm, readColumn, pad);
+        gm.SetGlobalBuffer(histogram + 64U);
+        DataCopyPad(counts, gm, readColumn, pad);
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        auto cursors = Ub<uint32_t>(65536U, r);
+        uint32_t peerBase = 0U;
+        for (uint32_t peer = 0U; peer < r; ++peer) {
+            cursors.SetValue(peer, peerBase + prefixes.GetValue(peer * 8U));
+            peerBase += counts.GetValue(peer * 8U);
+        }
+
+        // Stable final ordinal = all earlier peers + earlier token partitions
+        // for this peer + earlier routes in this partition. This is the old
+        // final_map result, generated directly without that scalar GM table.
+        auto packed = Ub<uint32_t>(73728U, 64U * 32U);
+        for (uint32_t first = begin; first < end; first += 64U) {
+            const uint32_t size = end - first < 64U ? end - first : 64U;
+            auto routes = LoadRoutes(rank, first * k, size * k);
+            SetFlag<HardEvent::S_V>(EVENT_ID0);
+            WaitFlag<HardEvent::S_V>(EVENT_ID0);
+            asc_vf_call<BuildFinalRoutesSimt>(dim3(128),
+                (__ubuf__ int32_t*)routes.GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(kFinalChunksUb, 32U * (r + 1U)).GetPhyAddr(),
+                (__ubuf__ uint32_t*)cursors.GetPhyAddr(),
+                (__ubuf__ uint32_t*)packed.GetPhyAddr(), size, k, n, r, rank,
+                static_cast<uint32_t>(server));
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            Store(reinterpret_cast<__gm__ uint32_t*>(plan + q.final_routes) + uint64_t(first) * 32U,
+                  packed, size * 32U);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemi_sync_core<true>();
+    }
+    __aicore__ void RecordPlanningStages(const uint64_t* elapsed, uint32_t path) {
+        // Eight per-core intervals, reduced into reserved plan header bytes
+        // 128..415. Plan layout/version and all payload tables are unchanged.
+        // Tile/cache scratch is dead after FinishPlan + PublishPlan's join.
+        auto detail = reinterpret_cast<__gm__ uint64_t*>(plan + 128U);
+        if (uint64_t(n) * 512U < uint64_t(coreCount) * 64U) {
+            if (core == 0U) { detail[0] = 0U; Flush(detail); }
+            return;
+        }
+        auto samples = reinterpret_cast<__gm__ uint64_t*>(ws + p.relay_publish);
+        for (uint32_t stage = 0U; stage < 8U; ++stage)
+            samples[uint64_t(core) * 8U + stage] = elapsed[stage];
+        Flush(samples + uint64_t(core) * 8U);
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemi_sync_core<true>();
+        if (core == 0U) {
+            uint64_t minima[8], sums[8] = {}, maxima[8] = {}, owners[8] = {};
+            for (uint32_t stage = 0U; stage < 8U; ++stage) minima[stage] = ~uint64_t(0);
+            for (uint32_t c = 0U; c < coreCount; ++c) {
+                auto row = samples + uint64_t(c) * 8U;
+                Flush(row);
+                for (uint32_t stage = 0U; stage < 8U; ++stage) {
+                    const uint64_t value = row[stage];
+                    sums[stage] += value;
+                    if (value < minima[stage]) minima[stage] = value;
+                    if (value > maxima[stage]) { maxima[stage] = value; owners[stage] = c; }
+                }
+            }
+            detail[0] = 0x504c414e53544731ULL; // PLANSTG1
+            detail[1] = coreCount; detail[2] = 8U; detail[3] = path;
+            for (uint32_t stage = 0U; stage < 8U; ++stage) {
+                detail[4U + stage * 4U] = minima[stage];
+                detail[5U + stage * 4U] = sums[stage];
+                detail[6U + stage * 4U] = maxima[stage];
+                detail[7U + stage * 4U] = owners[stage];
+            }
+            for (uint32_t line = 0U; line < 36U; line += 8U) Flush(detail + line);
+            DataSyncBarrier<MemDsbT::DDR>();
+        }
+    }
+    __aicore__ void PublishPlan() {
+        // All output tables already reside in the final tensor; no full-capacity
+        // workspace -> plan snapshot copy. Publish the header only after stores.
+        PipeBarrier<PIPE_ALL>();
+        aclshmemi_sync_core<true>();
+        if (core == 0U) {
+            auto header = reinterpret_cast<__gm__ uint64_t*>(plan);
+            header[0] = kCombineExecutionPlanVersion;
+            header[1] = n; header[2] = h; header[3] = k;
+            header[4] = r; header[5] = rank; header[6] = server; header[7] = 0;
+            Flush(header);
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemx_sync_vec_all();
+    }
+};
+} // namespace CombineExecutionPlanning
+
+__aicore__ __attribute__((noinline)) void RunCombinePlanning(
+    GM_ADDR dst, GM_ADDR groups, GM_ADDR dups, GM_ADDR counts,
+    ascend_moonep::PlanningTilingData tiling, uint64_t begin, uint64_t baseEnd) {
+    using namespace CombineExecutionPlanning;
+    ascend_moonep::MoonEPUdmaCombineTilingData t{};
+    t.S = tiling.num_tokens; t.K = tiling.num_topk; t.H = tiling.combine_h;
+    t.R = tiling.world_size; t.rank = tiling.rank; t.server_dedup = tiling.server_dedup;
+    auto workspace = reinterpret_cast<__gm__ uint8_t*>(tiling.combine_workspace);
+    auto plan = reinterpret_cast<__gm__ uint8_t*>(tiling.combine_plan);
+    if (!t.K || t.K > 16U || !t.R || t.R > 1024U)
+        aclshmemi_kernel_abort("planning combine invalid route dimensions\n");
+    CombinePlanBuilder x{reinterpret_cast<__gm__ uint8_t*>(workspace),
+        reinterpret_cast<const __gm__ int32_t*>(dst),
+        reinterpret_cast<const __gm__ int32_t*>(groups),
+        reinterpret_cast<const __gm__ int32_t*>(dups),
+        reinterpret_cast<const __gm__ int32_t*>(counts),
+        ascend_moonep::MakeCombinePutLayout(t.S * t.K, t.H, t.R),
+        t.S * t.K, t.H, t.K, t.R, t.rank, static_cast<uint32_t>(GetBlockIdx()), t.server_dedup != 0U,
+        reinterpret_cast<__gm__ uint8_t*>(plan), ascend_moonep::MakeCombineExecutionPlanLayout(t.S * t.K, t.R)};
+    x.coreCount = tiling.block_dim;
+    uint64_t elapsed[8];
+    uint64_t previous = baseEnd;
+    x.Init();
+    uint64_t now = GetSystemCycle(); elapsed[0] = now - previous; previous = now;
+    x.PublishRoutes();
+    now = GetSystemCycle(); elapsed[1] = now - previous; previous = now;
+    const bool tiled = x.UseTiledPlan(), staged = x.UseStagedPlan();
+    if (tiled) x.BuildTiledMetadata();
+    else if (staged) x.BuildCombineMetadata(true, false);
+    else x.CountSources(false);
+    now = GetSystemCycle(); elapsed[2] = now - previous; previous = now;
+    DataSyncBarrier<MemDsbT::DDR>();
+    aclshmemi_sync_core<true>();
+    now = GetSystemCycle(); elapsed[3] = now - previous; previous = now;
+    if (tiled) x.BuildTiledSourceCounts();
+    x.BuildSourcePrefixes();
+    now = GetSystemCycle(); elapsed[4] = now - previous; previous = now;
+    if (tiled) x.CompactTiledMetadata();
+    else if (staged) x.CompactStagedMetadata();
+    else x.BuildCombineMetadata();
+    now = GetSystemCycle(); elapsed[5] = now - previous; previous = now;
+    x.FinishPlan();
+    now = GetSystemCycle(); elapsed[6] = now - previous; previous = now;
+    x.PublishPlan();
+    now = GetSystemCycle(); elapsed[7] = now - previous;
+    x.RecordPlanningStages(elapsed, tiled ? 4U : staged ? 1U : 0U);
+    if (GetBlockIdx() == 0U) {
+        const uint64_t end = GetSystemCycle();
+        // Reserved second header cacheline, disjoint from PublishPlan's header.
+        // Ascend950 system counter is 1GHz. No extra kernel/event at the boundary.
+        auto timing = reinterpret_cast<__gm__ uint64_t*>(plan) + 8U;
+        timing[0] = 0x504c414e54494d45ULL;
+        timing[1] = tiling.block_dim;
+        timing[2] = baseEnd - begin;
+        timing[3] = end - baseEnd;
+        timing[4] = end - begin;
+        timing[5] = tiling.combine_mode;
+        CombineExecutionPlanning::Flush(timing);
+        DataSyncBarrier<MemDsbT::DDR>();
+    }
 }

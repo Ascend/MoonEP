@@ -8,10 +8,51 @@ and K-sum into one launch.
 
 from __future__ import annotations
 
-import torch
+from typing import TYPE_CHECKING
 
-from .launchers import _env_use_udma
-from .planning import MoonEPCommPlan
+# Workspace sizing remains usable without loading the NPU runtime.
+# Runtime dependencies are imported only by launch and input-validation helpers.
+if TYPE_CHECKING:
+    import torch
+    from .planning import MoonEPCommPlan
+
+
+# ---- Workspace ABI and core roles (mirrors kernels/types.h) ----
+# Combine only; does not change num_sms or launch core counts for dispatch/planning.
+COMBINE_PUT_CORES = 64
+COMBINE_PUT_SOURCE_LANES = 16
+def combine_put_roles(ranks: int) -> list:
+    """Core ownership in the production kernel: relay/reduce/sender/final-only."""
+    if ranks >= 128:
+        return [0] * 8 + [1] * 16 + [2] * 32 + [3] * 8
+    return [0] * 8 + [1] * 32 + [2] * 24
+
+
+def combine_put_workspace_bytes(n: int, h: int, ranks: int) -> int:
+    # Total symmetric workspace bytes per rank; N=n=S*K, H=h, R=ranks.
+    # Matches the order and capacities in MakeCombinePutLayout in
+    # include/ascend_moonep/kernels/types.h; reserves maximum slots regardless of deduplication or weights.
+    if min(n, h, ranks) <= 0:
+        raise ValueError("n, h and ranks must be positive")
+    align = lambda value: (value + 511) & ~511
+    batches = (n + 63) // 64
+    return (
+        # BF16 data: final_hidden[N,H], send_hidden[N,H], relay_hidden[8*N,H].
+        2 * align(n * h * 2) + align(8 * n * h * 2)
+        # Float weights[N]; N entries each for reverse/reverse_send/final_map/group_of_loff/tx_rows.
+        + align(n * 4) + 5 * align(n * 64)
+        # R entries each for source_counts/counts_send; 8*N each for contributor/relay_send/relay_publish.
+        + 2 * align(ranks * 64) + 3 * align(8 * n * 64)
+        # Two reserved count tables; source/reduce/final ready have 8*R/R*B/2*R slots, respectively.
+        + 1024 + (8 * ranks + ranks * batches + 2 * ranks) * 512
+        # R weight_ready slots and 64 core-private magic source slots; 512 bytes per slot, first 8 used.
+        + ranks * 512 + COMBINE_PUT_CORES * 512
+        + 2 * align(8 * ranks * 64) + ranks * 512
+        # One rank-local final gate: core 0 fans in final_ready then broadcasts it.
+        + 512
+        # N independent 128-byte final descriptors; N/K are active, N covers K=1.
+        + align(n * 128)
+    )
 
 
 def _check_tensor(
@@ -35,6 +76,10 @@ def _check_combine_inputs(
     plan: MoonEPCommPlan,
     output_sk: torch.Tensor | None,
 ) -> None:
+    import torch
+    from .launchers import _env_use_udma
+    from .planning import MoonEPCommPlan
+
     if not isinstance(plan, MoonEPCommPlan):
         raise TypeError("plan must be a MoonEPCommPlan")
 
@@ -45,6 +90,7 @@ def _check_combine_inputs(
     if use_udma:
         required_ctx_keys.extend((
             "hidden_buf_local", "weights_buf_local", "combine_sync_buffer",
+            "combine_workspace",
         ))
     else:
         required_ctx_keys.extend(("hidden_buf", "weights_buf"))
@@ -67,12 +113,10 @@ def _check_combine_inputs(
     if use_udma:
         if H % 8 != 0:
             raise ValueError("UDMA combine requires H to be a multiple of 8")
-        # Four bf16 rows plus fp32 accumulator/temp use 16 bytes per hidden
-        # element in the UDMA kernel's 128 KiB full-row double buffer.
-        if H * 16 > 128 * 1024:
+        # Phase 1/3 tile large rows through UB; cap one bf16 token row at 8 MiB.
+        if H * torch.bfloat16.itemsize > 8 * 1024 * 1024:
             raise ValueError(
-                "UDMA combine requires H<=8192 so its full-row double "
-                "buffer fits in 128 KiB of UB"
+                "UDMA combine requires one bf16 token row to be <=8 MiB"
             )
     else:
         if H % 16 != 0:
@@ -119,14 +163,14 @@ def _check_combine_inputs(
     _check_tensor(
         plan.dup_loffs,
         "plan.dup_loffs",
-        (NvS,),
+        (8 * NvS if plan.dup_counts.numel() == plan.R + 2 else NvS,),
         torch.int32,
         output_sh.device,
     )
     _check_tensor(
         plan.dup_counts,
         "plan.dup_counts",
-        (2,),
+        (plan.R + 2 if plan.dup_counts.numel() == plan.R + 2 else 2,),
         torch.int32,
         output_sh.device,
     )
@@ -150,6 +194,13 @@ def _check_combine_inputs(
         )
 
     if use_udma:
+        _check_tensor(
+            ctx["combine_workspace"],
+            "ctx.combine_workspace",
+            (combine_put_workspace_bytes(NvS, H, plan.R),),
+            torch.uint8,
+            output_sh.device,
+        )
         sync_buffer = ctx["combine_sync_buffer"]
         if sync_buffer.dtype != torch.uint8 or not sync_buffer.is_contiguous():
             raise ValueError(
@@ -188,3 +239,33 @@ def launch_combine(
         plan,
         output_sk=output_sk,
     )
+
+
+# ---- Launch an immutable execution plan produced by planning.py ----
+def launch_combine_prepared(ctx, output_sh, plan, execution_plan, output_sk=None):
+    import torch
+    import torch_npu
+    from .planning import CombineExecutionPlan, _routes, _key
+
+    if not isinstance(execution_plan, CombineExecutionPlan):
+        raise TypeError('execution_plan must be returned by prepare_combine_plan')
+    from .launchers import _env_use_udma
+    if not _env_use_udma('combine'):
+        raise ValueError('execution plans require UDMA combine')
+    execution_plan.validate(ctx, plan)
+    stream = torch_npu.npu.current_stream()
+    stream.wait_event(execution_plan.ready)
+    weights = ctx['weights_buf_local'].view(torch.float32) if output_sk is not None else None
+    torch.classes.AscendMoonEP.CombineUrma().compute_prepared(
+        ctx['hidden_buf_local'], weights, ctx['combine_sync_buffer'], ctx['combine_workspace'],
+        *_routes(plan), output_sh, output_sk, execution_plan.storage, *_key(ctx))
+    for tensor in (execution_plan.storage, *_routes(plan), ctx['hidden_buf_local'], weights,
+                   ctx['combine_workspace'], ctx['combine_sync_buffer'], output_sh,
+                   output_sk):
+        if tensor is not None:
+            tensor.record_stream(stream)
+    # Also orders subsequent reuse on another stream. Overlapping calls sharing
+    # the Buffer workspace remain unsupported, just like legacy combine.
+    last_use = torch_npu.npu.Event()
+    last_use.record(stream)
+    execution_plan.ready = last_use

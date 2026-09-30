@@ -11,7 +11,9 @@ dispatch-epilogue / combine-prologue steps are folded into ``DispatchOp`` and
 import torch
 
 from .kernel_op import KernelOp
+from .planning import RANKS_PER_SERVER
 from .launchers import (
+    _env_use_udma,
     launch_combine_op,
     launch_dispatch_op,
     launch_dispatch_profile_op,
@@ -69,6 +71,10 @@ class PlanningOp(KernelOp):
         B = int(ctx["B"])
         N = S * K
         NvS = int(ctx["NvS"])
+        # Planning output capacity depends on the dedup domain; rank and server share the same operator entry.
+        server_dedup = plan.dedup_mode == "server"
+        dup_capacity = RANKS_PER_SERVER * NvS if server_dedup else NvS
+        count_size = R + 2 if server_dedup else 2
         _collect_inputs(
             "PlanningOp",
             tensors=(
@@ -80,8 +86,8 @@ class PlanningOp(KernelOp):
                 ("plan.zero_fill_ranges", plan.zero_fill_ranges, [E + B, 2], torch.int32),
                 ("plan.remote_stats", plan.remote_stats, [2], torch.int32),
                 ("plan.dup_groups", plan.dup_groups, [NvS, 3], torch.int32),
-                ("plan.dup_loffs", plan.dup_loffs, [NvS], torch.int32),
-                ("plan.dup_counts", plan.dup_counts, [2], torch.int32),
+                ("plan.dup_loffs", plan.dup_loffs, [dup_capacity], torch.int32),
+                ("plan.dup_counts", plan.dup_counts, [count_size], torch.int32),
                 ("ctx.planning_workspace", ctx["planning_workspace"], None, torch.int32),
             ),
             scalars=(("shmem_instance_id", shmem_instance_id),),
@@ -90,7 +96,20 @@ class PlanningOp(KernelOp):
         workspace = self.sym_workspace()
         if workspace is None:
             raise RuntimeError("PlanningOp requires a symmetric workspace")
-        launch_planning_op(
+        # Custom NPU writes do not bump Tensor._version; invalidate prepared plans
+        # explicitly whenever the supported planner rebuilds routing.
+        ctx['_combine_plan_generation'] = ctx.get('_combine_plan_generation', 0) + 1
+        object.__setattr__(plan, 'combine_execution_plan', None)
+        ctx.pop('_planning_timing_events', None)
+        if ctx.get('_planning_timing_enabled', False):
+            from .planning import begin_base_planning_timing
+            begin_base_planning_timing(ctx, plan)
+        fused = _env_use_udma('combine')
+        fused_timing = None
+        if fused:
+            from .planning import begin_fused_combine_plan
+            fused_timing = begin_fused_combine_plan()
+        storage = launch_planning_op(
             topk_flat,
             plan.dst,
             cu_seqlens,
@@ -109,7 +128,17 @@ class PlanningOp(KernelOp):
             int(self.num_sms),
             rank,
             R,
+            combine_workspace=ctx['combine_workspace'] if fused else None,
+            hidden_size=int(ctx['H']) if fused else 0,
         )
+        # One planning kernel produces routing AND combine tables. This only
+        # attaches its output/event; it does not launch a second kernel.
+        if ctx.get('_planning_timing_enabled', False):
+            from .planning import end_base_planning_timing
+            end_base_planning_timing(ctx)
+        if fused:
+            from .planning import prepare_combine_plan
+            prepare_combine_plan(ctx, plan, storage=storage, fused_timing=fused_timing)
 
 
 class DispatchOp(KernelOp):
@@ -190,6 +219,12 @@ class CombineOp(KernelOp):
 
     def compute(self, ctx, output_sh, plan, output_sk=None,
                 shmem_instance_id: int = 0):
+        if _env_use_udma('combine'):
+            from .combine import launch_combine_prepared
+            if plan.combine_execution_plan is None:
+                raise ValueError('UDMA combine requires PlanningOp to generate its execution plan first')
+            return launch_combine_prepared(ctx, output_sh, plan,
+                                           plan.combine_execution_plan, output_sk)
         weight_buf = (
             ctx["weights_buf"].view(torch.float32)
             if output_sk is not None else None
@@ -198,6 +233,7 @@ class CombineOp(KernelOp):
             ctx["hidden_buf"],
             weight_buf,
             ctx["combine_sync_buffer"],
+            ctx["combine_workspace"],
             plan.dst,
             plan.dup_groups,
             plan.dup_loffs,

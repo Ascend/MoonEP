@@ -4,7 +4,9 @@
 The dispatch result stays in Buffer's symmetric storage and is passed to
 ``Buffer.combine`` in zero-copy mode. The combine launcher selects UDMA through
 ``ASCEND_MOONEP_COMBINE_USE_UDMA``. Therefore this test covers the framework-level
-dispatch and UDMA combine path as one operation chain.
+dispatch and UDMA combine path as one operation chain. Both dispatch routing
+and the packed combine execution plan are generated on CPU; no device planner
+or prepare_combine_plan kernel is launched.
 
 Golden result (there is no expert computation between the two operations):
 
@@ -16,6 +18,11 @@ Examples:
   python test_npu/urma/test_dispatch_combine_udma_joint.py --R 8 --S 16 --K 4 --H 128
   python test_npu/urma/test_dispatch_combine_udma_joint.py --R 8 --S 64 --K 8 --H 128 --no-weights
   python test_npu/urma/test_dispatch_combine_udma_joint.py --prod-shape --max-checks 64
+  python test_npu/urma/test_dispatch_combine_udma_joint.py --R 8 --dedup-mode server
+
+Multi-node: run once on each host with the same --R/--master-addr/--master-port,
+--nproc-per-node 8, and a distinct --node-rank. This script spawns local workers;
+do not wrap it in torchrun. The control plane uses HCCL; payload uses SHMEM UDMA.
 """
 from __future__ import annotations
 
@@ -26,8 +33,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kernel_test_utils import init_shmem
 import argparse
-import os
-import sys
+import struct
+import numpy as np
 
 import torch
 import torch.distributed as dist
@@ -52,6 +59,157 @@ def validate_joint_args(args) -> None:
     dispatch_test.validate_args(args)
     if args.K > 16:
         raise ValueError("UDMA combine requires K <= 16")
+    if args.max_checks < 0:
+        raise ValueError("max-checks must be nonnegative")
+    if args.R > 1024 or args.R * args.S * args.K >= 2**30:
+        raise ValueError("combine requires R<=1024 and R*S*K<2^30")
+    if not (args.R == 1 or (args.R % 2 == 0 and
+            (args.R <= 8 or (args.R < 128 and args.R % 8 == 0) or
+             (args.R >= 128 and args.R % 16 == 0)))):
+        raise ValueError("unsupported combine world size")
+
+
+def cpu_combine_layout(n, ranks):
+    """Execution-plan v5 ABI; CPU tests compare offsets with the native header."""
+    align = lambda size: (size + 511) & ~511
+    result, offset = {}, 512
+    for name, size in (('tx_rows', n * 16), ('source_counts', ranks * 64),
+                       ('contributor', 8 * n * 16), ('relay_send', 8 * n * 8),
+                       ('relay_ranges', 8 * ranks * 64), ('final_routes', n * 128)):
+        result[name] = offset
+        offset += align(size)
+    result['bytes'] = offset
+    return result
+
+
+def make_cpu_combine_plan(args, rank, raw=None):
+    """Build every payload table on CPU from the same golden route permutation.
+
+    No SHMEM traffic or device planner is used. Each process independently
+    reconstructs source-major prefixes, including remote ingress scratch offsets.
+    """
+    n, r, k = args.S * args.K, args.R, args.K
+    server = args.dedup_mode == 'server'
+    if raw is None:
+        raw = dispatch_test.make_raw_destinations(args)
+    raw = np.asarray(raw, dtype=np.int64).reshape(r, args.S, k)
+    if raw.min() < 0 or raw.max() >= r * n:
+        raise ValueError('golden route address out of range')
+    q = cpu_combine_layout(n, r)
+    storage = np.zeros(q['bytes'], dtype=np.uint8)
+    struct.pack_into('<8Q', storage, 0, 0x4d45504300000005, n, args.H, k, r, rank, int(server), 0)
+    def table(name, rows, columns):
+        return np.ndarray((rows, columns), dtype='<u4', buffer=storage, offset=q[name])
+    tx = table('tx_rows', n, 4)
+    sc = table('source_counts', r, 16)
+    contributor = table('contributor', 8 * n, 4)
+    relay = table('relay_send', 8 * n, 2)
+    ranges = table('relay_ranges', 8 * r, 16)
+    final = table('final_routes', n, 32)
+    scratch = [0] * r
+    requests = [0] * 8
+    tx_cursor = group_cursor = 0
+    invalid = 0xffffffff
+    for source in range(r):
+        rows = raw[source]
+        peers = rows // n
+        domains = peers // 8 if server else peers
+        primary = np.ones((args.S, k), dtype=bool)
+        for j in range(1, k):
+            primary[:, j] = np.all(domains[:, :j] != domains[:, j:j+1], axis=1)
+        active = primary | ((peers // 8 == source // 8) if server else False)
+        counts = np.bincount(peers[active], minlength=r)
+        final_base = np.cumsum(counts) - counts
+        final_cursor = final_base.copy()
+        tx_begin, scratch_begin = tx_cursor, scratch[rank]
+        request_begin = requests.copy()
+        direct = 0
+        # Remote sources without routes in this domain cannot add local TX,
+        # contributor or relay entries. Only the local source needs every Final token.
+        domain = rank // 8 if server else rank
+        tokens = range(args.S) if source == rank else np.flatnonzero(np.any(domains == domain, axis=1))
+        for token in tokens:
+            groups = {}
+            for j in range(k):
+                groups.setdefault(int(domains[token, j]), []).append(j)
+            # Build descriptors only for the domain containing this rank.
+            members = groups.get(rank // 8 if server else rank, [])
+            group, head, count = invalid, invalid, 1
+            representative = int(peers[token, members[0]]) if members else -1
+            local_source = server and source // 8 == rank // 8
+            if len(members) > 1:
+                if representative == rank:
+                    group = group_cursor
+                    group_cursor += 1
+                if not local_source:
+                    head, count = scratch[representative], len(members)
+                    # Position of the representative in this rank's source-major TX stream.
+                    own_before = sum(bool(active[token, j]) and int(peers[token, j]) == rank
+                                     for j in range(members[0]))
+                    for index, j in enumerate(members):
+                        address = int(rows[token, j])
+                        if representative == rank:
+                            if head + index >= 8 * n:
+                                raise ValueError('contributor capacity exceeded')
+                            contributor[head + index] = (tx_cursor + own_before if index == 0 else 0,
+                                count if index == 0 else 0, address if server else address % n, 0)
+                        if address // n == rank:
+                            lane = representative % 8 if server else 0
+                            if requests[lane] >= n:
+                                raise ValueError('relay request capacity exceeded')
+                            relay[lane * n + requests[lane]] = (address % n, head + index)
+                            requests[lane] += 1
+                    scratch[representative] += count
+            token_final = []
+            for j in range(k):
+                if not active[token, j]:
+                    continue
+                peer, loff = int(peers[token, j]), int(rows[token, j] % n)
+                reduced = peer == representative and len(members) > 1 and not local_source
+                if peer == rank:
+                    if tx_cursor >= n:
+                        raise ValueError('TX row capacity exceeded')
+                    tx[tx_cursor] = (loff, group if primary[token, j] else invalid,
+                                     head if reduced else invalid, count if reduced else 1)
+                    tx_cursor += 1
+                    direct += not reduced
+                if source == rank:
+                    # Rank-local dedup must consume its reduced self result, not the raw representative.
+                    local_raw = peer == rank and not reduced
+                    token_final.append((0x80000000 | loff) if local_raw else int(final_cursor[peer]))
+                final_cursor[peer] += 1
+            if source == rank:
+                final[token, 0] = len(token_final)
+                final[token, 1:1+len(token_final)] = token_final
+        sc[source, :7] = (tx_cursor - tx_begin, int(final_base[rank]), tx_begin, direct,
+                           scratch_begin, scratch[rank] - scratch_begin, 0)
+        for lane in range(8 if server else 1):
+            ranges[lane * r + source, :2] = (request_begin[lane], requests[lane] - request_begin[lane])
+    return torch.from_numpy(storage), q
+
+
+def attach_cpu_combine_plan(ctx, plan, storage):
+    """Upload a CPU snapshot and bind production ownership/version/event guards."""
+    from npu_patch.planning import CombineExecutionPlan, _key, _routes, _stamp
+    from npu_patch import ShmemRuntime
+    torch.npu.synchronize()
+    ShmemRuntime.barrier()
+    # Fresh collective preparation: no payload is in flight while flags are reset.
+    ctx['combine_workspace'].zero_()
+    storage = storage.to(device=plan.dst.device)
+    stream = torch.npu.current_stream()
+    ready = torch.npu.Event()
+    ready.record(stream)
+    for tensor in (storage, ctx['combine_workspace'], *_routes(plan)):
+        tensor.record_stream(stream)
+    execution = CombineExecutionPlan(storage, id(plan), ctx['combine_workspace'], _key(ctx),
+        tuple(map(_stamp, _routes(plan))), _stamp(storage),
+        ctx.get('_combine_plan_generation', 0), ready, ctx)
+    object.__setattr__(plan, 'combine_execution_plan', execution)
+    torch.npu.synchronize()
+    ShmemRuntime.barrier()
+    execution.validate(ctx, plan)
+    return execution
 
 
 def check_precision(
@@ -163,7 +321,13 @@ def run_rank(local_rank: int, args) -> None:
             args.R,
             B=B,
             explicitly_destroy=True,
+            dispatch_use_udma=True,
+            combine_use_udma=True,
         )
+        ctx = buffer._require_ctx()
+        if not (ctx.get("_dispatch_use_udma", False)
+                and ctx.get("_combine_use_udma", False)):
+            raise RuntimeError("Joint test requires both UDMA dispatch and UDMA combine")
         if not ShmemRuntime.is_initialized():
             init_shmem(args=args, 
                 group=None,
@@ -175,7 +339,11 @@ def run_rank(local_rank: int, args) -> None:
         ctx = buffer._require_ctx()
         ctx["active_qp_count"] = UDMA_QP_COUNT
 
-        hidden_cpu = dispatch_test.make_hidden(rank, args)
+        # Bounded binary fractions keep every K<=16 partial sum exact in BF16;
+        # the K*hidden oracle therefore does not depend on reduction grouping.
+        token = torch.arange(args.S, dtype=torch.int64)[:, None]
+        dimension = torch.arange(args.H, dtype=torch.int64)[None, :]
+        hidden_cpu = ((rank * 5 + token * 3 + dimension) % 8).float().div(16).to(torch.bfloat16)
         hidden = hidden_cpu.to(device=f"npu:{device_id}")
         route_weights = (
             dispatch_test.make_weights(rank, args).to(
@@ -185,6 +353,11 @@ def run_rank(local_rank: int, args) -> None:
             else None
         )
         plan = make_comm_plan(args, rank, hidden.device)
+        cpu_execution, _ = make_cpu_combine_plan(args, rank)
+        attach_cpu_combine_plan(ctx, plan, cpu_execution)
+        del cpu_execution
+        print(f'[rank {rank}] CPU golden dispatch + combine execution plan ready; '
+              f'dedup={args.dedup_mode}', flush=True)
 
         ShmemRuntime.barrier()
         launch_dispatch(ctx, hidden, route_weights, plan)
@@ -225,7 +398,7 @@ def run_rank(local_rank: int, args) -> None:
         check_idx = select_token_indices(args.S, args.max_checks, args.seed)
         golden_hidden = (hidden_cpu.float() * float(args.K)).to(torch.bfloat16)
         hidden_stats = check_precision(
-            hidden_sk[check_idx], golden_hidden[check_idx]
+            hidden_sk.cpu()[check_idx], golden_hidden[check_idx]
         )
         print(
             f"[rank {rank}] UDMA joint hidden: ok={hidden_stats['ok']} "
@@ -245,7 +418,7 @@ def run_rank(local_rank: int, args) -> None:
             if route_weights_sk is None:
                 raise AssertionError("UDMA combine did not return route weights")
             weight_stats = check_precision(
-                route_weights_sk[check_idx], route_weights[check_idx]
+                route_weights_sk.cpu()[check_idx], route_weights.cpu()[check_idx]
             )
             print(
                 f"[rank {rank}] UDMA joint weights: ok={weight_stats['ok']} "
@@ -316,6 +489,7 @@ def parse_args():
         help="token rows to check; 0 means all (prod-shape default: 64)",
     )
     parser.add_argument("--no-weights", action="store_true")
+    parser.add_argument('--dedup-mode', choices=('rank', 'server'), default='rank')
     parser.add_argument(
         "--prod-shape",
         action="store_true",
@@ -328,7 +502,8 @@ def main() -> int:
     args = parse_args()
     # Compatibility fields consumed by dispatch_test.validate_args.
     args.mode = "kernel"
-    args.bootstrap = "uid"
+    args.plan_source = 'golden'
+    args.bootstrap = "ipport" if args.nproc_per_node and args.R > args.nproc_per_node else "uid"
     args.shmem_ip_port = ""
     args.profile = False
     args.profile_iters = 1
@@ -351,7 +526,8 @@ def main() -> int:
     print(
         f"UDMA dispatch+combine joint: R={args.R} S={args.S} H={args.H} "
         f"K={args.K} E={dispatch_test.num_experts(args)} "
-        f"weights={not args.no_weights} plan_mode={args.plan_mode} "
+        f"weights={not args.no_weights} plan_mode={args.plan_mode} dedup_mode={args.dedup_mode} "
+        f"combine_plan=cpu-golden "
         f"qp_count={UDMA_QP_COUNT} max_checks={args.max_checks or 'all'}",
         flush=True,
     )

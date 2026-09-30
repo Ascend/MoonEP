@@ -1,1931 +1,1882 @@
-// MoonEP-style plan-driven combine kernel.
-// UBMEM implementation — uses the SHMEM symmetric window for publication and
-// batched UDMA Get submission across two explicit QPs for the remote gather.
-//
-// Architecture: A5/Ascend950 (UDMA), fixed kCombineAivNum AIV cores.
-//
-// Inputs are already published in SHMEM symmetric allocations.
-// Single-kernel design (inverse of moonep_dispatch):
-//   Phase 1 (Prologue): for each dup group, fp32-sum primary + dups and
-//       store the reduced row back to the primary loff (in-place on SHMEM).
-//   Barrier: publish reduced primary rows to peers.
-//   Phase 2 (Gather): dispatch-style group flow limits the readers admitted by
-//       each source PE. One AIV owns a peer for the whole group and submits both
-//       QPs for that peer. The reader returns done only after both QPs and the
-//       optional weight GET are complete, then the source admits the next group.
-//   Phase 3 (Reduce): fp32-accumulate staged primary rows into output [S,H].
-
+// Hidden uses UDMA PUT; weights are gathered by MTE only in Final.
+// Pipeline owns the shared utilities and the complete combine payload flow.
+// 64P: 0..7 relay; 8..39 reduce (8 groups x 4 shards);
+//      40..55 QP0 send, 56..63 QP1 send (two workers/core).
+// >=128P: 0..7 relay; 8..23 reduce (8 groups x 2 shards);
+//       24..39 QP0 send, 40..55 QP1 send (one source lane/core), 56..63 final-only.
+// Execution-plan generation belongs to planning.cpp; Pipeline only consumes it.
 #include "kernel_operator.h"
 #include "ascend_moonep/kernels/types.h"
 #include "shmem.h"
+#include "simt_api/common_functions.h"
+#include "simt_api/device_sync_functions.h"
+#include "simt_api/device_functions.h"
+
+// Adapted from simt-moonep/ascend-moonep/kernels/moonep_dispatch_udma.cpp:
+// MoonEPFillWriteWqeSimt / MoonEPSimtSubmitWqes. One VF thread writes one WQE
+// directly to the SQ, followed by V_S and a scalar doorbell. No MTE SQ staging.
+namespace CombinePutSimt {
+constexpr uint32_t kBatch = 64U;
+constexpr uint32_t kEntryWords = 8U;
+constexpr uint32_t kContextWords = 16U;
+// Do not overlap Wqe [128,136) KiB, relay metadata [120,124) KiB or sender
+// descriptors [144,146) KiB. These buffers are only live in relay/send phases.
+constexpr uint32_t kEntriesOffset = 136U * 1024U;
+constexpr uint32_t kContextOffset = 138U * 1024U;
+constexpr uint32_t kLaunchUbBytes = 192U * 1024U;
+static_assert(kEntriesOffset + kBatch * kEntryWords * 4U == kContextOffset);
+static_assert(kContextOffset + 2U * kContextWords * 4U < 144U * 1024U);
+
+__simt_vf__ LAUNCH_BOUND(kBatch) inline void FillWriteWqes(
+    uint32_t count, __ubuf__ uint32_t* entries, __ubuf__ uint32_t* ctx) {
+    const uint32_t tid = threadIdx.x;
+    if (tid >= count) return;
+    __ubuf__ uint32_t* entry = entries + tid * kEntryWords;
+    const uint64_t remote = uint64_t(entry[2]) | (uint64_t(entry[3]) << 32U);
+    const uint64_t local = uint64_t(entry[4]) | (uint64_t(entry[5]) << 32U);
+    const uint64_t sq = uint64_t(ctx[6]) | (uint64_t(ctx[7]) << 32U);
+    // Preserve combine's per-batch completion: only the last row is SO+CQE;
+    // preceding rows are RO without CQE. ctx[13] contains the last-row DW0.
+    const uint32_t dw0 = tid + 1U == count ? ctx[13] : ctx[0];
+    __gm__ uint64_t* wqe = reinterpret_cast<__gm__ uint64_t*>(
+        sq + uint64_t(entry[7]) * ctx[12]);
+    wqe[0] = uint64_t(dw0) | (uint64_t(ctx[1]) << 32U);
+    wqe[1] = uint64_t(ctx[2]) | (uint64_t(ctx[3]) << 32U);
+    wqe[2] = uint64_t(ctx[8]) | (uint64_t(ctx[9]) << 32U);
+    wqe[3] = uint64_t(ctx[10]) | (uint64_t(ctx[11]) << 32U);
+    wqe[4] = uint64_t(ctx[4]) | (uint64_t(ctx[5]) << 32U);
+    wqe[5] = remote;
+    wqe[6] = uint64_t(entry[6]);
+    wqe[7] = local;
+}
+} // namespace CombinePutSimt
 
 using namespace AscendC;
-
 using bf16_t = bfloat16_t;
+namespace {
+using namespace ascend_moonep;
 
-#define MOONEP_UDMA_CQE_DEBUG 0
-#define MOONEP_UDMA_PROFILE_STATISTIC 0
-static constexpr uint32_t kCombineAivNum =
-    ascend_moonep::kMoonEPAivNum;
-static constexpr uint32_t kCombineUdmaQpNum =
-    ascend_moonep::kMoonEPUdmaCombineQpCount;
-static_assert(kCombineUdmaQpNum == 2,
-              "MoonEP weighted UDMA GET assignment requires exactly two QPs");
-static constexpr uint32_t kCombineUbHiddenRowBytes = 128 * 1024;
-static constexpr uint32_t kCombineAccBytesPerElement =
-    sizeof(bf16_t) + 2 * sizeof(float);
-static constexpr uint32_t kCombineAccTileAlignElements =
-    32 / sizeof(bf16_t);
-static constexpr uint32_t kCombineMaxAccTileElements =
-    (kCombineUbHiddenRowBytes /
-     kCombineAccBytesPerElement /
-     kCombineAccTileAlignElements) *
-    kCombineAccTileAlignElements;
-static constexpr uint32_t kCombineAccTileBf16Bytes =
-    kCombineMaxAccTileElements * sizeof(bf16_t);
-static constexpr uint32_t kCombineAccTileFp32Bytes =
-    kCombineMaxAccTileElements * sizeof(float);
-static constexpr uint32_t kCombineAccTileBytes =
-    kCombineAccTileBf16Bytes + 2 * kCombineAccTileFp32Bytes;
-static constexpr uint32_t kCombineMaxDataCopyPadBytes = 65504;
-static constexpr uint32_t kCombineWeightStageBytes = 32;
-static constexpr uint32_t kCombineWeightStagingBytes = 2 * kCombineWeightStageBytes;
-// Group credit caps the readers admitted by each source, so restore dispatch's
-// 128-WQE doorbell batch without recreating the unbounded cross-node fan-in.
-static constexpr uint32_t kCombineUdmaWqeBatchSize = 128;
-static constexpr uint32_t kCombineUdmaWqeBytes = 64;
-static constexpr uint32_t kCombineUdmaStagingBytes =
-    kCombineUdmaWqeBatchSize * kCombineUdmaWqeBytes;
-// Keep the grouped protocol aligned with dispatch: at most 16 readers are
-// admitted per source in one group.
-static constexpr uint32_t kCombineMaxGroupWidth = 16;
-static constexpr uint32_t kCombineGroupSignalBytes = 512;
-static constexpr uint32_t kCombineGroupSignalSlots = 2;
-static constexpr uint32_t kCombineGrantSignalSlot = 0;
-static constexpr uint32_t kCombineDoneSignalSlot = 1;
-static constexpr uint64_t kCombineGroupMagicPrefix = 0x434F4D4200000000ULL;
-// Match the published Dispatch/PUT vector selection granularity. The selection
-// buffers are phase-local and may exceed the hidden-row accumulator, so place
-// the persistent weight/WQE staging after the larger scratch requirement.
-static constexpr uint32_t kCombineSlotChunkCount = 8192;
-static constexpr uint32_t kCombineVectorSlotSelectCountAlign = 64;
-static constexpr uint32_t kCombineSlotTensorBytes =
-    kCombineSlotChunkCount * sizeof(int32_t);
-static constexpr uint32_t kCombineSlotMaskBytes =
-    ((kCombineSlotChunkCount / 8U + 31U) / 32U) * 32U;
-static constexpr uint32_t kCombineSlotSelectBytes =
-    4U * kCombineSlotTensorBytes + kCombineSlotMaskBytes;
-static constexpr uint32_t kCombineWeightOutputStageBytes =
-    kCombineSlotChunkCount * sizeof(float);
-// Prologue / reduce full-row DB (UBMem style): 2 load + 2 store + fp32 acc/tmp.
-static constexpr uint32_t kCombinePrologueGroupFields = 3;
-static constexpr uint32_t kCombinePrologueEntryWindow = 1024;
-static constexpr uint32_t kCombinePrologueMaxSrcs = 16;
-static constexpr uint32_t kCombinePrologueDbBytesPerElement =
-    4U * sizeof(bf16_t) + 2U * sizeof(float);
-static constexpr uint32_t kCombinePrologueDbMaxBytes =
-    kCombineUbHiddenRowBytes;
-static constexpr uint32_t kCombineProloguePlanBytes =
-    kCombinePrologueEntryWindow * kCombinePrologueGroupFields *
-    sizeof(int32_t);
-static constexpr uint32_t kCombineProloguePlanOffset =
-    kCombinePrologueDbMaxBytes;
-static constexpr uint32_t kCombinePrologueScratchBytes =
-    kCombineProloguePlanOffset + kCombineProloguePlanBytes;
-static constexpr uint32_t kCombinePhaseScratchBytes =
-    kCombineSlotSelectBytes > kCombineUbHiddenRowBytes
-        ? (kCombineSlotSelectBytes > kCombinePrologueScratchBytes
-               ? kCombineSlotSelectBytes
-               : kCombinePrologueScratchBytes)
-        : (kCombineUbHiddenRowBytes > kCombinePrologueScratchBytes
-               ? kCombineUbHiddenRowBytes
-               : kCombinePrologueScratchBytes);
-static constexpr uint32_t kCombineWeightStagingOffset =
-    kCombinePhaseScratchBytes;
-static constexpr uint32_t kCombineUdmaStagingOffset =
-    kCombineWeightStagingOffset + kCombineWeightStagingBytes;
-static constexpr uint32_t kCombineUbBytes = kCombineUdmaStagingOffset + kCombineUdmaStagingBytes;
-// Keep each AIV's bandwidth and phase counters on a separate 64-byte line.
-static constexpr uint32_t kCombineBandwidthStatsStride =
-    64U / sizeof(int64_t);
-static constexpr float kCombineCyclesPerMicrosecond = 1000.0F;
-static constexpr uint32_t kCombineStatHiddenBytes = 0U;
-static constexpr uint32_t kCombineStatGatherCycles = 1U;
-static constexpr uint32_t kCombineStatHiddenSubmitCycles = 2U;
-static constexpr uint32_t kCombineStatWeightGetCycles = 3U;
-static constexpr uint32_t kCombineStatWeightSyncCycles = 4U;
-static constexpr uint32_t kCombineStatWeightAssembleCycles = 5U;
-static constexpr uint32_t kCombineStatHiddenQuietCycles = 6U;
-static constexpr uint32_t kCombineStatFinalSyncCycles = 7U;
-static_assert(kCombineBandwidthStatsStride > kCombineStatFinalSyncCycles,
-              "MoonEP combine profile counters must fit one cache line");
-
-struct CombineGatherResult {
-    uint64_t hidden_bytes;
-#if MOONEP_UDMA_PROFILE_STATISTIC
-    uint64_t hidden_submit_cycles;
-    uint64_t weight_get_cycles;
-    uint64_t weight_sync_cycles;
-    uint64_t weight_assemble_cycles;
-    uint64_t hidden_quiet_cycles;
-    uint64_t final_sync_cycles;
-#endif
-};
-static_assert(kCombineMaxAccTileElements > 0,
-              "MoonEP accumulation tile must contain at least one aligned block");
-static_assert(kCombineAccTileBytes <= kCombineUbHiddenRowBytes,
-              "MoonEP accumulation tile must fit the hidden UB region");
-static_assert(kCombineSlotSelectBytes <= kCombinePhaseScratchBytes,
-              "MoonEP vector slot-select buffers must fit the phase scratch region");
-static_assert(2U * kCombineWeightOutputStageBytes + kCombineSlotTensorBytes <=
-                  kCombinePhaseScratchBytes,
-              "MoonEP direct weight gather buffers must fit phase scratch");
-static_assert(kCombineUdmaStagingBytes >= ACLSHMEM_UDMA_MTE_STAGING_UB_SIZE,
-              "MoonEP aggregate WQE staging must satisfy SHMEM's minimum size");
-static_assert(
-    kCombinePrologueDbMaxBytes <= kCombineUbHiddenRowBytes,
-    "Prologue/reduce full-row double-buffer must fit the hidden UB region");
-static_assert(
-    kCombineProloguePlanOffset + kCombineProloguePlanBytes <=
-        kCombinePhaseScratchBytes,
-    "Prologue plan AoS must sit in phase scratch above the reduce DB");
-
-__forceinline__ __aicore__ void CombineSplitRange(
-    uint32_t total,
-    uint32_t parts,
-    uint32_t part_idx,
-    uint32_t& start,
-    uint32_t& end) {
-    if (total == 0 || parts == 0 || part_idx >= parts) {
-        start = 0;
-        end = 0;
-        return;
-    }
-    uint32_t base = total / parts;
-    uint32_t rem = total - base * parts;
-    start = part_idx * base + ((part_idx < rem) ? part_idx : rem);
-    end = start + base + ((part_idx < rem) ? 1U : 0U);
-}
-
-// Match dispatch's 6:2 CLOS port ratio: each four route chunks use
-// QP0, QP0, QP0, and QP1. A single AIV owns both QPs for a remote PE.
-__forceinline__ __aicore__ uint32_t CombineGetChunkQpIndex(
-    uint32_t chunk_index) {
-    return chunk_index % 4U == 3U ? 1U : 0U;
-}
-
-__forceinline__ __aicore__ uint32_t CombineGetGroupWidth(uint32_t world_size) {
-    return world_size < kCombineMaxGroupWidth
-        ? world_size
-        : kCombineMaxGroupWidth;
-}
-
-__forceinline__ __aicore__ uint32_t CombineGetGroupRankIndex(
-    uint32_t rank,
-    uint32_t world_size) {
-    const uint32_t half_world_size = world_size / 2U;
-    const uint32_t half_group_width = CombineGetGroupWidth(world_size) / 2U;
-    return rank / half_world_size * half_group_width +
-        rank % half_group_width;
-}
-
-// Same balanced rank permutation as dispatch: each group contains half of its
-// peers from each node half. For R=16/group_width=8, every phase therefore has
-// four local-half and four remote-half peers.
-__forceinline__ __aicore__ uint32_t CombineGetGroupSourceRank(
-    uint32_t rank,
-    uint32_t world_size,
-    uint32_t group,
-    uint32_t group_rank_index) {
-    const uint32_t half_world_size = world_size / 2U;
-    const uint32_t group_width = CombineGetGroupWidth(world_size);
-    const uint32_t half_group_width = group_width / 2U;
-    const uint32_t group_count = world_size / group_width;
-    const uint32_t rank_group =
-        rank % half_world_size / half_group_width;
-    const uint32_t source_group = (rank_group + group) % group_count;
-    return group_rank_index / half_group_width * half_world_size +
-        source_group * half_group_width +
-        group_rank_index % half_group_width;
-}
-
-// Inverse of CombineGetGroupSourceRank: reader_rank GETs from rank in group.
-__forceinline__ __aicore__ uint32_t CombineGetGroupReaderRank(
-    uint32_t rank,
-    uint32_t world_size,
-    uint32_t group,
-    uint32_t group_rank_index) {
-    const uint32_t half_world_size = world_size / 2U;
-    const uint32_t group_width = CombineGetGroupWidth(world_size);
-    const uint32_t half_group_width = group_width / 2U;
-    const uint32_t group_count = world_size / group_width;
-    const uint32_t rank_group =
-        rank % half_world_size / half_group_width;
-    const uint32_t reader_group =
-        (rank_group + group_count - group % group_count) % group_count;
-    return group_rank_index / half_group_width * half_world_size +
-        reader_group * half_group_width +
-        group_rank_index % half_group_width;
-}
-
-__forceinline__ __aicore__ __gm__ uint64_t* CombineGetGroupSignal(
-    __gm__ uint8_t* sync_buffer,
-    uint32_t publisher_rank,
-    uint32_t receiver_group_rank_index,
-    uint32_t signal_slot) {
-    const uint64_t rank_stride =
-        static_cast<uint64_t>(kCombineMaxGroupWidth) *
-        kCombineGroupSignalSlots * kCombineGroupSignalBytes;
-    const uint64_t receiver_stride =
-        static_cast<uint64_t>(kCombineGroupSignalSlots) *
-        kCombineGroupSignalBytes;
-    return reinterpret_cast<__gm__ uint64_t*>(
-        sync_buffer + static_cast<uint64_t>(publisher_rank) * rank_stride +
-        static_cast<uint64_t>(receiver_group_rank_index) * receiver_stride +
-        static_cast<uint64_t>(signal_slot) * kCombineGroupSignalBytes);
-}
-
-__forceinline__ __aicore__ uint64_t CombineGetGroupToken(
-    uint64_t invocation_magic,
-    uint32_t group,
-    uint32_t group_count) {
-    return kCombineGroupMagicPrefix |
-        (invocation_magic * (static_cast<uint64_t>(group_count) + 1U) +
-         group + 1U);
-}
-
-template <typename T>
-__forceinline__ __aicore__ LocalTensor<T> CombineMakeUbTensor(
-    LocalTensor<uint8_t> ub_base,
-    uint32_t byte_offset,
-    uint32_t elements) {
-    LocalTensor<T> tensor = ub_base[byte_offset].template ReinterpretCast<T>();
-    tensor.address_.logicPos = static_cast<uint8_t>(TPosition::VECIN);
-    tensor.address_.dataLen = elements * sizeof(T);
-    return tensor;
-}
-
-template <typename T>
-__forceinline__ __aicore__ __ubuf__ T* CombineUbPtr(LocalTensor<T> ub) {
-    return reinterpret_cast<__ubuf__ T*>(static_cast<uintptr_t>(ub.address_.bufferAddr));
-}
-
-__forceinline__ __aicore__ void CombinePublishGroupSignal(
-    LocalTensor<uint8_t> ub_base,
-    __gm__ uint8_t* sync_buffer,
-    uint32_t publisher_rank,
-    uint32_t receiver_rank,
-    uint32_t receiver_group_rank_index,
-    uint32_t signal_slot,
-    uint64_t token) {
-    if (publisher_rank == receiver_rank) {
-        return;
-    }
-
-    constexpr uint32_t word_count =
-        kCombineGroupSignalBytes / sizeof(uint64_t);
-    LocalTensor<uint64_t> signal_local = CombineMakeUbTensor<uint64_t>(
-        ub_base, kCombineUdmaStagingOffset, word_count);
-    for (uint32_t word = 0; word < word_count; ++word) {
-        signal_local.SetValue(word, word == 0U ? token : 0U);
-    }
-    SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
-    WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
-
-    __gm__ uint64_t* local_signal = CombineGetGroupSignal(
-        sync_buffer,
-        publisher_rank,
-        receiver_group_rank_index,
-        signal_slot);
-    __gm__ uint64_t* remote_signal = reinterpret_cast<__gm__ uint64_t*>(
-        aclshmem_ptr(local_signal, static_cast<int32_t>(receiver_rank)));
-    GlobalTensor<uint64_t> remote_signal_tensor;
-    remote_signal_tensor.SetGlobalBuffer(remote_signal, word_count);
-    DataCopy(remote_signal_tensor, signal_local, word_count);
-    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-}
-
-__forceinline__ __aicore__ void CombineWaitGroupSignal(
-    __gm__ uint8_t* sync_buffer,
-    uint32_t publisher_rank,
-    uint32_t receiver_rank,
-    uint32_t receiver_group_rank_index,
-    uint32_t signal_slot,
-    uint64_t token) {
-    if (publisher_rank == receiver_rank) {
-        return;
-    }
-    aclshmem_uint64_wait_until(
-        CombineGetGroupSignal(
-            sync_buffer,
-            publisher_rank,
-            receiver_group_rank_index,
-            signal_slot),
-        ACLSHMEM_CMP_EQ,
-        token);
-}
-
-template <typename T>
-__forceinline__ __aicore__ void CombineCopyGmToUb(
-    LocalTensor<T> ub,
-    const __gm__ T* gm,
-    uint32_t elements) {
-    uint32_t total_bytes = elements * sizeof(T);
-    if (total_bytes != 0 &&
-        total_bytes <= kCombineMaxDataCopyPadBytes &&
-        total_bytes % 32U == 0) {
-        GlobalTensor<T> srcGM;
-        srcGM.SetGlobalBuffer(const_cast<__gm__ T*>(gm), elements);
-        DataCopy(ub, srcGM, elements);
-        return;
-    }
-
-    uint32_t copied = 0;
-    while (copied < elements) {
-        uint32_t chunk_elements = elements - copied;
-        uint32_t max_chunk_elements = kCombineMaxDataCopyPadBytes / sizeof(T);
-        if (chunk_elements > max_chunk_elements) {
-            chunk_elements = max_chunk_elements;
-        }
-        uint32_t chunk_bytes = chunk_elements * sizeof(T);
-        GlobalTensor<T> srcGM;
-        srcGM.SetGlobalBuffer(const_cast<__gm__ T*>(gm) + copied, chunk_elements);
-        DataCopyParams cp {1, static_cast<uint16_t>(chunk_bytes), 0, 0};
-        DataCopyPad(ub[copied], srcGM, cp, DataCopyPadParams{});
-        copied += chunk_elements;
-    }
-}
-
-__forceinline__ __aicore__ void CombineLocalAivBarrier() {
-    // SHMEM's internal core barrier selects hardware SyncAll for MIX builds
-    // and its soft AIV barrier otherwise.  Unlike barrier_all_vec this never
-    // waits for a peer rank.
-    aclshmemi_sync_core<true>();
-}
-
-__forceinline__ __aicore__ void CombineCopyGmToUbForScalar(
-    LocalTensor<int32_t> ub,
-    const __gm__ int32_t* gm,
-    uint32_t elements) {
-    uint32_t copied = 0;
-    while (copied < elements) {
-        uint32_t chunk_elements = elements - copied;
-        uint32_t max_chunk_elements =
-            kCombineMaxDataCopyPadBytes / sizeof(int32_t);
-        if (chunk_elements > max_chunk_elements) {
-            chunk_elements = max_chunk_elements;
-        }
-        uint32_t chunk_bytes = chunk_elements * sizeof(int32_t);
-        GlobalTensor<int32_t> srcGM;
-        srcGM.SetGlobalBuffer(
-            const_cast<__gm__ int32_t*>(gm) + copied,
-            chunk_elements);
-        DataCopyParams cp {1, static_cast<uint16_t>(chunk_bytes), 0, 0};
-        DataCopyPad(ub[copied], srcGM, cp, DataCopyPadParams{});
-        copied += chunk_elements;
-    }
-    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-}
-
-// Like CombineCopyGmToUbForScalar, but MTE2_S waits on `event_id` so a
-// preceding large MTE2 (e.g. hidden row on ID0) can keep MTE2_V ownership.
-__forceinline__ __aicore__ void CombineCopyGmToUbForScalarOnEvent(
-    LocalTensor<int32_t> ub,
-    const __gm__ int32_t* gm,
-    uint32_t elements,
-    TEventID event_id) {
-    uint32_t copied = 0;
-    while (copied < elements) {
-        uint32_t chunk_elements = elements - copied;
-        uint32_t max_chunk_elements =
-            kCombineMaxDataCopyPadBytes / sizeof(int32_t);
-        if (chunk_elements > max_chunk_elements) {
-            chunk_elements = max_chunk_elements;
-        }
-        uint32_t chunk_bytes = chunk_elements * sizeof(int32_t);
-        GlobalTensor<int32_t> srcGM;
-        srcGM.SetGlobalBuffer(
-            const_cast<__gm__ int32_t*>(gm) + copied,
-            chunk_elements);
-        DataCopyParams cp {1, static_cast<uint16_t>(chunk_bytes), 0, 0};
-        DataCopyPad(ub[copied], srcGM, cp, DataCopyPadParams{});
-        copied += chunk_elements;
-    }
-    SetFlag<HardEvent::MTE2_S>(event_id);
-    WaitFlag<HardEvent::MTE2_S>(event_id);
-}
-
-template <typename T>
-__forceinline__ __aicore__ void CombineIssueUbToGm(
-    __gm__ T* gm,
-    LocalTensor<T> ub,
-    uint32_t elements) {
-    uint32_t total_bytes = elements * sizeof(T);
-    if (total_bytes != 0 &&
-        total_bytes <= kCombineMaxDataCopyPadBytes &&
-        total_bytes % 32U == 0) {
-        GlobalTensor<T> dstGM;
-        dstGM.SetGlobalBuffer(gm, elements);
-        DataCopy(dstGM, ub, elements);
-        return;
-    }
-
-    uint32_t copied = 0;
-    while (copied < elements) {
-        uint32_t chunk_elements = elements - copied;
-        uint32_t max_chunk_elements = kCombineMaxDataCopyPadBytes / sizeof(T);
-        if (chunk_elements > max_chunk_elements) {
-            chunk_elements = max_chunk_elements;
-        }
-        uint32_t chunk_bytes = chunk_elements * sizeof(T);
-        GlobalTensor<T> dstGM;
-        dstGM.SetGlobalBuffer(gm + copied, chunk_elements);
-        DataCopyParams cp {1, static_cast<uint16_t>(chunk_bytes), 0, 0};
-        DataCopyPad(dstGM, ub[copied], cp);
-        copied += chunk_elements;
-    }
-}
-
-__forceinline__ __aicore__ void CombineZeroFp32(
-    LocalTensor<float> acc,
-    uint32_t elements) {
-    Duplicate(acc, 0.0f, elements);
-}
-
-__forceinline__ __aicore__ void CombineAccumulateBf16Row(
-    LocalTensor<float> acc,
-    LocalTensor<float> tmp,
-    LocalTensor<bf16_t> row,
-    uint32_t elements,
-    bool first) {
-    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-
-    if (first) {
-        Cast(acc, row, RoundMode::CAST_NONE, static_cast<int32_t>(elements));
-    } else {
-        Cast(tmp, row, RoundMode::CAST_NONE, static_cast<int32_t>(elements));
-        PipeBarrier<PIPE_V>();
-        Add(acc, acc, tmp, static_cast<int32_t>(elements));
-    }
-
-    // The next CombineCopyGmToUb reuses row through MTE2. Do not let MTE2
-    // overwrite it until Vector has finished consuming the current contents.
-    SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
-    WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-}
-
-__forceinline__ __aicore__ void CombineStoreAccAsBf16(
-    __gm__ bf16_t* dst,
-    LocalTensor<float> acc,
-    LocalTensor<bf16_t> out_row,
-    uint32_t elements) {
-    Cast(out_row, acc, RoundMode::CAST_RINT, static_cast<int32_t>(elements));
-    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-    CombineIssueUbToGm(dst, out_row, elements);
-    SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-}
-
-// ============================================================
-// Phase 1: Prologue — reduce duplicates into primary (inverse of epilogue)
-// ============================================================
-// UBMem-style full-row load ping-pong (ID0/ID1) + dual store credits (ID2/ID3).
-// GET plans stay 3-field (primary, dup_start, dup_n). Contiguous AIV SplitRange
-// replaces the old strided gid walk so windowed group meta loads stay coherent.
-// Drain store credits before the cross-rank barrier / gather.
-
-template <typename HiddenT>
-__forceinline__ __aicore__ void PlanPrologueIssueHiddenLoad(
-    LocalTensor<HiddenT> row,
-    __gm__ HiddenT* local_hidden,
-    uint32_t loff,
-    uint32_t H,
-    TEventID event_id) {
-    CombineCopyGmToUb(
-        row, local_hidden + static_cast<uint64_t>(loff) * H, H);
-    SetFlag<HardEvent::MTE2_V>(event_id);
-}
-
-template <typename HiddenT>
-__aicore__ void PlanPrologueReduceGroup(
-    LocalTensor<uint8_t> ub_base,
-    LocalTensor<int32_t> metaLocal,
-    __gm__ HiddenT* local_hidden,
-    const __gm__ int32_t* dup_loffs,
-    int32_t primary_loff,
-    int32_t dup_start,
-    int32_t dup_n,
-    uint32_t H,
-    uint32_t NvS,
-    uint32_t kMetaStageElements,
-    uint32_t& store_stage) {
-    if (H == 0U ||
-        H * kCombinePrologueDbBytesPerElement > kCombineUbHiddenRowBytes) {
-        return;
-    }
-
-    const uint32_t row_bytes = H * sizeof(HiddenT);
-    LocalTensor<HiddenT> row0 =
-        CombineMakeUbTensor<HiddenT>(ub_base, 0, H);
-    LocalTensor<HiddenT> row1 =
-        CombineMakeUbTensor<HiddenT>(ub_base, row_bytes, H);
-    LocalTensor<HiddenT> store0 =
-        CombineMakeUbTensor<HiddenT>(ub_base, 2U * row_bytes, H);
-    LocalTensor<HiddenT> store1 =
-        CombineMakeUbTensor<HiddenT>(ub_base, 3U * row_bytes, H);
-    LocalTensor<float> acc =
-        CombineMakeUbTensor<float>(ub_base, 4U * row_bytes, H);
-    LocalTensor<float> tmp = CombineMakeUbTensor<float>(
-        ub_base, 4U * row_bytes + H * sizeof(float), H);
-
-    uint32_t src_loff[kCombinePrologueMaxSrcs];
-    uint32_t n_src = 0;
-    src_loff[n_src++] = static_cast<uint32_t>(primary_loff);
-
-    SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
-    WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
-    PlanPrologueIssueHiddenLoad<HiddenT>(
-        row0, local_hidden, src_loff[0], H, EVENT_ID0);
-
-    // Small dup_loffs MTE2 tucked behind the first large hidden load (ID1).
-    for (int32_t j = 0; j < dup_n && n_src < kCombinePrologueMaxSrcs;) {
-        uint32_t loff_count = static_cast<uint32_t>(dup_n - j);
-        if (loff_count > kMetaStageElements) {
-            loff_count = kMetaStageElements;
-        }
-        if (n_src + loff_count > kCombinePrologueMaxSrcs) {
-            loff_count = kCombinePrologueMaxSrcs - n_src;
-        }
-        CombineCopyGmToUbForScalarOnEvent(
-            metaLocal, dup_loffs + dup_start + j, loff_count, EVENT_ID1);
-        for (uint32_t loff_i = 0; loff_i < loff_count; ++loff_i) {
-            int32_t dst_i = metaLocal.GetValue(loff_i);
-            if (dst_i < 0) {
-                continue;
-            }
-            uint32_t dst_loff = static_cast<uint32_t>(dst_i);
-            if (dst_loff >= NvS) {
-                continue;
-            }
-            src_loff[n_src++] = dst_loff;
-            if (n_src >= kCombinePrologueMaxSrcs) {
-                break;
-            }
-        }
-        j += static_cast<int32_t>(loff_count);
-    }
-
-    SetFlag<HardEvent::S_MTE2>(EVENT_ID1);
-    WaitFlag<HardEvent::S_MTE2>(EVENT_ID1);
-
-    bool ping_pending = false;
-    bool pong_pending = false;
-    int32_t cur = 0;
-    for (uint32_t i = 0; i < n_src; ++i) {
-        TEventID cur_ev = cur == 0 ? EVENT_ID0 : EVENT_ID1;
-        LocalTensor<HiddenT> cur_row = cur == 0 ? row0 : row1;
-        WaitFlag<HardEvent::MTE2_V>(cur_ev);
-
-        uint32_t next_i = i + 1U;
-        if (next_i < n_src) {
-            int32_t next_buf = 1 - cur;
-            TEventID next_ev = next_buf == 0 ? EVENT_ID0 : EVENT_ID1;
-            LocalTensor<HiddenT> next_row = next_buf == 0 ? row0 : row1;
-            if (next_buf == 0 && ping_pending) {
-                WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-                ping_pending = false;
-            } else if (next_buf == 1 && pong_pending) {
-                WaitFlag<HardEvent::V_MTE2>(EVENT_ID1);
-                pong_pending = false;
-            }
-            PlanPrologueIssueHiddenLoad<HiddenT>(
-                next_row, local_hidden, src_loff[next_i], H, next_ev);
-        }
-
-        if (i == 0U) {
-            Cast(acc, cur_row, RoundMode::CAST_NONE, static_cast<int32_t>(H));
-        } else {
-            Cast(tmp, cur_row, RoundMode::CAST_NONE, static_cast<int32_t>(H));
-            PipeBarrier<PIPE_V>();
-            Add(acc, acc, tmp, static_cast<int32_t>(H));
-        }
-        SetFlag<HardEvent::V_MTE2>(cur_ev);
-        if (cur == 0) {
-            ping_pending = true;
-        } else {
-            pong_pending = true;
-        }
-        cur = 1 - cur;
-    }
-
-    if (ping_pending) {
-        WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-    }
-    if (pong_pending) {
-        WaitFlag<HardEvent::V_MTE2>(EVENT_ID1);
-    }
-
-    TEventID store_ev = store_stage == 0U ? EVENT_ID2 : EVENT_ID3;
-    LocalTensor<HiddenT> store_row = store_stage == 0U ? store0 : store1;
-    WaitFlag<HardEvent::MTE3_MTE2>(store_ev);
-    Cast(store_row, acc, RoundMode::CAST_RINT, static_cast<int32_t>(H));
-    SetFlag<HardEvent::V_MTE3>(store_ev);
-    WaitFlag<HardEvent::V_MTE3>(store_ev);
-    CombineIssueUbToGm(
-        local_hidden + static_cast<uint64_t>(primary_loff) * H,
-        store_row,
-        H);
-    SetFlag<HardEvent::MTE3_MTE2>(store_ev);
-    store_stage ^= 1U;
-}
-
-template <typename HiddenT>
-__aicore__ void PlanProloguePhase(
-    LocalTensor<uint8_t> ub_base,
-    __gm__ HiddenT* local_hidden,
-    const __gm__ int32_t* dup_groups,
-    const __gm__ int32_t* dup_loffs,
-    const __gm__ int32_t* dup_counts,
-    uint32_t H,
-    uint32_t NvS,
-    uint32_t core_idx,
-    uint32_t core_num) {
-
-    constexpr uint32_t kMetaStageElements =
-        kCombineWeightStagingBytes / sizeof(int32_t);
-    LocalTensor<int32_t> metaLocal = CombineMakeUbTensor<int32_t>(
-        ub_base, kCombinePhaseScratchBytes, kMetaStageElements);
-    CombineCopyGmToUbForScalar(metaLocal, dup_counts, 2);
-
-    int32_t n_groups_i = metaLocal.GetValue(0);
-    int32_t n_dup_loffs_i = metaLocal.GetValue(1);
-    if (n_groups_i <= 0) {
-        PipeBarrier<PIPE_ALL>();
-        DataSyncBarrier<MemDsbT::DDR>();
-        CombineLocalAivBarrier();
-        return;
-    }
-    uint32_t n_groups = static_cast<uint32_t>(n_groups_i);
-    uint32_t n_dup_loffs = static_cast<uint32_t>(n_dup_loffs_i);
-    if (n_groups > NvS) {
-        n_groups = NvS;
-    }
-    if (n_dup_loffs > NvS) {
-        n_dup_loffs = NvS;
-    }
-
-    uint32_t group_beg = 0;
-    uint32_t group_end = 0;
-    CombineSplitRange(n_groups, core_num, core_idx, group_beg, group_end);
-    if (group_beg >= group_end) {
-        PipeBarrier<PIPE_ALL>();
-        DataSyncBarrier<MemDsbT::DDR>();
-        CombineLocalAivBarrier();
-        return;
-    }
-
-    LocalTensor<int32_t> planChunkLocal = CombineMakeUbTensor<int32_t>(
-        ub_base, kCombineProloguePlanOffset,
-        kCombinePrologueEntryWindow * kCombinePrologueGroupFields);
-
-    uint32_t store_stage = 0;
-    bool store_db_live = false;
-
-    for (uint32_t window_start = group_beg;
-         window_start < group_end;
-         window_start += kCombinePrologueEntryWindow) {
-        uint32_t window_count = group_end - window_start;
-        if (window_count > kCombinePrologueEntryWindow) {
-            window_count = kCombinePrologueEntryWindow;
-        }
-        const uint32_t flat_count =
-            window_count * kCombinePrologueGroupFields;
-        CombineCopyGmToUb(
-            planChunkLocal,
-            dup_groups +
-                static_cast<uint64_t>(window_start) * kCombinePrologueGroupFields,
-            flat_count);
-        SetFlag<HardEvent::MTE2_S>(EVENT_ID1);
-        WaitFlag<HardEvent::MTE2_S>(EVENT_ID1);
-
-        for (uint32_t li = 0; li < window_count; ++li) {
-            const uint32_t gid = window_start + li;
-            const uint32_t base = li * kCombinePrologueGroupFields;
-            int32_t primary_loff = planChunkLocal.GetValue(base);
-            int32_t dup_start = planChunkLocal.GetValue(base + 1);
-            int32_t dup_n = planChunkLocal.GetValue(base + 2);
-            bool group_ok =
-                primary_loff >= 0 &&
-                primary_loff < static_cast<int32_t>(NvS) &&
-                dup_start >= 0 &&
-                dup_n > 0;
-            if (group_ok) {
-                if (dup_start > static_cast<int32_t>(n_dup_loffs)) {
-                    group_ok = false;
-                } else {
-                    int32_t available_dups =
-                        static_cast<int32_t>(n_dup_loffs) - dup_start;
-                    if (dup_n > available_dups) {
-                        dup_n = available_dups;
-                    }
-                    if (dup_n <= 0) {
-                        group_ok = false;
-                    }
-                }
-            }
-
-            if (group_ok) {
-                if (!store_db_live) {
-                    SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID2);
-                    SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
-                    store_db_live = true;
-                }
-                PlanPrologueReduceGroup<HiddenT>(
-                    ub_base, metaLocal, local_hidden, dup_loffs,
-                    primary_loff, dup_start, dup_n, H, NvS, kMetaStageElements,
-                    store_stage);
-            }
-        }
-    }
-
-    if (store_db_live) {
-        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID2);
-        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
-    }
-
-    PipeBarrier<PIPE_ALL>();
-    DataSyncBarrier<MemDsbT::DDR>();
-    CombineLocalAivBarrier();
-}
-
-// ============================================================
-// Phase 2: basic UDMA Get gather into route-major local GM
-// ============================================================
-
-__forceinline__ __aicore__ uint32_t CombineDecodeRank(
-    int32_t dst_val,
-    uint32_t NvS) {
-    uint32_t raw_dst = dst_val >= 0
-        ? static_cast<uint32_t>(dst_val)
-        : static_cast<uint32_t>(-static_cast<int64_t>(dst_val) - 1);
-    return raw_dst / NvS;
-}
-
-__forceinline__ __aicore__ uint32_t CombineDecodeLoff(
-    int32_t dst_val,
-    uint32_t NvS) {
-    uint32_t raw_dst = dst_val >= 0
-        ? static_cast<uint32_t>(dst_val)
-        : static_cast<uint32_t>(-static_cast<int64_t>(dst_val) - 1);
-    return raw_dst % NvS;
-}
-
-__forceinline__ __aicore__ bool CombineCanUseVectorSlotSelect(
-    uint32_t route_count,
-    uint32_t& slot_shift) {
-    if (route_count == 0 ||
-        (route_count & (route_count - 1U)) != 0) {
-        return false;
-    }
-    slot_shift = 0;
-    for (uint32_t value = route_count; value > 1U; value >>= 1U) {
-        ++slot_shift;
-    }
-    return slot_shift <= 31U;
-}
+// ---- Begin combine-only definitions ----
+// Combine-only 64-AIV layout; leaves kMoonEPAivNum=32 unchanged for other operators.
+// Matches TileXR combine_v2: 8 relay, 32 reducer (8 groups x 4 shards), 24 physical sender cores.
+inline constexpr uint32_t kCombinePutRelayCores = 8;
+inline constexpr uint32_t kCombinePutSourceLanes = 16;
+// 8 reducer groups x 4 shards. Each group owns a source-lane sequence.
+inline constexpr uint32_t kCombinePutReducerGroups = 8;
+inline constexpr uint32_t kCombinePutReducerShards = 4;
+inline constexpr uint32_t kCombinePutReducerBegin = kCombinePutRelayCores;
+inline constexpr uint32_t kCombinePutSenderBegin =
+    kCombinePutReducerBegin + kCombinePutReducerGroups * kCombinePutReducerShards;
+// QP0: 16 physical workers. QP1: 8 physical workers, each owns two peers.
+inline constexpr uint32_t kCombinePutSenderEnd =
+    kCombinePutSenderBegin + kCombinePutSourceLanes + kCombinePutSourceLanes / 2U;
+// All worlds >=128P share moonep-r18's static first-reduce layout. Keep the
+// legacy constants above untouched: they remain the exact 64P layout.
+// The historical "128" suffix identifies this shared path, not a world-size limit.
+inline constexpr uint32_t kCombinePut128ReducerBegin = 8U;
+inline constexpr uint32_t kCombinePut128ReducerGroups = 8U;
+inline constexpr uint32_t kCombinePut128ReducerShards = 2U;
+inline constexpr uint32_t kCombinePut128SenderBegin = 24U;
+// >=128P: AIV24..39 own QP0; AIV40..55 own QP1 (one source lane/core).
+// AIV56..63 final-only. Keep each peer/QP on one core through all payload passes.
+inline constexpr uint32_t kCombinePut128SenderEnd =
+    kCombinePut128SenderBegin + 2U * kCombinePutSourceLanes;
+static_assert(kCombinePut128SenderEnd == 56U);
+static_assert(kCombinePut128SenderEnd <= kCombinePutCores);
+static_assert(kCombinePutReducerGroups * 2U == kCombinePutSourceLanes);
+static_assert(kCombinePutSenderEnd ==
+    kCombinePutSenderBegin + 3U * kCombinePutSourceLanes / 2U);
+static_assert(kCombinePutSenderEnd <= kCombinePutCores);
 
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-// GET does not use the RO/SO ordering domains. Fence every aggregate WQE;
-// deferred WQEs stay CQE-free and the final submit WQE publishes the CQE.
-inline constexpr aclshmemx_udma_op_config_t
-    kCombineUdmaOpConfigDeferFence{
-        0U, 0U, 1U, ACLSHMEMX_UDMA_ODR_NO};
-inline constexpr aclshmemx_udma_op_config_t
-    kCombineUdmaOpConfigSubmitFence{
-        1U, 0U, 1U, ACLSHMEMX_UDMA_ODR_NO};
-
-template <typename T>
-__forceinline__ __aicore__ void CombineUdmaGet(
-    __gm__ T* local_dst,
-    __gm__ T* symmetric_src,
-    __ubuf__ uint8_t* wqe_staging,
-    uint32_t elements,
-    uint32_t dest_rank,
-    uint32_t qp_idx) {
-    aclshmemx_udma_qp_get_nbi<T, PIPE_MTE3>(
-        local_dst,
-        symmetric_src,
-        reinterpret_cast<__ubuf__ T*>(wqe_staging),
-        elements,
-        static_cast<int32_t>(dest_rank),
-        qp_idx,
-        EVENT_ID0);
-}
-
-template <typename T>
-__forceinline__ __aicore__ void CombineUdmaGet(
-    __gm__ T* local_dst,
-    __gm__ T* symmetric_src,
-    __ubuf__ uint8_t* wqe_staging,
-    uint32_t elements,
-    uint32_t dest_rank,
-    uint32_t qp_idx,
-    aclshmemx_defer_t action) {
-    aclshmemx_udma_qp_get_nbi<
-        T, PIPE_MTE3, kCombineUdmaOpConfigDeferFence>(
-        local_dst,
-        symmetric_src,
-        reinterpret_cast<__ubuf__ T*>(wqe_staging),
-        elements,
-        static_cast<int32_t>(dest_rank),
-        qp_idx,
-        EVENT_ID0,
-        action);
-}
-
-template <typename T>
-__forceinline__ __aicore__ void CombineUdmaGet(
-    __gm__ T* local_dst,
-    __gm__ T* symmetric_src,
-    __ubuf__ uint8_t* wqe_staging,
-    uint32_t elements,
-    uint32_t dest_rank,
-    uint32_t qp_idx,
-    aclshmemx_submit_t action) {
-    aclshmemx_udma_qp_get_nbi<
-        T, PIPE_MTE3, kCombineUdmaOpConfigSubmitFence>(
-        local_dst,
-        symmetric_src,
-        reinterpret_cast<__ubuf__ T*>(wqe_staging),
-        elements,
-        static_cast<int32_t>(dest_rank),
-        qp_idx,
-        EVENT_ID0,
-        action);
-}
+#define MOONEP_PUT_SCHEDULE_INLINE __forceinline__ __aicore__
+#else
+#define MOONEP_PUT_SCHEDULE_INLINE inline constexpr
 #endif
 
-__aicore__ void AssembleWeightsFromStagingPhase(
-    LocalTensor<uint8_t> ub_base,
-    __gm__ float* published_weights,
-    const __gm__ float* gathered_weights,
-    const __gm__ int32_t* dst,
-    __gm__ float* output_sk,
-    uint32_t R,
-    uint32_t NvS,
-    uint32_t rank,
-    uint32_t worker_idx,
-    uint32_t worker_num) {
-    uint32_t route_start = 0;
-    uint32_t route_end = 0;
-    CombineSplitRange(
-        NvS, worker_num, worker_idx, route_start, route_end);
-    if (route_start >= route_end) {
-        return;
+// Shared >=128P mapping matches dispatch's current Staged GetGroupDstRank.
+// 128P/256P/512P use 4x4 groups inside 64-rank frames. At 256P, XOR frame
+// offsets visit the local 128P half first, then the other half. At 512P, row
+// and side spread source groups across target frames. Other supported world
+// sizes use dispatch's Legacy cross-half-world mapping, not a partial-frame extension.
+// In combine, source is the original rank that ultimately receives the result. This uses
+// dispatch's forward destination-rank mapping, not its reverse incoming-peer mapping.
+// Relay supplies data in the ingress mapping order; Reduce/Send/planning share this function.
+// Do not compact/reorder same-server entries: Reduce/Send skip them; Relay finishes LocalFinal.
+MOONEP_PUT_SCHEDULE_INLINE uint32_t CombinePutSource128(
+    uint32_t rank, uint32_t ordinal, uint32_t ranks) {
+    const uint32_t frame = rank / 64U;
+    const uint32_t groupRow = (rank % 64U) / 32U;
+    const uint32_t groupSide = (rank % 8U) / 4U;
+    const uint32_t frames = ranks / 64U;
+    const bool staged = ranks >= 128U && ranks <= 512U && ranks % 64U == 0U &&
+        (frames & (frames - 1U)) == 0U;
+    if (staged) {
+        const uint32_t phase = ordinal / 16U, lane = ordinal % 16U;
+        const uint32_t subround = phase % 4U;
+        const uint32_t framePhase = phase / 4U;
+        const uint32_t frameSpread = groupSide + groupRow * (frames >= 4U ? frames / 2U : 0U);
+        const uint32_t frameOffset = frames == 4U
+            ? (framePhase / 2U) * 2U + (groupSide ^ (framePhase % 2U))
+            : (framePhase + frameSpread) % frames;
+        const uint32_t targetFrame = frames == 4U
+            ? frame ^ frameOffset : (frame + frameOffset) % frames;
+        const uint32_t targetGroupRow = (groupRow + subround / 2U) % 2U;
+        const uint32_t targetGroupSide = groupSide ^ (subround % 2U);
+        return targetFrame * 64U + (targetGroupRow * 4U + lane / 4U) * 8U +
+               targetGroupSide * 4U + lane % 4U;
     }
+    const uint32_t halfWorld = ranks / 2U;
+    const uint32_t rankGroup = (rank % halfWorld) / 8U;
+    const uint32_t peerGroup = (rankGroup + ordinal / 16U) % (ranks / 16U);
+    const uint32_t lane = ordinal % 16U;
+    return (lane / 8U) * halfWorld + peerGroup * 8U + lane % 8U;
+}
 
-    LocalTensor<int32_t> dst_local = CombineMakeUbTensor<int32_t>(
-        ub_base,
-        2U * kCombineWeightOutputStageBytes,
-        kCombineSlotChunkCount);
-
-    SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID2);
-    SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
-    uint32_t output_stage_idx = 0;
-
-    for (uint32_t chunk_start = route_start;
-         chunk_start < route_end;
-         chunk_start += kCombineSlotChunkCount) {
-        uint32_t chunk_count = route_end - chunk_start;
-        if (chunk_count > kCombineSlotChunkCount) {
-            chunk_count = kCombineSlotChunkCount;
-        }
-
-        const TEventID store_ev =
-            output_stage_idx == 0U ? EVENT_ID2 : EVENT_ID3;
-        LocalTensor<float> output_local = CombineMakeUbTensor<float>(
-            ub_base,
-            output_stage_idx * kCombineWeightOutputStageBytes,
-            kCombineSlotChunkCount);
-        WaitFlag<HardEvent::MTE3_MTE2>(store_ev);
-        CombineCopyGmToUbForScalarOnEvent(
-            dst_local, dst + chunk_start, chunk_count, EVENT_ID0);
-
-        for (uint32_t route_i = 0; route_i < chunk_count; ++route_i) {
-            const int32_t dst_val = dst_local.GetValue(route_i);
-            const uint32_t dest_rank = CombineDecodeRank(dst_val, NvS);
-            const uint32_t loff = CombineDecodeLoff(dst_val, NvS);
-            float weight = 0.0f;
-            if (dest_rank >= R || loff >= NvS) {
-                output_local.SetValue(route_i, weight);
-                continue;
+// The host ensures ranks>0. Callers iterate ordinal<ranks; unused lanes in small worlds stay idle.
+MOONEP_PUT_SCHEDULE_INLINE uint32_t CombinePutSource(
+    uint32_t rank, uint32_t ordinal, uint32_t ranks) {
+    if (ranks <= 8U) return (rank + ordinal) % ranks;
+    // Match the current reference source schedule, not the older +8 rotation.
+    const uint32_t lane = ordinal % 16U, phase = ordinal / 16U;
+    const uint32_t serverBegin = rank / 8U * 8U, local = rank % 8U;
+    if (ranks >= 128U) return CombinePutSource128(rank, ordinal, ranks);
+    if (ranks == 16U || ranks == 32U || ranks == 64U) {
+        const uint32_t remaining = ranks - 8U > phase * 16U ? ranks - 8U - phase * 16U : 0U;
+        const uint32_t remote = remaining < 16U ? remaining : 16U;
+        if (lane >= remote) return serverBegin + lane - remote;
+        uint32_t seen = 0;
+        for (uint32_t side = 0; side < 2U; ++side) {
+            uint32_t start = side == 0U ? (serverBegin + ranks - (phase + 1U) * 8U + local) % ranks
+                : (serverBegin + (phase + 1U) * 8U + (phase == 0U ? 0U : local)) % ranks;
+            for (uint32_t i = 0; i < (side == 0U ? 8U : ranks); ++i) {
+                uint32_t candidate = (start + i) % ranks;
+                if (candidate >= serverBegin && candidate < serverBegin + 8U) continue;
+                if (seen++ == lane) return candidate;
             }
-            weight = dest_rank == rank
-                ? published_weights[loff]
-                : gathered_weights[
-                      static_cast<uint64_t>(dest_rank) * NvS + loff];
-            output_local.SetValue(route_i, weight);
         }
-
-        SetFlag<HardEvent::S_MTE3>(store_ev);
-        WaitFlag<HardEvent::S_MTE3>(store_ev);
-        CombineIssueUbToGm(
-            output_sk + chunk_start, output_local, chunk_count);
-        SetFlag<HardEvent::MTE3_MTE2>(store_ev);
-        output_stage_idx ^= 1U;
     }
-
-    WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID2);
-    WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
+    // Preserve the public API's other world sizes (reference does not support them).
+    const uint32_t base = ((rank / 8U) * 8U + 8U) % ranks;
+    return (base + ordinal) % ranks;
 }
 
-template <typename HiddenT>
-__aicore__ CombineGatherResult GatherToStagingPhase(
-    LocalTensor<uint8_t> ub_base,
-    __gm__ HiddenT* published_hidden,
-    __gm__ float* published_weights,
-    __gm__ uint8_t* sync_buffer,
-    GM_ADDR workspace,
-    const __gm__ int32_t* dst,
-    __gm__ float* output_sk,
-    uint32_t H,
-    uint32_t R,
-    uint32_t NvS,
-    bool with_weights,
-    uint64_t invocation_magic,
-    uint32_t rank,
-    uint32_t core_idx,
-    uint32_t core_num) {
+// The relay receiver (peer) performs first-reduce: >=128P supplies sources in demand order.
+// The producer's rotated order could put the receiver's first awaited source at the end.
+// Worlds below 128P retain their original producer order.
+MOONEP_PUT_SCHEDULE_INLINE uint32_t CombinePutRelaySource(
+    uint32_t rank, uint32_t peer, uint32_t ordinal, uint32_t ranks) {
+    return ranks >= 128U ? CombinePutSource128(peer, ordinal, ranks)
+                         : CombinePutSource(rank, ordinal, ranks);
+}
 
-    __gm__ HiddenT* gathered_hidden = reinterpret_cast<__gm__ HiddenT*>(
-        workspace);
-    const uint64_t gathered_weights_off_bytes =
-        static_cast<uint64_t>(NvS) * H * sizeof(HiddenT);
-    __gm__ float* gathered_weights = reinterpret_cast<__gm__ float*>(
-        workspace + gathered_weights_off_bytes);
-    __ubuf__ uint8_t* wqe_staging = reinterpret_cast<__ubuf__ uint8_t*>(
-        CombineUbPtr(CombineMakeUbTensor<uint8_t>(
-            ub_base, kCombineUdmaStagingOffset, kCombineUdmaStagingBytes)));
+// Find a source's scheduling ordinal. The base is only 8-aligned, so source%16 cannot
+// identify its sender; preparation and payload must use exactly the same peer/QP ownership.
+MOONEP_PUT_SCHEDULE_INLINE uint32_t CombinePutSourceOrdinal(
+    uint32_t rank, uint32_t source, uint32_t ranks) {
+    for (uint32_t ordinal = 0; ordinal < ranks; ++ordinal)
+        if (CombinePutSource(rank, ordinal, ranks) == source) return ordinal;
+    return ranks;
+}
 
-    CombineGatherResult result{};
-    CombineLocalAivBarrier();
-#if MOONEP_UDMA_PROFILE_STATISTIC
-    const uint64_t hidden_submit_start_cycle = AscendC::GetSystemCycle();
+MOONEP_PUT_SCHEDULE_INLINE uint32_t CombinePutSenderCore(
+    uint32_t rank, uint32_t source, uint32_t ranks) {
+    return (ranks >= 128U ? kCombinePut128SenderBegin : kCombinePutSenderBegin) +
+        CombinePutSourceOrdinal(rank, source, ranks) % kCombinePutSourceLanes;
+}
+
+MOONEP_PUT_SCHEDULE_INLINE uint32_t CombinePutSenderLane128(uint32_t core) {
+    return core < kCombinePut128SenderBegin + kCombinePutSourceLanes ? 0U : 1U;
+}
+MOONEP_PUT_SCHEDULE_INLINE uint32_t CombinePutSenderWorker128(uint32_t core) {
+    return CombinePutSenderLane128(core) == 0U ? core - kCombinePut128SenderBegin
+        : core - (kCombinePut128SenderBegin + kCombinePutSourceLanes);
+}
+
+// 64P has 56 remote sources, so ordinal 48..55 is the final, half-full
+// 16-source wave.  Give its hidden payload exclusively to QP0's six-port
+// path instead of splitting eight peers over QP0/QP1.  QP1 emits neither
+// payload nor final_ready; Final() skips that lane for the same tail peers.
+MOONEP_PUT_SCHEDULE_INLINE bool CombinePutSenderTailQp0Only(
+    uint32_t rank, uint32_t source, uint32_t ranks) {
+    if (ranks != 64U) return false;
+    const uint32_t ordinal = CombinePutSourceOrdinal(rank, source, ranks);
+    return ordinal >= 3U * kCombinePutSourceLanes && ordinal < ranks - 8U;
+}
+
+// QP0 six-port: one worker/core. QP1 two-port: two peers/core.
+MOONEP_PUT_SCHEDULE_INLINE uint32_t CombinePutSenderLane(uint32_t core) {
+    return core < kCombinePutSenderBegin + kCombinePutSourceLanes ? 0U : 1U;
+}
+MOONEP_PUT_SCHEDULE_INLINE uint32_t CombinePutSenderWorker(uint32_t core, uint32_t index) {
+    return core < kCombinePutSenderBegin + kCombinePutSourceLanes
+               ? core - kCombinePutSenderBegin
+               : core - (kCombinePutSenderBegin + kCombinePutSourceLanes) + index * 8U;
+}
+// Rotate batch ownership across sources so a short tail does not keep landing on one shard.
+MOONEP_PUT_SCHEDULE_INLINE uint32_t CombinePutReducerFirstBatch(
+    uint32_t shard, uint32_t batchOwnerRotation) {
+    return (shard + kCombinePutReducerShards - batchOwnerRotation) %
+           kCombinePutReducerShards;
+}
+// TileXR first-reduce scheduling: every four-shard group owns one source
+// in each 8-source round: g, g+8, g+16, ... .
+MOONEP_PUT_SCHEDULE_INLINE uint32_t CombinePutReducerOrdinal(uint32_t group, uint32_t round) {
+    return round * kCombinePutReducerGroups + group;
+}
+
+MOONEP_PUT_SCHEDULE_INLINE uint32_t CombinePutReducerOrdinal(
+    uint32_t ranks, uint32_t group, uint32_t round) {
+    (void)ranks;
+    return CombinePutReducerOrdinal(group, round);
+}
+#undef MOONEP_PUT_SCHEDULE_INLINE
+
+// ---- End combine-only definitions ----
+
+constexpr uint32_t kCores = ascend_moonep::kCombinePutCores;
+constexpr uint32_t kReduceBegin = kCombinePutReducerBegin;
+constexpr uint32_t kSendBegin = kCombinePutSenderBegin;
+constexpr uint32_t kSendEnd = kCombinePutSenderEnd;
+constexpr uint32_t kBatch = ascend_moonep::kCombinePutBatchRows, kTile = 8192;
+// TileXR source-final scheduling constants.  Use the native AscendC vector
+// operations for final reduction; this is the stable pre-RegBase path.
+constexpr uint32_t kAlignedFinalTile = 4096U;
+constexpr uint32_t kAlignedFinalRouteBatch = 4U;
+
+#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+inline constexpr aclshmemx_udma_op_config_t kPayload{0U, 0U, 0U, ACLSHMEMX_UDMA_ODR_RO};
+inline constexpr aclshmemx_udma_op_config_t kCheckpoint{1U, 0U, 0U, ACLSHMEMX_UDMA_ODR_SO};
 #endif
+template <typename T>
+__aicore__ inline LocalTensor<T> Ub(uint32_t bytes, uint32_t count) {
+    LocalTensor<T> t;
+    t.address_.logicPos = static_cast<uint8_t>(TPosition::VECIN);
+    t.address_.bufferAddr = bytes;
+    t.address_.dataLen = count * sizeof(T);
+    return t;
+}
+template <typename T>
+__aicore__ inline void Load(LocalTensor<T> ub, const __gm__ T* p, uint32_t n) {
+    GlobalTensor<T> gm;
+    gm.SetGlobalBuffer(const_cast<__gm__ T*>(p), n);
+    DataCopyExtParams cp{1, n * static_cast<uint32_t>(sizeof(T)), 0, 0, 0};
+    DataCopyPadExtParams<T> pad{false, 0, 0, 0};
+    DataCopyPad(ub, gm, cp, pad);
+}
+template <typename T>
+__aicore__ inline void Store(__gm__ T* p, LocalTensor<T> ub, uint32_t n) {
+    GlobalTensor<T> gm;
+    gm.SetGlobalBuffer(p, n);
+    DataCopyExtParams cp{1, n * static_cast<uint32_t>(sizeof(T)), 0, 0, 0};
+    DataCopyPad(gm, ub, cp);
+}
 
-    uint32_t slot_shift = 0;
-    const bool use_vector_slot_select =
-        CombineCanUseVectorSlotSelect(NvS, slot_shift);
-    LocalTensor<int32_t> dstLocal = CombineMakeUbTensor<int32_t>(
-        ub_base, 0, kCombineSlotChunkCount);
-    LocalTensor<int32_t> dstRankLocal = CombineMakeUbTensor<int32_t>(
-        ub_base, kCombineSlotTensorBytes, kCombineSlotChunkCount);
-    LocalTensor<int32_t> routeIndices = CombineMakeUbTensor<int32_t>(
-        ub_base, 2U * kCombineSlotTensorBytes, kCombineSlotChunkCount);
-    LocalTensor<int32_t> selectedRouteIndices = CombineMakeUbTensor<int32_t>(
-        ub_base, 3U * kCombineSlotTensorBytes, kCombineSlotChunkCount);
-    LocalTensor<uint8_t> compareMask = CombineMakeUbTensor<uint8_t>(
-        ub_base, 4U * kCombineSlotTensorBytes, kCombineSlotMaskBytes);
-    GlobalTensor<int32_t> dstGlobal;
-    dstGlobal.SetGlobalBuffer(
-        const_cast<__gm__ int32_t*>(dst), NvS);
+__aicore__ inline void Flush(__gm__ void* p) {
+    dcci_cacheline(reinterpret_cast<__gm__ uint8_t*>(p));
+}
+__aicore__ inline void Publish(__gm__ uint64_t* p, uint64_t magic) {
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    DataSyncBarrier<MemDsbT::DDR>();
+    *p = magic;
+    Flush(p);
+}
+__aicore__ inline void Wait(__gm__ uint64_t* p, uint64_t magic) {
+    aclshmem_uint64_wait_until(p, ACLSHMEM_CMP_EQ, magic);
+}
+__aicore__ inline bool Ready(__gm__ uint64_t* p, uint64_t magic) {
+    Flush(p);
+    return *p == magic;
+}
+__aicore__ inline uint32_t Raw(int32_t v) {
+    return ascend_moonep::IsMoonEPServerForwardedRoute(v)
+        ? ascend_moonep::DecodeMoonEPServerForwardedRoute(v)
+        : v >= 0 ? static_cast<uint32_t>(v)
+                 : static_cast<uint32_t>(-static_cast<int64_t>(v) - 1);
+}
 
-    // Dispatch-style group ownership. The active AIV set is group_width, and
-    // each active AIV owns one source PE (and both of its QPs) per group.
-    const uint32_t group_width = CombineGetGroupWidth(R);
-    const uint32_t group_count = R > 1U ? R / group_width : 0U;
-    const uint32_t group_rank_index = core_idx % group_width;
-    const uint32_t current_rank_index = R > 1U
-        ? CombineGetGroupRankIndex(rank, R)
-        : 0U;
-    const bool reader_active = R > 1U && core_idx < group_width;
-    uint64_t hidden_rows = 0;
-    for (uint32_t group = 0; group < group_count && reader_active; ++group) {
-        const uint32_t dest_rank = CombineGetGroupSourceRank(
-            rank, R, group, group_rank_index);
-        const uint32_t incoming_reader = CombineGetGroupReaderRank(
-            rank, R, group, group_rank_index);
-        const uint64_t group_token = CombineGetGroupToken(
-            invocation_magic, group, group_count);
+struct Pipeline {
+    // Each AIV owns a Pipeline; GM pointers refer to rank-shared data, while counters are core-private.
+    __gm__ uint8_t* ws;       // Symmetric workspace: reverse plans, relay/send/final hidden, weights, ready slots.
+    __gm__ bf16_t* hidden;    // Original input [n, h], indexed by producer-local loff; combine does not overwrite it.
+    __gm__ float* weights;   // Symmetric SHMEM input [n]; Final reads rank/loff from dst; private GM is not valid.
 
-        // This rank is a source for incoming_reader while it is a reader of
-        // dest_rank. Publish every grant before waiting, exactly dual to
-        // dispatch's receiver-credit flow, so the phase cannot deadlock.
-        CombinePublishGroupSignal(
-            ub_base,
-            sync_buffer,
-            rank,
-            incoming_reader,
-            group_rank_index,
-            kCombineGrantSignalSlot,
-            group_token);
-        CombineWaitGroupSignal(
-            sync_buffer,
-            dest_rank,
-            rank,
-            current_rank_index,
-            kCombineGrantSignalSlot,
-            group_token);
+    // Read-only planning inputs; source is the token's original rank, producer holds the input row.
+    const __gm__ int32_t
+        *dst,                // Source-rank route map [n]; Raw(dst[route]) = producer*n + loff.
+                             // Nonnegative/forwarded tags mark canonical entries, ~raw duplicates; weights return per route.
+        *groups,             // Dedup groups [n, 3]: representative loff, dups offset, duplicate count excluding the representative.
+                             // In server mode column 3 packs source_route and duplicate count, decoded by DupCount().
+        *dups,               // Rank mode: local loffs, capacity n; server mode: producer*n+loff, capacity 8*n.
+        *counts;             // [0] valid groups, [1] valid duplicate members; r extra source-group prefixes in server ABI are unused here.
+    __gm__ bf16_t* out;       // Source-rank output [n/k, h]; Final() merges canonical partial sums.
+    __gm__ float* outw;       // Source-rank weights [n/k, k], restored per original route without deduplication or summation.
+    ascend_moonep::CombinePutLayout p; // Workspace byte offsets relative to ws, batches per peer, etc.
 
-        // Self occupies one balanced group slot but does not consume UDMA.
-        if (dest_rank != rank) {
-        if (use_vector_slot_select) {
-            // NvS is a power of two, so encoded rank is dst >> log2(NvS).
-            // Negative duplicate encodings remain negative after the shift
-            // and therefore cannot match the non-negative destination rank.
-            for (uint32_t chunk_start = 0;
-                 chunk_start < NvS;
-                 chunk_start += kCombineSlotChunkCount) {
-                const uint32_t chunk_index =
-                    chunk_start / kCombineSlotChunkCount;
-                const uint32_t qp_idx =
-                    CombineGetChunkQpIndex(chunk_index);
-                uint32_t chunk_count = NvS - chunk_start;
-                if (chunk_count > kCombineSlotChunkCount) {
-                    chunk_count = kCombineSlotChunkCount;
+    uint32_t n,              // S*K: per-rank route/input-row capacity, not the actual deduplicated send count.
+             h,              // H: hidden elements per row; each BF16 element is 2 bytes.
+             k,              // K: top-k routes per original token; the original token count is n/k.
+             r,              // R: ranks in the EP communication world, e.g. 64; not the server count.
+             rank,           // Global rank; in server mode rank/8 is the server ID and rank%8 the local device ID.
+             core;           // AIV ID; see the file header for 64P and >=128P core roles.
+    bool server,             // True: 8-rank/server dedup ABI with intra-server relay; false: rank-local dedup ABI.
+         with_weights;       // Whether to return weights; false skips the weights/outw path.
+    uint64_t magic;           // Unique ready marker per invocation; planning clears once, later calls use distinct magic values.
+
+    // Two UB context records, one for each alternating QP. Reload on peer/QP
+    // changes; head and CQ count are always read from the shared SHMEM context
+    // because scalar metadata/ready PUTs also advance this same queue.
+    uint32_t simt_peer[2] = {0xffffffffU, 0xffffffffU};
+    // CQ failure attribution: 1=ReverseRoutes, 2=ReverseRelays, 3=FinishPlan,
+    // 4=payload relay/reduce/send, 5=Final. No extra synchronization is added.
+    uint32_t phase_id = 0U, simt_batches_posted = 0U;
+    uint32_t simt_qp[2] = {0xffffffffU, 0xffffffffU};
+    __aicore__ inline __gm__ int32_t* Meta(uint64_t base, uint64_t index) {
+        uint64_t offset = 0U, stride = 64U;
+        if (base == p.tx_rows) { offset = plan_layout.tx_rows; stride = kCombinePlanTxBytes; }
+        else if (base == p.source_counts) offset = plan_layout.source_counts;
+        else if (base == p.contributor) { offset = plan_layout.contributor; stride = kCombinePlanContributorBytes; }
+        else if (base == p.relay_send) { offset = plan_layout.relay_send; stride = kCombinePlanRelayBytes; }
+        else if (base == p.relay_ranges) offset = plan_layout.relay_ranges;
+        else aclshmemi_kernel_abort("combine attempted mutable plan access rank=%u\n", rank);
+        auto record = reinterpret_cast<__gm__ int32_t*>(execution_plan + offset + index * stride);
+        // Planning writes directly into a reusable allocator block. Source
+        // counts are read by PIPE_S without a caller-side Flush; invalidate
+        // that cache line even when a previous plan occupied the same address.
+        if (base == p.source_counts) Flush(record);
+        return record;
+    }
+    // Prepared execution only reads this tensor. PUT targets/flags remain in ws.
+    __gm__ uint8_t* execution_plan = nullptr;
+    CombineExecutionPlanLayout plan_layout{};
+    __aicore__ inline __gm__ uint64_t* Flag(uint64_t base, uint64_t index) {
+        return reinterpret_cast<__gm__ uint64_t*>(ws + base + index * 512U);
+    }
+    __aicore__ inline __gm__ bf16_t* Row(uint64_t base, uint64_t index) {
+        return reinterpret_cast<__gm__ bf16_t*>(ws + base) + index * h;
+    }
+    __aicore__ inline __ubuf__ uint8_t* Wqe() {
+        return reinterpret_cast<__ubuf__ uint8_t*>(Ub<uint8_t>(128 * 1024, 8192).GetPhyAddr());
+    }
+    // Default batched PUT retains scalar SHMEM WQE construction and MTE3 SQ staging.
+    // DIRECT, cross-server reduced results, and small-world LocalFinal use this non-SIMT entry.
+    __aicore__ inline void SubmitPutBatch(__gm__ bf16_t* target_base,
+                                          __gm__ bf16_t* const* inputs,
+                                          __gm__ bf16_t* const* targets,
+                                          uint32_t count, uint32_t peer,
+                                          uint32_t qp) {
+        (void)target_base;
+        if (!count) return;
+        {
+            // Exact pre-SIMT aggregate path: defer payload rows, then submit
+            // the last row with one completion checkpoint for this batch.
+            aclshmemx_submit_state_t state{};
+            for (uint32_t j = 0; j < count; ++j) {
+                if (j + 1U == count) {
+                    aclshmemx_submit_t submit(state);
+                    aclshmemx_udma_qp_put_nbi<bf16_t, PIPE_MTE3, kCheckpoint>(
+                        targets[j], inputs[j], reinterpret_cast<__ubuf__ bf16_t*>(Wqe()),
+                        h, peer, qp, EVENT_ID0, submit);
+                } else {
+                    aclshmemx_defer_t defer(state);
+                    aclshmemx_udma_qp_put_nbi<bf16_t, PIPE_MTE3, kPayload>(
+                        targets[j], inputs[j], reinterpret_cast<__ubuf__ bf16_t*>(Wqe()),
+                        h, peer, qp, EVENT_ID0, defer);
                 }
-                const uint32_t padded_count =
-                    ((chunk_count + kCombineVectorSlotSelectCountAlign - 1U) /
-                     kCombineVectorSlotSelectCountAlign) *
-                    kCombineVectorSlotSelectCountAlign;
+            }
+            return;
+        }
+    }
+    // Intra-server SIMT payload, shared by Relay() and 64P/>=128P LocalFinal(); never for cross-server sends.
+    // Metadata, weights, and ready keep their original paths; the last WQE in each batch still requests SO+CQE.
+    __aicore__ inline void SubmitIntraPutBatch(__gm__ bf16_t* target_base,
+                                               __gm__ bf16_t* const* inputs,
+                                               __gm__ bf16_t* const* targets,
+                                               uint32_t count, uint32_t peer,
+                                               uint32_t qp) {
+        (void)target_base;
+        if (!count) return;
+        if (!server || peer / 8U != rank / 8U) {
+            aclshmemi_kernel_abort("combine SIMT intra PUT requires same-server peer\n");
+            return;
+        }
+        auto info = aclshmemi_udma_qp_info_fetch();
+        auto ctx = aclshmemi_udma_get_qp_ctx(info, peer, qp);
+        if (count > CombinePutSimt::kBatch || peer == rank || ctx->wqe_size != 64U) {
+            aclshmemi_kernel_abort("combine SIMT invalid count/peer/WQE size\n");
+            return;
+        }
+        // Apply the same SQ credit guard as the aggregate SHMEM writer, using
+        // our checked Drain so a CQ timeout never permits overwriting live SQEs.
+        if (!aclshmemi_udma_sq_has_credit(ctx, count)) Drain(peer, qp);
+        if (!aclshmemi_udma_sq_has_credit(ctx, count)) {
+            aclshmemi_kernel_abort("combine SIMT SQ credit unavailable\n");
+            return;
+        }
+        auto entries = reinterpret_cast<__ubuf__ uint32_t*>(
+            Ub<uint32_t>(CombinePutSimt::kEntriesOffset, 64U * 8U).GetPhyAddr());
+        const uint32_t cache = qp & 1U;
+        auto rec = reinterpret_cast<__ubuf__ uint32_t*>(
+            Ub<uint32_t>(CombinePutSimt::kContextOffset + cache * 64U, 16U).GetPhyAddr());
+        if (simt_peer[cache] != peer || simt_qp[cache] != qp) {
+            auto mem = aclshmemi_udma_get_mem_info(info, peer, qp);
+            const uint32_t common = (uint32_t(mem->token_value_valid) << 28U) |
+                (ACLSHMEM_UDMA_REMOTE_JETTY_TYPE << 29U);
+            rec[0] = common | (aclshmemi_udma_build_flag<
+                aclshmemi_udma_opcode_t::UDMA_OP_WRITE, kPayload>() << 16U);
+            rec[1] = (mem->target_hint & 0xffU) |
+                (uint32_t(aclshmemi_udma_opcode_t::UDMA_OP_WRITE) << 8U);
+            rec[2] = (mem->tpn & 0xffffffU) | (1U << 24U);
+            rec[3] = mem->tid & 0xfffffU;
+            rec[4] = mem->rmt_token_value;
+            rec[5] = 0U;
+            const uint64_t sq = ctx->buf_addr;
+            rec[6] = uint32_t(sq); rec[7] = uint32_t(sq >> 32U);
+            auto eid = reinterpret_cast<__gm__ uint64_t*>(mem->eid_addr);
+            const uint64_t eid0 = eid[0], eid1 = eid[1];
+            rec[8] = uint32_t(eid0); rec[9] = uint32_t(eid0 >> 32U);
+            rec[10] = uint32_t(eid1); rec[11] = uint32_t(eid1 >> 32U);
+            rec[12] = ctx->wqe_size;
+            rec[13] = common | (aclshmemi_udma_build_flag<
+                aclshmemi_udma_opcode_t::UDMA_OP_WRITE, kCheckpoint>() << 16U);
+            rec[14] = 0U; rec[15] = 0U;
+            simt_peer[cache] = peer; simt_qp[cache] = qp;
+        }
+        const uint32_t head = ctx->head;
+        for (uint32_t j = 0U; j < count; ++j) {
+            auto entry = entries + j * CombinePutSimt::kEntryWords;
+            const uint64_t remote = reinterpret_cast<uint64_t>(aclshmem_ptr(targets[j], peer));
+            const uint64_t local = reinterpret_cast<uint64_t>(inputs[j]);
+            entry[2] = uint32_t(remote); entry[3] = uint32_t(remote >> 32U);
+            entry[4] = uint32_t(local); entry[5] = uint32_t(local >> 32U);
+            entry[6] = h * sizeof(bf16_t);
+            entry[7] = (head + j) % shm::UDMA_SQ_BASKBLK_CNT;
+        }
+        SetFlag<HardEvent::S_V>(EVENT_ID0);
+        WaitFlag<HardEvent::S_V>(EVENT_ID0);
+        const uint32_t threads = (count + 31U) / 32U * 32U;
+        AscendC::Simt::VF_CALL<CombinePutSimt::FillWriteWqes>(
+            AscendC::Simt::Dim3(threads, 1, 1), count, entries, rec);
+        // Match dispatch's direct-GM-store protocol: V_S completes VF stores
+        // before the doorbell and before S can reuse entries/context UB.
+        SetFlag<HardEvent::V_S>(EVENT_ID0);
+        WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        auto db = reinterpret_cast<__gm__ uint32_t*>(ctx->db_addr);
+        st_dev(head + count, db, 0);
+        ctx->head = head + count;
+        ctx->cqe_cnt += 1U; // exactly one SO+CQE WQE per nonempty batch
+        ++simt_batches_posted;
+    }
+    __aicore__ inline uint32_t Source(uint32_t ordinal) {
+        return CombinePutSource(rank, ordinal, r);
+    }
+    __aicore__ inline uint32_t Producer(uint32_t address) { return server ? address / n : rank; }
+    __aicore__ inline uint32_t Loff(uint32_t address) { return server ? address % n : address; }
 
-                SetFlag<HardEvent::S_MTE2>(EVENT_ID1);
-                WaitFlag<HardEvent::S_MTE2>(EVENT_ID1);
-                DataCopyExtParams dst_copy_params {
-                    1,
-                    static_cast<uint32_t>(chunk_count * sizeof(int32_t)),
-                    0,
-                    0,
-                    0};
-                DataCopyPadExtParams<int32_t> dst_pad_params {
-                    false, 0, 0, 0};
-                DataCopyPad(
-                    dstLocal,
-                    dstGlobal[chunk_start],
-                    dst_copy_params,
-                    dst_pad_params);
-                SetFlag<HardEvent::MTE2_V>(EVENT_ID1);
-                WaitFlag<HardEvent::MTE2_V>(EVENT_ID1);
+    template <typename T>
+    __aicore__ inline void Copy(__gm__ T* to, const __gm__ T* from, uint32_t size) {
+        auto buf = Ub<T>(0, kTile);
+        for (uint32_t off = 0; off < size; off += kTile) {
+            uint32_t count = size - off < kTile ? size - off : kTile;
+            Load(buf, from + off, count);
+            SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+            Store(to + off, buf, count);
+            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+        }
+    }
 
-                ShiftRight(
-                    dstRankLocal,
-                    dstLocal,
-                    static_cast<int32_t>(slot_shift),
-                    padded_count);
-                CreateVecIndex(
-                    routeIndices,
-                    static_cast<int32_t>(chunk_start),
-                    padded_count);
+    __aicore__ inline void Drain(uint32_t peer, uint32_t qp) {
+        auto info = aclshmemi_udma_qp_info_fetch();
+        auto ctx = aclshmemi_udma_get_qp_ctx(info, peer, qp);
+        uint32_t status = aclshmemi_udma_poll_cq(peer, qp, ctx->cqe_cnt);
+        if (status == 0xffU) {
+            // The SDK's one-million-spin budget is not a transport error.
+            // Retry the same completion target for at most one second on
+            // Ascend950 (GetSystemCycle is 1 GHz); never ignore a CQ error.
+            uint64_t start = GetSystemCycle();
+            do {
+                status = aclshmemi_udma_poll_cq(peer, qp, ctx->cqe_cnt);
+            } while (status == 0xffU && GetSystemCycle() - start < 1000000000ULL);
+        }
+        if (status != 0U) {
+            auto tbl = aclshmemi_udma_active_table(info);
+            auto cq = reinterpret_cast<__gm__ aclshmemi_udma_cq_ctx_t*>(tbl->scq_ptr) + peer * info->qp_num + qp;
+            AscendC::printf("combine PUT queue head=%u tail=%u expected_cq=%u cq_tail=%u wqe_size=%u cqe_size=%u\n",
+                ctx->head, ctx->tail, ctx->cqe_cnt, cq->tail, ctx->wqe_size, cq->cqe_size);
+            // poll_cq only commits cq->tail after reaching its full target.
+            // Probe without consuming to distinguish zero progress from a missing
+            // last checkpoint; cq_tail=0 alone does NOT mean no CQEs arrived.
+            uint32_t observed = cq->tail;
+            while (observed != ctx->cqe_cnt && observed - cq->tail < shm::UDMA_CQ_DEPTH_DEFAULT) {
+                auto entry = reinterpret_cast<__gm__ aclshmemi_jfc_cqe_ctx_t*>(
+                    cq->buf_addr + uint64_t(cq->cqe_size) * (observed & (shm::UDMA_CQ_DEPTH_DEFAULT - 1U)));
+                dcci_cachelines(reinterpret_cast<__gm__ uint8_t*>(entry), sizeof(aclshmemi_jfc_cqe_ctx_t));
+                if ((((observed / shm::UDMA_CQ_DEPTH_DEFAULT) & 1U) ^ entry->owner) == 0U) break;
+                if (entry->status || entry->substatus) break;
+                ++observed;
+            }
+            aclshmemi_kernel_abort("combine PUT CQ failure rank=%u core=%u peer=%u qp=%u status=%u phase=%u simt_batches=%u observed_cq=%u\n",
+                rank, core, peer, qp, status, phase_id, simt_batches_posted, observed);
+        }
+    }
+    template <typename State>
+    __aicore__ inline void SendReady(uint64_t base, uint64_t index, uint32_t peer,
+                                    uint32_t qp, State& state) {
+        aclshmemx_submit_t submit(state);
+        aclshmemx_udma_qp_put_nbi<uint64_t, PIPE_MTE3, kCheckpoint>(
+            Flag(base, index), Flag(p.magic, core), reinterpret_cast<__ubuf__ uint64_t*>(Wqe()),
+            1U, peer, qp, EVENT_ID0, submit);
+    }
+    // Same public plan ABI and SHMEM per-peer QPs; combine_v2 payload scheduling.
+    TPipe pipe;
+    TQue<QuePosition::VECIN, 2> inputQ;
+    TQue<QuePosition::VECOUT, 2> outputQ;
+    TBuf<TPosition::VECCALC> accumBuf, tempBuf, descriptorBuf, inputAddressBuf, readyBuf;
+    // Stable pre-RegBase final path: MTE2 inputs, MTE3 outputs and native
+    // AscendC Cast/Add accumulation in VECCALC.
+    TBuf<TPosition::VECIN> finalInputBuf;
+    TBuf<TPosition::VECOUT> finalOutputBuf;
+    TBuf<TPosition::VECCALC> finalAccumulatorBuf, finalTempBuf, finalRouteBuf;
+    static constexpr uint32_t tile = 3584U;
+
+    __aicore__ bool LocalSource(uint32_t source) const {
+        return server && source / 8U == rank / 8U;
+    }
+    __aicore__ uint32_t LocalLane(uint32_t peer) const { return server ? peer % 8U : 0U; }
+
+    __aicore__ __gm__ uint64_t* Descriptors(uint32_t slot) {
+        // Two eight-byte fields in one packed 16-byte plan record. word0 is
+        // {count:high32,tx index:low32}; count=0 marks an interior slot.
+        // word1 is the original global contributor address (producer*N+loff).
+        // It lets Reduce() read an ingress-local contributor directly from
+        // hidden instead of requiring a self relay_hidden staging copy.
+        return reinterpret_cast<__gm__ uint64_t*>(Meta(p.contributor, slot));
+    }
+
+    __aicore__ void Init() {
+        // Planning initializes ready storage once. Every collective invocation
+        // receives a new nonzero magic from NextCombineMagic(); all payload
+        // waits compare against that value, so old flags cannot satisfy them.
+        // Never clear remote-writable flags here: a faster peer may have already
+        // published this invocation's ready. Workspace calls must remain serial.
+        // Match TileXR's topology-fused hidden entry: no rank/core barrier.
+        // Each core consumes its own PUT-source magic only after this publish;
+        // incoming payload is protected by relay/reduce/final-ready instead.
+        // These slots remain PUT-source tokens for hidden ready notifications.
+        // Weights do not poll them: callers provide ready, immutable inputs.
+        Publish(Flag(p.magic, core), magic);
+    }
+
+    __aicore__ void BindPlan(__gm__ uint8_t* plan) {
+        auto header = reinterpret_cast<__gm__ uint64_t*>(plan);
+        Flush(header);
+        if (header[0] != kCombineExecutionPlanVersion || header[1] != n ||
+            header[2] != h || header[3] != k || header[4] != r ||
+            header[5] != rank || header[6] != uint64_t(server))
+            aclshmemi_kernel_abort("combine execution plan header mismatch rank=%u\n", rank);
+        execution_plan = plan;
+        plan_layout = MakeCombineExecutionPlanLayout(n, r);
+    }
+
+    __aicore__ void SubmitWeightBatch(LocalTensor<int32_t> routes,
+        LocalTensor<float> gathered, uint64_t first, uint32_t size, uint32_t bank) {
+        const TEventID event = bank == 0U ? EVENT_ID0 : EVENT_ID1;
+        SetFlag<HardEvent::S_MTE2>(event);
+        WaitFlag<HardEvent::S_MTE2>(event);
+        // Read dst directly: a full batch reads 64*4=256B instead of a separate 1024B weights table.
+        Load(routes, dst + first, size);
+        SetFlag<HardEvent::MTE2_S>(event);
+        WaitFlag<HardEvent::MTE2_S>(event);
+        for (uint32_t j = 0U; j < size; ++j) {
+            const uint32_t raw = Raw(routes.GetValue(j));
+            const uint32_t peer = raw / n, loff = raw % n;
+            // Each scalar MTE uses a separate 32B-aligned slot so padding cannot overwrite adjacent weights.
+            const uint32_t offset = j * 8U;
+            if (peer == rank) Load(gathered[offset], weights + loff, 1U);
+            else {
+                // Input contract: upstream dispatch/input production has completed; all weights
+                // referenced by dst remain unchanged during GET. Do not wait for peers to enter combine.
+                aclshmemx_mte_get_nbi<float>(
+                    reinterpret_cast<__ubuf__ float*>(gathered[offset].GetPhyAddr()),
+                    weights + loff, 1U, peer, event);
+            }
+        }
+        // One event covers all scalar reads for this bank.
+        SetFlag<HardEvent::MTE2_V>(event);
+    }
+
+    __aicore__ void FinalWeights() {
+        if (!with_weights) return;
+        const uint64_t firstBatch = uint64_t(core) * 64U;
+        if (firstBatch >= n) return;
+        // Run after this core finishes WORK, without delaying its pending hidden transfers.
+        // Finish outstanding MTE/V instructions and release reducer TPipe resources before reusing low UB.
+        PipeBarrier<PIPE_ALL>();
+        pipe.Reset();
+        LocalTensor<int32_t> routes[2] = {
+            Ub<int32_t>(0U, 64U), Ub<int32_t>(4096U, 64U)};
+        // Route-independent layout: construct once per core and reuse for all batches, outside planning.
+        auto gatherOffsets = Ub<uint32_t>(256U, 64U);
+        for (uint32_t j = 0U; j < 64U; ++j) gatherOffsets.SetValue(j, j * 32U);
+        SetFlag<HardEvent::S_V>(EVENT_ID0);
+        WaitFlag<HardEvent::S_V>(EVENT_ID0);
+        LocalTensor<float> gathered[2] = {
+            Ub<float>(1024U, 512U), Ub<float>(5120U, 512U)};
+        LocalTensor<float> packed[2] = {
+            Ub<float>(3072U, 64U), Ub<float>(7168U, 64U)};
+        bool used[2] = {false, false};
+        const uint32_t firstSize = n - firstBatch < 64U ? n - firstBatch : 64U;
+        SubmitWeightBatch(routes[0], gathered[0], firstBatch, firstSize, 0U);
+        uint32_t bank = 0U;
+        for (uint64_t first = firstBatch; first < n; first += uint64_t(kCores) * 64U) {
+            const uint32_t size = n - first < 64U ? n - first : 64U;
+            const TEventID event = bank == 0U ? EVENT_ID0 : EVENT_ID1;
+            WaitFlag<HardEvent::MTE2_V>(event);
+            const uint32_t next = bank ^ 1U;
+            const uint64_t nextFirst = first + uint64_t(kCores) * 64U;
+            if (nextFirst < n) {
+                const TEventID nextEvent = next == 0U ? EVENT_ID0 : EVENT_ID1;
+                if (used[next]) {
+                    WaitFlag<HardEvent::V_MTE2>(nextEvent);
+                    WaitFlag<HardEvent::MTE3_V>(nextEvent);
+                    used[next] = false;
+                }
+                const uint32_t nextSize = n - nextFirst < 64U ? n - nextFirst : 64U;
+                SubmitWeightBatch(routes[next], gathered[next], nextFirst, nextSize, next);
+            }
+            // Compact this batch with vector Gather while the next MTE2 is in flight; avoid per-element Get/SetValue.
+            Gather(packed[bank], gathered[bank], gatherOffsets, 0U, size);
+            SetFlag<HardEvent::V_MTE2>(event); // protects gathered input reuse
+            SetFlag<HardEvent::V_MTE3>(event);
+            WaitFlag<HardEvent::V_MTE3>(event);
+            Store(outw + first, packed[bank], size);
+            SetFlag<HardEvent::MTE3_V>(event); // wait only on reuse / final drain
+            used[bank] = true;
+            // Route-load-to-store-issue latency; adjacent batches can overlap.
+            bank = next;
+        }
+        for (uint32_t b = 0U; b < 2U; ++b) {
+            if (!used[b]) continue;
+            const TEventID event = b == 0U ? EVENT_ID0 : EVENT_ID1;
+            WaitFlag<HardEvent::V_MTE2>(event);
+            WaitFlag<HardEvent::MTE3_V>(event);
+        }
+        PipeBarrier<PIPE_ALL>();
+    }
+
+    __aicore__ void LocalFinal(uint32_t peer) {
+        // Match combine_v2 self-peer behavior: the rows already live in this
+        // rank's hidden workspace, so FinalPair reads them directly.
+        if (peer == rank) {
+            Publish(Flag(p.final_ready, uint64_t(rank) * 2U), magic);
+            return;
+        }
+        auto sc = Meta(p.source_counts, peer);
+        LocalTensor<uint64_t> txPages[2] = {
+            Ub<uint64_t>(120U * 1024U, 64U * 4U),
+            Ub<uint64_t>(122U * 1024U, 64U * 4U),
+        };
+        uint32_t current = 0U;
+        uint32_t count = static_cast<uint32_t>(sc[0]);
+        if (count) SubmitTxRowLoad(txPages[current], sc[2], count < 64U ? count : 64U);
+        for (uint32_t first = 0; first < count; first += 64U) {
+            uint32_t size = count - first < 64U ? count - first : 64U;
+            WaitRelayRequestLoad();
+            uint32_t next = current ^ 1U, nextFirst = first + 64U;
+            if (nextFirst < count) {
+                uint32_t nextSize = count - nextFirst < 64U ? count - nextFirst : 64U;
+                SubmitTxRowLoad(txPages[next], sc[2] + nextFirst, nextSize);
+            }
+            __gm__ bf16_t* inputs[64U];
+            __gm__ bf16_t* targets[64U];
+            for (uint32_t j = 0; j < size; ++j) {
+                uint32_t loff = static_cast<uint32_t>(txPages[current].GetValue(j * 4U));
+                inputs[j] = hidden + uint64_t(loff) * h;
+                targets[j] = Row(p.final_hidden, sc[1] + first + j);
+            }
+            // Use SIMT for local-server peers in 64P and >=128P, sharing Relay's peer/QP0 queue and context.
+            // The destination remains final_hidden; other world sizes retain scalar SHMEM submission.
+            if (server && (r == 64U || r >= 128U)) {
+                SubmitIntraPutBatch(Row(p.final_hidden, 0U), inputs, targets,
+                                    size, peer, 0U);
+            } else {
+                SubmitPutBatch(Row(p.final_hidden, 0U), inputs, targets,
+                               size, peer, 0U);
+            }
+            current = next;
+        }
+        aclshmemx_submit_state_t state{};
+        SendReady(p.final_ready, uint64_t(rank) * 2U, peer, 0U, state);
+    }
+
+    // Phase A: this rank is a producer; each AIV0..7 sends to one fixed local-server peer.
+    // For duplicate contributors of remote sources, read this rank's original hidden and
+    // PUT into the ingress rank's relay_hidden via intra-server UDMA, then perform server reduce.
+    // Same-server sources bypass server reduce. Submit all relay PUT/ready operations before
+    // LocalFinal() returns data to final_hidden; do not interleave it with relay for remote sources.
+    __aicore__ void Relay() {
+        // Server mode uses AIV0..7, one per receiving rank in this server;
+        // rank mode uses only AIV0.
+        if (core >= (server ? 8U : 1U)) return;
+
+        // The fixed local-server receiver (ingress for cross-server data) of this relay core:
+        // for example, rank=36 and core=3 give peer=35.
+        uint32_t peer = server ? rank / 8U * 8U + core : rank;
+        if (peer >= r) return;
+
+        // The self producer's input already resides in this rank's hidden.
+        // The reducer reads hidden directly using original contributor addresses in descriptors,
+        // so no self staging copy from hidden to relay_hidden is needed.
+        if (peer == rank) {
+            for (uint32_t ord = 0; ord < r; ++ord) {
+                uint32_t source = Source(ord);
+
+                // Publish ready even if this producer has no contributors for the source:
+                // the reducer waits on a fixed producer set and cannot distinguish empty from pending.
+                uint64_t readyIndex = uint64_t(LocalLane(rank)) * r + source;
+                Publish(Flag(p.relay_ready, readyIndex), magic);
+
+            }
+            // Self needs no hidden copy; publish all relay-ready flags before this rank's final-ready.
+            if (server) LocalFinal(peer);
+            return;
+        }
+
+        // Non-self receiver: >=128P supplies data in the receiving peer's Reduce/Send order,
+        // not this producer's rotated order; other world sizes retain their original order.
+        // LocalFinal must follow the entire loop: the staged schedule may visit local sources early,
+        // but source==peer must not trigger a return transfer that interrupts subsequent remote relay.
+        for (uint32_t ord = 0; ord < r; ++ord) {
+            uint32_t source = CombinePutRelaySource(rank, peer, ord, r);
+
+            // Index relay_ranges by receiver/target source, independent of physical request ordering.
+            // The ingress builds this compact relay request range for the producer/source during planning:
+            // each entry in [first, first + count) is {producer-local input loff, relay scratch slot}.
+            auto range = Meta(p.relay_ranges, uint64_t(core) * r + source);
+            Flush(range);
+            uint32_t first = range[0], count = range[1];
+
+            // TileXR local-UDMA pattern: each producer/source CSR range is
+            // consumed in 64-row batches.  MTE2 gathers the strided metadata
+            // into one of two UB pages; while MTE3 posts page k, MTE2 prefetches
+            // page k+1.  This replaces 64 scalar Meta()+Flush() operations.
+            LocalTensor<uint64_t> requestPages[2] = {
+                Ub<uint64_t>(120U * 1024U, 64U * 4U),
+                Ub<uint64_t>(122U * 1024U, 64U * 4U),
+            };
+            uint32_t current = 0U;
+            uint32_t size = count < 64U ? count : 64U;
+            if (count) {
+                SubmitRelayRequestLoad(requestPages[current],
+                    uint64_t(core) * n + first, size);
+            }
+            for (uint32_t off = 0; off < count; off += 64U) {
+                size = count - off < 64U ? count - off : 64U;
+
+                // This is the visible metadata dependency for batch k. The
+                // corresponding MTE2 read may already have overlapped WQE post
+                // for batch k-1; the event therefore reports remaining wait
+                // plus UB descriptor decode/address setup.
+                WaitRelayRequestLoad();
+                const uint32_t nextOff = off + 64U;
+                const uint32_t next = current ^ 1U;
+                if (nextOff < count) {
+                    uint32_t nextSize = count - nextOff < 64U ? count - nextOff : 64U;
+                    SubmitRelayRequestLoad(requestPages[next],
+                        uint64_t(core) * n + first + nextOff, nextSize);
+                }
+                __gm__ bf16_t* inputs[64U];
+                __gm__ bf16_t* targets[64U];
+                for (uint32_t j = 0; j < size; ++j) {
+                    uint64_t request = requestPages[current].GetValue(j * 4U);
+                    inputs[j] = hidden + uint64_t(static_cast<uint32_t>(request)) * h;
+                    targets[j] = Row(p.relay_hidden,
+                        static_cast<uint32_t>(request >> 32U));
+                }
+
+                SubmitIntraPutBatch(Row(p.relay_hidden, 0U), inputs, targets,
+                                   size, peer, 0U);
+
+                current = next;
+            }
+
+            // After enqueuing all relay PUTs for this producer/source on the QP,
+            // write magic to the ingress rank's corresponding relay_ready slot.
+            // Reduce starts only after all producers in the server report ready for this source.
+            aclshmemx_submit_state_t state{};
+            uint64_t readyIndex = uint64_t(LocalLane(rank)) * r + source;
+            SendReady(p.relay_ready, readyIndex, peer, 0U, state);
+            // No periodic eight-source Drain; continue submitting subsequent sources.
+            // Payload-before-ready ordering on the same QP makes data safe for the receiver to consume.
+            // Submission still polls when queue credits run low to avoid overwriting in-flight WQEs.
+        }
+
+        // All remote-source relay payload and ready operations are submitted before local returns.
+        // No extra Drain between Relay and LocalFinal; preserve 64P behavior.
+        // No additional all-core barrier; relay cores progress independently.
+        // 64P retains relay -> local final order; local final never interrupts >=128P relay.
+        if (server) LocalFinal(peer);
+
+        // Drain this core's exclusive local peer/QP0 at the end, covering both relay and LocalFinal.
+        // Each relay core drains independently; no core reclaims another core's queue.
+        Drain(peer, 0U);
+    }
+
+    __aicore__ void InitVector(bool final) {
+        pipe.Reset();
+        if (final) {
+            pipe.InitBuffer(finalInputBuf,
+                            2U * kAlignedFinalRouteBatch * kAlignedFinalTile * sizeof(bf16_t));
+            pipe.InitBuffer(finalOutputBuf, 2U * kAlignedFinalTile * sizeof(bf16_t));
+            pipe.InitBuffer(finalAccumulatorBuf, kAlignedFinalTile * sizeof(float));
+            pipe.InitBuffer(finalTempBuf, kAlignedFinalTile * sizeof(float));
+            // Two 128-byte final-route descriptors.  MTE2 fills the next bank
+            // while Vector consumes the current token's hidden rows.
+            pipe.InitBuffer(finalRouteBuf, 2U * 128U);
+            return;
+        }
+        pipe.InitBuffer(inputQ, 2, 4U * tile * 2U);
+        pipe.InitBuffer(outputQ, 2, 2U * tile * 2U);
+        pipe.InitBuffer(accumBuf, 2U * tile * 4U);
+        pipe.InitBuffer(tempBuf, 2U * tile * 4U);
+        pipe.InitBuffer(descriptorBuf, 64U * 32U);
+        pipe.InitBuffer(inputAddressBuf, 64U * 32U);
+        pipe.InitBuffer(readyBuf, 32U);
+        auto token = readyBuf.Get<uint64_t>();
+        for (uint32_t i = 0; i < 4U; ++i) token.SetValue(i, i == 0U ? magic : 0U);
+        SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+    }
+
+    __aicore__ void PublishMte(uint32_t source, uint32_t batch) {
+        // FIFO on MTE3 orders result stores before this stable 32-byte token.
+        // No per-batch DDR DSB or MTE3->scalar wait is inserted.
+        Store(Flag(p.reduce_ready, uint64_t(source) * p.batches + batch), readyBuf.Get<uint64_t>(), 4U);
+    }
+
+    __aicore__ void LoadDescriptors(LocalTensor<uint64_t> ub, uint32_t first, uint32_t size) {
+        GlobalTensor<uint64_t> gm;
+        gm.SetGlobalBuffer(Descriptors(first), uint64_t(size) * 2U);
+        DataCopyExtParams cp{static_cast<uint16_t>(size), 8U, kCombinePlanContributorBytes - 8U, 0U, 0U};
+        DataCopyPadExtParams<uint64_t> pad{false, 0U, 0U, 0U};
+        DataCopyPad(ub, gm, cp, pad); // each 8-byte block is UB padded to 32 bytes
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    }
+
+    __aicore__ void LoadInputAddresses(LocalTensor<uint64_t> ub, uint32_t first, uint32_t size) {
+        GlobalTensor<uint64_t> gm;
+        gm.SetGlobalBuffer(Descriptors(first) + 1U, uint64_t(size) * 2U - 1U);
+        DataCopyExtParams cp{static_cast<uint16_t>(size), 8U, kCombinePlanContributorBytes - 8U, 0U, 0U};
+        DataCopyPadExtParams<uint64_t> pad{false, 0U, 0U, 0U};
+        DataCopyPad(ub, gm, cp, pad);
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    }
+
+    // Packed relay requests: 8 GM bytes {input_loff,scratch} per row. Keep the
+    // existing 32-byte UB lanes consumed by SIMT; no payload/WQE order changes.
+    // Planner has completed exact-byte MTE3 stores before publishing the plan.
+    __aicore__ void SubmitRelayRequestLoad(LocalTensor<uint64_t> ub,
+                                           uint64_t requestFirst, uint32_t size) {
+        GlobalTensor<uint64_t> gm;
+        gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(
+                               Meta(p.relay_send, requestFirst)),
+                           uint64_t(size));
+        DataCopyExtParams cp{static_cast<uint16_t>(size), 8U, 0U, 0U, 0U};
+        DataCopyPadExtParams<uint64_t> pad{false, 0U, 0U, 0U};
+        DataCopyPad(ub, gm, cp, pad);
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    }
+
+    __aicore__ void WaitRelayRequestLoad() {
+        WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    }
+
+    // Packed 16-byte TX rows; LocalFinal still gathers the first 8 bytes into
+    // the unchanged 32-byte UB lanes used by the existing double buffer.
+    __aicore__ void SubmitTxRowLoad(LocalTensor<uint64_t> ub,
+                                    uint32_t first, uint32_t size) {
+        GlobalTensor<uint64_t> gm;
+        gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(Meta(p.tx_rows, first)),
+                           uint64_t(size) * 2U);
+        DataCopyExtParams cp{static_cast<uint16_t>(size), 8U, kCombinePlanTxBytes - 8U, 0U, 0U};
+        DataCopyPadExtParams<uint64_t> pad{false, 0U, 0U, 0U};
+        DataCopyPad(ub, gm, cp, pad);
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    }
+
+    // >=128P DIRECT: read each full 16B GM tx_rows record to obtain
+    // both the input loff in tx[0] and the contributor count in tx[3].
+    // Each record is padded to 32B in UB, so fields use a j*8 uint32_t offset.
+    // Planning has completed exact-length MTE3 writes and published the plan; tx_rows is immutable during payload.
+    __aicore__ void SubmitDirectTxRowLoad128(LocalTensor<uint32_t> ub,
+                                            uint32_t first, uint32_t size) {
+        // Finish previous scalar reads before reusing the page; use a dedicated EVENT_ID1,
+        // separate from scalar PUT's EVENT_ID0 and result-descriptor load events.
+        SetFlag<HardEvent::S_MTE2>(EVENT_ID1);
+        WaitFlag<HardEvent::S_MTE2>(EVENT_ID1);
+        GlobalTensor<uint32_t> gm;
+        gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(Meta(p.tx_rows, first)),
+                           uint64_t(size) * 4U);
+        DataCopyExtParams cp{static_cast<uint16_t>(size), 16U, 0U, 0U, 0U};
+        DataCopyPadExtParams<uint32_t> pad{false, 0U, 0U, 0U};
+        DataCopyPad(ub, gm, cp, pad);
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID1);
+    }
+
+    __aicore__ uint32_t InputAddress(uint32_t slot, uint32_t scratchBase,
+                                     uint32_t loadedAddresses,
+                                     const uint32_t* inputAddresses) {
+        uint32_t index = slot - scratchBase;
+        if (index < loadedAddresses) return inputAddresses[index];
+        // A contributor group may straddle the 64-slot reduce batch boundary.
+        // Its tail was not gathered into UB, so read its immutable plan record.
+        auto descriptor = Descriptors(slot);
+        Flush(descriptor);
+        return static_cast<uint32_t>(descriptor[1]);
+    }
+
+    __aicore__ bool DirectInput(uint32_t slot, uint32_t scratchBase,
+                                uint32_t loadedAddresses,
+                                const uint32_t* inputAddresses) {
+        return Producer(InputAddress(slot, scratchBase, loadedAddresses, inputAddresses)) == rank;
+    }
+
+    __aicore__ void LoadInputRow(LocalTensor<bf16_t> ub, uint32_t dstOffset,
+                                 uint32_t slot, uint32_t scratchBase,
+                                 uint32_t loadedAddresses,
+                                 const uint32_t* inputAddresses,
+                                 uint32_t off, uint32_t size) {
+        GlobalTensor<bf16_t> gm;
+        uint32_t address = InputAddress(slot, scratchBase, loadedAddresses, inputAddresses);
+        if (Producer(address) == rank)
+            gm.SetGlobalBuffer(hidden + uint64_t(Loff(address)) * h + off, size);
+        else
+            gm.SetGlobalBuffer(Row(p.relay_hidden, slot) + off, size);
+        DataCopyExtParams cp{static_cast<uint16_t>(1U), size * 2U, 0U, 0U, 0U};
+        DataCopyPadExtParams<bf16_t> pad{false, 0U, 0U, 0U};
+        DataCopyPad(ub[dstOffset], gm, cp, pad);
+    }
+
+    __aicore__ void LoadGroup(LocalTensor<bf16_t> ub, uint32_t slot, uint32_t count,
+                             uint32_t scratchBase, uint32_t loadedAddresses,
+                             const uint32_t* inputAddresses,
+                             uint32_t off, uint32_t size) {
+        bool direct = false;
+        for (uint32_t c = 0; c < count; ++c)
+            direct |= DirectInput(slot + c, scratchBase, loadedAddresses, inputAddresses);
+        if (direct) {
+            uint32_t stride = (size + 15U) & ~15U;
+            for (uint32_t c = 0; c < count; ++c)
+                LoadInputRow(ub, c * stride, slot + c, scratchBase, loadedAddresses, inputAddresses, off, size);
+            return;
+        }
+        GlobalTensor<bf16_t> gm;
+        gm.SetGlobalBuffer(Row(p.relay_hidden, slot) + off, uint64_t(count - 1U) * h + size);
+        DataCopyExtParams cp{static_cast<uint16_t>(count), size * 2U, (h - size) * 2U, 0U, 0U};
+        DataCopyPadExtParams<bf16_t> pad{false, 0U, 0U, 0U};
+        DataCopyPad(ub, gm, cp, pad);
+    }
+
+    __aicore__ void LoadPair(LocalTensor<bf16_t> ub, uint32_t a, uint32_t b,
+                            uint32_t scratchBase, uint32_t loadedAddresses,
+                            const uint32_t* inputAddresses,
+                            uint32_t off, uint32_t size, uint32_t count) {
+        bool direct = false;
+        for (uint32_t c = 0; c < 2U; ++c)
+            for (uint32_t group = 0; group < count; ++group)
+                direct |= DirectInput((group ? b : a) + c, scratchBase, loadedAddresses, inputAddresses);
+        if (direct) {
+            for (uint32_t c = 0; c < 2U; ++c)
+                for (uint32_t group = 0; group < count; ++group)
+                    LoadInputRow(ub, c * 2U * size + group * size, (group ? b : a) + c,
+                                 scratchBase, loadedAddresses, inputAddresses, off, size);
+            return;
+        }
+        // Contributor-major: [A0,B0,A1,B1], just like combine_v2.
+        for (uint32_t c = 0; c < 2U; ++c) {
+            GlobalTensor<bf16_t> gm;
+            gm.SetGlobalBuffer(Row(p.relay_hidden, a + c) + off,
+                              uint64_t(count == 2U ? b - a : 0U) * h + size);
+            DataCopyExtParams cp{static_cast<uint16_t>(count), size * 2U,
+                count == 2U ? static_cast<uint32_t>((uint64_t(b - a) * h - size) * 2U) : 0U, 0U, 0U};
+            DataCopyPadExtParams<bf16_t> pad{false, 0U, 0U, 0U};
+            DataCopyPad(ub[c * 2U * size], gm, cp, pad);
+        }
+    }
+
+    __aicore__ void ReducePairs(const uint32_t* slots, uint32_t count, uint32_t scratchBase,
+                                uint32_t loadedAddresses, const uint32_t* inputAddresses,
+                                uint32_t off, uint32_t size) {
+        if (!count) return;
+        auto acc = accumBuf.Get<float>(), tmp = tempBuf.Get<float>();
+        auto page = inputQ.template AllocTensor<bf16_t>();
+        uint32_t rows = count < 2U ? count : 2U;
+        LoadPair(page, slots[0], rows == 2U ? slots[1] : slots[0], scratchBase, loadedAddresses, inputAddresses, off, size, rows);
+        inputQ.EnQue(page);
+        for (uint32_t i = 0; i < count; i += 2U) {
+            rows = count - i < 2U ? count - i : 2U;
+            page = inputQ.template DeQue<bf16_t>();
+            if (i + 2U < count) {
+                auto next = inputQ.template AllocTensor<bf16_t>();
+                uint32_t more = count - i - 2U < 2U ? count - i - 2U : 2U;
+                LoadPair(next, slots[i + 2U], more == 2U ? slots[i + 3U] : slots[i + 2U], scratchBase, loadedAddresses, inputAddresses, off, size, more);
+                inputQ.EnQue(next);
+            }
+            Cast(acc, page, RoundMode::CAST_NONE, rows * size);
+            PipeBarrier<PIPE_V>();
+            Cast(tmp, page[2U * size], RoundMode::CAST_NONE, rows * size);
+            PipeBarrier<PIPE_V>();
+            Add(acc, acc, tmp, rows * size);
+            PipeBarrier<PIPE_V>();
+            inputQ.FreeTensor(page);
+            auto output = outputQ.template AllocTensor<bf16_t>();
+            Cast(output, acc, RoundMode::CAST_RINT, rows * size);
+            outputQ.EnQue(output);
+            output = outputQ.template DeQue<bf16_t>();
+            for (uint32_t j = 0; j < rows; ++j)
+                Store(Row(p.relay_hidden, slots[i + j]) + off, output[j * size], size);
+            outputQ.FreeTensor(output);
+        }
+    }
+
+    __aicore__ void ReduceGroups(const uint32_t* slots, const uint32_t* lengths,
+                                uint32_t count, uint32_t scratchBase, uint32_t loadedAddresses,
+                                const uint32_t* inputAddresses,
+                                uint32_t off, uint32_t size) {
+        if (!count) return;
+        uint32_t stride = (size + 15U) & ~15U;
+        auto acc = accumBuf.Get<float>(), tmp = tempBuf.Get<float>();
+        auto page = inputQ.template AllocTensor<bf16_t>();
+        LoadGroup(page, slots[0], lengths[0], scratchBase, loadedAddresses, inputAddresses, off, size);
+        inputQ.EnQue(page);
+        for (uint32_t i = 0; i < count; ++i) {
+            page = inputQ.template DeQue<bf16_t>();
+            if (i + 1U < count) {
+                auto next = inputQ.template AllocTensor<bf16_t>();
+                LoadGroup(next, slots[i + 1U], lengths[i + 1U], scratchBase, loadedAddresses, inputAddresses, off, size);
+                inputQ.EnQue(next);
+            }
+            Cast(acc, page, RoundMode::CAST_NONE, size);
+            PipeBarrier<PIPE_V>();
+            for (uint32_t c = 1; c < lengths[i]; ++c) {
+                Cast(tmp, page[c * stride], RoundMode::CAST_NONE, size);
                 PipeBarrier<PIPE_V>();
-                SetFlag<HardEvent::S_V>(EVENT_ID1);
-                WaitFlag<HardEvent::S_V>(EVENT_ID1);
-                Compares(
-                    compareMask,
-                    dstRankLocal,
-                    static_cast<int32_t>(dest_rank),
-                    CMPMODE::EQ,
-                    padded_count);
+                Add(acc, acc, tmp, size);
                 PipeBarrier<PIPE_V>();
-                uint64_t selected_route_count = 0;
-                GatherMask(
-                    selectedRouteIndices,
-                    routeIndices,
-                    compareMask.ReinterpretCast<uint32_t>(),
-                    true,
-                    chunk_count,
-                    {1U, 1U, 0U, 0U},
-                    selected_route_count);
-                SetFlag<HardEvent::V_S>(EVENT_ID1);
-                WaitFlag<HardEvent::V_S>(EVENT_ID1);
-                hidden_rows += selected_route_count;
-                aclshmemx_submit_state_t submit_state{};
-                aclshmemx_defer_t defer_action(submit_state);
-                aclshmemx_submit_t submit_action(submit_state);
-                for (uint64_t batch_start = 0;
-                     batch_start < selected_route_count;
-                     batch_start += kCombineUdmaWqeBatchSize) {
-                    uint64_t batch_end = selected_route_count;
-                    if (batch_end - batch_start > kCombineUdmaWqeBatchSize) {
-                        batch_end = batch_start + kCombineUdmaWqeBatchSize;
-                    }
-                    // Defer the first N-1 requests without CQEs, then submit
-                    // the final request as the batch's only CQE checkpoint.
-                    for (uint64_t selected = batch_start;
-                         selected + 1U < batch_end;
-                         ++selected) {
-                        const uint32_t route_idx = static_cast<uint32_t>(
-                            selectedRouteIndices.GetValue(selected));
-                        const int32_t dst_val =
-                            dstLocal.GetValue(route_idx - chunk_start);
-                        const uint32_t loff =
-                            static_cast<uint32_t>(dst_val) & (NvS - 1U);
-                        __gm__ HiddenT* remote_hidden =
-                            published_hidden + static_cast<uint64_t>(loff) * H;
-                        CombineUdmaGet(
-                            gathered_hidden +
-                                static_cast<uint64_t>(route_idx) * H,
-                            remote_hidden,
-                            wqe_staging,
-                            H,
-                            dest_rank,
-                            qp_idx,
-                            defer_action);
-                    }
+            }
+            inputQ.FreeTensor(page);
+            auto output = outputQ.template AllocTensor<bf16_t>();
+            Cast(output, acc, RoundMode::CAST_RINT, size);
+            outputQ.EnQue(output);
+            output = outputQ.template DeQue<bf16_t>();
+            Store(Row(p.relay_hidden, slots[i]) + off, output, size);
+            outputQ.FreeTensor(output);
+        }
+    }
 
-                    const uint64_t selected = batch_end - 1U;
-                    const uint32_t route_idx = static_cast<uint32_t>(
-                        selectedRouteIndices.GetValue(selected));
-                    const int32_t dst_val =
-                        dstLocal.GetValue(route_idx - chunk_start);
-                    const uint32_t loff =
-                        static_cast<uint32_t>(dst_val) & (NvS - 1U);
-                    __gm__ HiddenT* remote_hidden =
-                        published_hidden + static_cast<uint64_t>(loff) * H;
-                    CombineUdmaGet(
-                        gathered_hidden +
-                            static_cast<uint64_t>(route_idx) * H,
-                        remote_hidden,
-                        wqe_staging,
-                        H,
-                        dest_rank,
-                        qp_idx,
-                        submit_action);
+    __aicore__ void ReduceLarge(uint32_t slot, uint32_t count, uint32_t scratchBase,
+                                uint32_t loadedAddresses, const uint32_t* inputAddresses,
+                                uint32_t off, uint32_t size) {
+        // >4 contributors: bounded four-route input pages, prefetch within group.
+        auto acc = accumBuf.Get<float>(), tmp = tempBuf.Get<float>();
+        uint32_t stride = (size + 15U) & ~15U;
+        auto page = inputQ.template AllocTensor<bf16_t>();
+        LoadGroup(page, slot, count < 4U ? count : 4U, scratchBase, loadedAddresses, inputAddresses, off, size);
+        inputQ.EnQue(page);
+        for (uint32_t first = 0; first < count; first += 4U) {
+            page = inputQ.template DeQue<bf16_t>();
+            if (first + 4U < count) {
+                auto next = inputQ.template AllocTensor<bf16_t>();
+                uint32_t more = count - first - 4U;
+                LoadGroup(next, slot + first + 4U, more < 4U ? more : 4U, scratchBase, loadedAddresses, inputAddresses, off, size);
+                inputQ.EnQue(next);
+            }
+            uint32_t rows = count - first < 4U ? count - first : 4U;
+            for (uint32_t j = 0; j < rows; ++j) {
+                if (first == 0U && j == 0U) Cast(acc, page, RoundMode::CAST_NONE, size);
+                else {
+                    Cast(tmp, page[j * stride], RoundMode::CAST_NONE, size);
+                    PipeBarrier<PIPE_V>();
+                    Add(acc, acc, tmp, size);
+                }
+                PipeBarrier<PIPE_V>();
+            }
+            inputQ.FreeTensor(page);
+        }
+        auto output = outputQ.template AllocTensor<bf16_t>();
+        Cast(output, acc, RoundMode::CAST_RINT, size);
+        outputQ.EnQue(output);
+        output = outputQ.template DeQue<bf16_t>();
+        Store(Row(p.relay_hidden, slot) + off, output, size);
+        outputQ.FreeTensor(output);
+    }
+
+    __aicore__ void Reduce() {
+        InitVector(false);
+        uint32_t group = (core - kCombinePutReducerBegin) /
+                         kCombinePutReducerShards;
+        uint32_t shard = (core - kCombinePutReducerBegin) %
+                         kCombinePutReducerShards;
+        uint32_t batchOwnerRotation = 0U;
+        for (uint32_t round = 0; ; ++round) {
+            uint32_t ord = CombinePutReducerOrdinal(r, group, round);
+            if (ord >= r) break;
+            uint32_t source = Source(ord);
+            auto sc = Meta(p.source_counts, source);
+            if (LocalSource(source) || sc[5] == 0) continue;
+            if (shard + 1U == kCombinePutReducerShards) {
+                uint32_t producers = server ? (r < 8U ? r : 8U) : 1U;
+                for (uint32_t local = 0; local < producers; ++local)
+                    Wait(Flag(p.relay_ready, uint64_t(local) * r + source), magic);
+                Publish(Flag(p.source_input_ready, source), magic);
+            } else Wait(Flag(p.source_input_ready, source), magic);
+            uint32_t batchCount =
+                (sc[5] + kCombinePutBatchRows - 1U) / kCombinePutBatchRows;
+            uint32_t firstBatch =
+                CombinePutReducerFirstBatch(shard, batchOwnerRotation);
+            for (uint32_t first = firstBatch * kCombinePutBatchRows;
+                 first < static_cast<uint32_t>(sc[5]);
+                 first += kCombinePutReducerShards * kCombinePutBatchRows) {
+                uint32_t size = sc[5] - first < kCombinePutBatchRows
+                                    ? sc[5] - first
+                                    : kCombinePutBatchRows;
+                uint32_t slots[64], lengths[64], pairs[64], generic[64], sizes[64];
+                uint32_t valid = 0, pairCount = 0;
+                auto desc = descriptorBuf.Get<uint64_t>();
+                auto inputAddressDesc = inputAddressBuf.Get<uint64_t>();
+                uint32_t inputAddresses[64];
+                LoadDescriptors(desc, sc[4] + first, size);
+                LoadInputAddresses(inputAddressDesc, sc[4] + first, size);
+                for (uint32_t i = 0; i < size; ++i) {
+                    inputAddresses[i] = static_cast<uint32_t>(inputAddressDesc.GetValue(i * 4U));
+                    uint64_t value = desc.GetValue(i * 4U);
+                    uint32_t count = value >> 32U;
+                    if (!count) continue;
+                    slots[valid] = sc[4] + first + i; lengths[valid++] = count;
+                    if (count == 2U) pairs[pairCount++] = sc[4] + first + i;
+                }
+                for (uint32_t off = 0; off < h; off += tile) {
+                    uint32_t elems = h - off < tile ? h - off : tile;
+                    bool paired = elems % 16U == 0U;
+                    if (paired) ReducePairs(pairs, pairCount, sc[4] + first, size, inputAddresses, off, elems);
+                    uint32_t genericCount = 0;
+                    for (uint32_t i = 0; i < valid; ++i) {
+                        if (lengths[i] <= 4U && !(paired && lengths[i] == 2U)) {
+                            generic[genericCount] = slots[i]; sizes[genericCount++] = lengths[i];
+                        }
+                    }
+                    ReduceGroups(generic, sizes, genericCount, sc[4] + first, size, inputAddresses, off, elems);
+                    for (uint32_t i = 0; i < valid; ++i)
+                        if (lengths[i] > 4U) ReduceLarge(slots[i], lengths[i], sc[4] + first, size, inputAddresses, off, elems);
+                }
+                PublishMte(source, first / kCombinePutBatchRows);
+            }
+            batchOwnerRotation =
+                (batchOwnerRotation + batchCount) % kCombinePutReducerShards;
+        }
+        PipeBarrier<PIPE_ALL>(); // retire queued result/ready stores before role transition
+    }
+
+    // Shared >=128P first-reduce: AIV8..23 form eight groups with two
+    // shards each.  Shard 0/1 owns even/odd 64-row batches respectively.
+    __aicore__ void Reduce128() {
+        InitVector(false);
+        const uint32_t group = (core - kCombinePut128ReducerBegin) /
+                               kCombinePut128ReducerShards;
+        const uint32_t shard = (core - kCombinePut128ReducerBegin) %
+                               kCombinePut128ReducerShards;
+        for (uint32_t round = 0U; ; ++round) {
+            const uint32_t ord = CombinePutReducerOrdinal(r, group, round);
+            if (ord >= r) break;
+            const uint32_t source = Source(ord);
+            auto sc = Meta(p.source_counts, source);
+            if (LocalSource(source) || sc[5] == 0) continue;
+            if (shard + 1U == kCombinePut128ReducerShards) {
+                const uint32_t producers = server ? 8U : 1U;
+                for (uint32_t local = 0U; local < producers; ++local)
+                    Wait(Flag(p.relay_ready, uint64_t(local) * r + source), magic);
+                Publish(Flag(p.source_input_ready, source), magic);
+            } else {
+                Wait(Flag(p.source_input_ready, source), magic);
+            }
+
+            for (uint32_t first = shard * kCombinePutBatchRows;
+                 first < static_cast<uint32_t>(sc[5]);
+                 first += kCombinePut128ReducerShards * kCombinePutBatchRows) {
+                const uint32_t size = sc[5] - first < kCombinePutBatchRows
+                    ? sc[5] - first : kCombinePutBatchRows;
+                uint32_t slots[64], lengths[64], pairs[64], generic[64], sizes[64];
+                uint32_t valid = 0U, pairCount = 0U;
+                auto desc = descriptorBuf.Get<uint64_t>();
+                auto inputAddressDesc = inputAddressBuf.Get<uint64_t>();
+                uint32_t inputAddresses[64];
+                LoadDescriptors(desc, sc[4] + first, size);
+                LoadInputAddresses(inputAddressDesc, sc[4] + first, size);
+                for (uint32_t i = 0U; i < size; ++i) {
+                    inputAddresses[i] = static_cast<uint32_t>(
+                        inputAddressDesc.GetValue(i * 4U));
+                    const uint64_t value = desc.GetValue(i * 4U);
+                    const uint32_t count = value >> 32U;
+                    if (!count) continue;
+                    slots[valid] = sc[4] + first + i;
+                    lengths[valid++] = count;
+                    if (count == 2U) pairs[pairCount++] = sc[4] + first + i;
+                }
+                for (uint32_t off = 0U; off < h; off += tile) {
+                    const uint32_t elems = h - off < tile ? h - off : tile;
+                    const bool paired = elems % 16U == 0U;
+                    if (paired)
+                        ReducePairs(pairs, pairCount, sc[4] + first, size,
+                                    inputAddresses, off, elems);
+                    uint32_t genericCount = 0U;
+                    for (uint32_t i = 0U; i < valid; ++i) {
+                        if (lengths[i] <= 4U && !(paired && lengths[i] == 2U)) {
+                            generic[genericCount] = slots[i];
+                            sizes[genericCount++] = lengths[i];
+                        }
+                    }
+                    ReduceGroups(generic, sizes, genericCount, sc[4] + first,
+                                 size, inputAddresses, off, elems);
+                    for (uint32_t i = 0U; i < valid; ++i)
+                        if (lengths[i] > 4U)
+                            ReduceLarge(slots[i], lengths[i], sc[4] + first,
+                                        size, inputAddresses, off, elems);
+                }
+                PublishMte(source, first / kCombinePutBatchRows);
+            }
+        }
+        PipeBarrier<PIPE_ALL>();
+    }
+
+    // source: destination source rank of this chunk; PUT writes into that rank's final_hidden.
+    // lane: sending lane and SHMEM QP ID (0=QP0, 1=QP1).
+    // ordinal: chunk index within this source; chunks with ordinal%4==0 belong to QP1,
+    //          all others to QP0. Non-owner lanes return immediately so each chunk is sent exactly once.
+    // inputs: up to 64 local input-row indices into hidden if direct=true, otherwise into relay_hidden.
+    // targets: corresponding destination-row indices in the source rank's final_hidden.
+    // count: valid rows in this chunk, 1..64; the last chunk may contain fewer than 64 rows.
+    // direct: true for unreduced DIRECT rows, false for group-head rows after server reduce.
+    // qp0_only: the last 64P group has only eight remote sources; send all its payload through QP0.
+    __aicore__ void PostChunk(uint32_t source, uint32_t lane, uint32_t ordinal,
+                             const uint32_t* inputs, const uint32_t* targets,
+                             uint32_t count, bool direct, bool qp0_only) {
+        if (!count || (qp0_only ? lane != 0U
+                                : ((ordinal & 3U) == 0U ? 1U : 0U) != lane)) {
+            return;
+        }
+        __gm__ bf16_t* batch_inputs[64U];
+        __gm__ bf16_t* batch_targets[64U];
+        for (uint32_t j = 0; j < count; ++j) {
+            batch_inputs[j] = direct ? hidden + uint64_t(inputs[j]) * h
+                                     : Row(p.relay_hidden, inputs[j]);
+            batch_targets[j] = Row(p.final_hidden, targets[j]);
+        }
+        if (source == rank) {
+            for (uint32_t j = 0; j < count; ++j)
+                Copy(batch_targets[j], batch_inputs[j], h);
+        } else {
+            SubmitPutBatch(Row(p.final_hidden, 0U), batch_inputs, batch_targets,
+                               count, source, lane);
+        }
+    }
+
+    /** Source: target source rank for PUT; lane: QP ID; pass: DIRECT rows (0) or reduced rows (1). */
+    __aicore__ void SendSource(uint32_t source, uint32_t lane, uint32_t pass) {
+        if (LocalSource(source)) {
+            return; // Phase-A core already returns ALL local routes.
+        }
+
+        auto sc = Meta(p.source_counts, source);
+        // In the 64P tail wave there are only eight remote peers.  QP0 owns
+        // all chunks.  QP1 owns no payload, ready WQE or CQE for this source;
+        // return before pass=1 can wait on reducer batches that it will never
+        // submit.  Final() already skips this absent QP1 ready flag.
+        const bool qp0_only = CombinePutSenderTailQp0Only(rank, source, r);
+        if (qp0_only && lane == 1U) {
+            return;
+        }
+        uint32_t inputs[64], targets[64], selected = 0, chunk = 0;
+        if (pass == 0U) {
+            // Restore the original direct path: scan tx_rows in source order.
+            for (uint32_t i = 0; i < static_cast<uint32_t>(sc[0]); ++i) {
+                auto tx = Meta(p.tx_rows, sc[2] + i);
+                Flush(tx);
+                if (tx[3] != 1U) continue;
+                inputs[selected] = tx[0];
+                targets[selected++] = sc[1] + i;
+                if (selected == 64U) {
+                    PostChunk(source, lane, chunk++, inputs, targets,
+                              selected, true, qp0_only);
+                    selected = 0;
                 }
             }
         } else {
-            // Keep every aggregate batch on one QP. A submit state must never
-            // span a chunk boundary where the 3:1 QP selection may change.
-            for (uint32_t chunk_start = 0;
-                 chunk_start < NvS;
-                 chunk_start += kCombineSlotChunkCount) {
-                uint32_t chunk_end = chunk_start + kCombineSlotChunkCount;
-                if (chunk_end > NvS) {
-                    chunk_end = NvS;
-                }
-                const uint32_t chunk_index =
-                    chunk_start / kCombineSlotChunkCount;
-                const uint32_t qp_idx =
-                    CombineGetChunkQpIndex(chunk_index);
-                aclshmemx_submit_state_t submit_state{};
-                aclshmemx_defer_t defer_action(submit_state);
-                aclshmemx_submit_t submit_action(submit_state);
-                bool has_held_final = false;
-                bool has_held_unsignaled = false;
-                uint32_t held_final_route_idx = 0;
-                uint32_t held_final_loff = 0;
-                uint32_t held_unsignaled_route_idx = 0;
-                uint32_t held_unsignaled_loff = 0;
-                uint32_t deferred_in_batch = 0;
-                for (uint32_t route_idx = chunk_start;
-                     route_idx < chunk_end;
-                     ++route_idx) {
-                    const int32_t dst_val = dst[route_idx];
-                    if (dst_val < 0 ||
-                        CombineDecodeRank(dst_val, NvS) != dest_rank) {
+            // The sender scans the SAME 64 scratch slots as the reducer. Only
+            // group heads become payload rows; contributor holes are not work.
+            auto desc = Ub<uint64_t>(144U * 1024U, 64U * 4U);
+            // sc[0]: total result rows to return.
+            // sc[5]: staged contributor rows used to produce the duplicate-group results.
+            for (uint32_t first = 0; first < static_cast<uint32_t>(sc[5]); first += 64U) {
+                uint32_t size = sc[5] - first < 64U ? sc[5] - first : 64U;
+                Wait(Flag(p.reduce_ready, uint64_t(source) * p.batches + first / 64U), magic);
+                LoadDescriptors(desc, sc[4] + first, size);
+                for (uint32_t j = 0; j < size; ++j) {
+                    uint64_t value = desc.GetValue(j * 4U);
+                    if (!(value >> 32U)) {
                         continue;
                     }
-                    ++hidden_rows;
-                    const uint32_t loff = CombineDecodeLoff(dst_val, NvS);
-                    if (!has_held_final) {
-                        held_final_route_idx = route_idx;
-                        held_final_loff = loff;
-                        has_held_final = true;
-                        continue;
+                    uint32_t txIndex = static_cast<uint32_t>(value);
+                    inputs[selected] = sc[4] + first + j;
+                    targets[selected++] = sc[1] + txIndex - sc[2];
+                    if (selected == 64U) {
+                        // chunk 0,4,8,... -> lane=1 -> QP1
+                        // chunk 1,2,3,5,6,7,... -> lane=0 -> QP0
+                        PostChunk(source, lane, chunk++, inputs, targets, selected, false,
+                                  qp0_only);
+                        selected = 0;
                     }
-
-                    if (has_held_unsignaled) {
-                        __gm__ HiddenT* held_remote_hidden = published_hidden +
-                            static_cast<uint64_t>(held_unsignaled_loff) * H;
-                        CombineUdmaGet(
-                            gathered_hidden + static_cast<uint64_t>(
-                                held_unsignaled_route_idx) * H,
-                            held_remote_hidden,
-                            wqe_staging,
-                            H,
-                            dest_rank,
-                            qp_idx,
-                            defer_action);
-                        ++deferred_in_batch;
-                    }
-                    held_unsignaled_route_idx = held_final_route_idx;
-                    held_unsignaled_loff = held_final_loff;
-                    has_held_unsignaled = true;
-                    held_final_route_idx = route_idx;
-                    held_final_loff = loff;
-
-                    if (deferred_in_batch + 2U ==
-                        kCombineUdmaWqeBatchSize) {
-                        __gm__ HiddenT* held_remote_hidden = published_hidden +
-                            static_cast<uint64_t>(held_unsignaled_loff) * H;
-                        CombineUdmaGet(
-                            gathered_hidden + static_cast<uint64_t>(
-                                held_unsignaled_route_idx) * H,
-                            held_remote_hidden,
-                            wqe_staging,
-                            H,
-                            dest_rank,
-                            qp_idx,
-                            defer_action);
-                        __gm__ HiddenT* final_remote_hidden = published_hidden +
-                            static_cast<uint64_t>(held_final_loff) * H;
-                        CombineUdmaGet(
-                            gathered_hidden + static_cast<uint64_t>(
-                                held_final_route_idx) * H,
-                            final_remote_hidden,
-                            wqe_staging,
-                            H,
-                            dest_rank,
-                            qp_idx,
-                            submit_action);
-                        deferred_in_batch = 0;
-                        has_held_final = false;
-                        has_held_unsignaled = false;
-                    }
-                }
-                if (has_held_unsignaled) {
-                    __gm__ HiddenT* held_remote_hidden = published_hidden +
-                        static_cast<uint64_t>(held_unsignaled_loff) * H;
-                    CombineUdmaGet(
-                        gathered_hidden + static_cast<uint64_t>(
-                            held_unsignaled_route_idx) * H,
-                        held_remote_hidden,
-                        wqe_staging,
-                        H,
-                        dest_rank,
-                        qp_idx,
-                        defer_action);
-                }
-                if (has_held_final) {
-                    __gm__ HiddenT* held_remote_hidden = published_hidden +
-                        static_cast<uint64_t>(held_final_loff) * H;
-                    CombineUdmaGet(
-                        gathered_hidden + static_cast<uint64_t>(
-                            held_final_route_idx) * H,
-                        held_remote_hidden,
-                        wqe_staging,
-                        H,
-                        dest_rank,
-                        qp_idx,
-                        submit_action);
                 }
             }
         }
+
+        if (selected) {
+            PostChunk(source, lane, chunk, inputs, targets, selected, pass == 0U,
+                      qp0_only);
         }
 
-        // Weight GET overlaps the already submitted hidden GETs for this peer.
-        // done is not returned until both UDMA QPs and MTE are complete.
-        if (dest_rank != rank && with_weights && NvS != 0U) {
-            aclshmemx_mte_get_nbi<float>(
-                gathered_weights + static_cast<uint64_t>(dest_rank) * NvS,
-                published_weights,
-                reinterpret_cast<__ubuf__ float*>(wqe_staging),
-                kCombineUdmaStagingBytes,
-                NvS,
-                static_cast<int32_t>(dest_rank),
-                EVENT_ID0);
-        }
-        if (dest_rank != rank) {
-            for (uint32_t qp_idx = 0;
-                 qp_idx < kCombineUdmaQpNum;
-                 ++qp_idx) {
-                aclshmemx_udma_qp_quiet(
-                    static_cast<int32_t>(dest_rank), qp_idx);
+        if (pass == 1U) {
+            // Each QP's SO completion closes BOTH direct and reduced streams.
+            // The 64P half-full tail is QP0-only: lane 1 owns neither payload
+            // nor completion there, so it must not create a ready WQE/CQE.
+            aclshmemx_submit_state_t state{};
+            if (source == rank) {
+                Publish(Flag(p.final_ready, uint64_t(rank) * 2U + lane), magic);
+            } else if (!(qp0_only && lane == 1U)) {
+                SendReady(p.final_ready, uint64_t(rank) * 2U + lane, source, lane, state);
             }
-            if (with_weights && NvS != 0U) {
-                aclshmemx_mte_quiet();
+
+            // After submitting each source's result/ready, immediately drain only this core's exclusive QP.
+            // This also completes its earlier DIRECT submissions; skip the empty QP1 in the 64P tail group.
+            if (source != rank && !(qp0_only && lane == 1U)) {
+                Drain(source, lane);
             }
         }
-
-        CombinePublishGroupSignal(
-            ub_base,
-            sync_buffer,
-            rank,
-            dest_rank,
-            group_rank_index,
-            kCombineDoneSignalSlot,
-            group_token);
-        CombineWaitGroupSignal(
-            sync_buffer,
-            incoming_reader,
-            rank,
-            current_rank_index,
-            kCombineDoneSignalSlot,
-            group_token);
     }
 
-    // Group completion above already includes hidden QP quiet and the optional
-    // weight MTE quiet. Keep the legacy profile fields ABI-stable: the complete
-    // grouped transfer is reported in hidden_submit.
-#if MOONEP_UDMA_PROFILE_STATISTIC
-    const uint64_t hidden_submit_end_cycle = AscendC::GetSystemCycle();
-#endif
-#if MOONEP_UDMA_PROFILE_STATISTIC
-    const uint64_t weight_get_end_cycle = AscendC::GetSystemCycle();
-#endif
-    CombineLocalAivBarrier();
-#if MOONEP_UDMA_PROFILE_STATISTIC
-    const uint64_t weight_sync_end_cycle = AscendC::GetSystemCycle();
-#endif
-    if (with_weights) {
-        AssembleWeightsFromStagingPhase(
-            ub_base,
-            published_weights,
-            gathered_weights,
-            dst,
-            output_sk,
-            R,
-            NvS,
-            rank,
-            core_idx,
-            core_num);
-    }
-#if MOONEP_UDMA_PROFILE_STATISTIC
-    const uint64_t weight_assemble_end_cycle = AscendC::GetSystemCycle();
-#endif
-
-#if MOONEP_UDMA_PROFILE_STATISTIC
-    const uint64_t hidden_quiet_end_cycle = AscendC::GetSystemCycle();
-#endif
-    CombineLocalAivBarrier();
-#if MOONEP_UDMA_PROFILE_STATISTIC
-    const uint64_t final_sync_end_cycle = AscendC::GetSystemCycle();
-    result.hidden_submit_cycles =
-        hidden_submit_end_cycle - hidden_submit_start_cycle;
-    result.weight_get_cycles =
-        weight_get_end_cycle - hidden_submit_end_cycle;
-    result.weight_sync_cycles =
-        weight_sync_end_cycle - weight_get_end_cycle;
-    result.weight_assemble_cycles =
-        weight_assemble_end_cycle - weight_sync_end_cycle;
-    result.hidden_quiet_cycles =
-        hidden_quiet_end_cycle - weight_assemble_end_cycle;
-    result.final_sync_cycles =
-        final_sync_end_cycle - hidden_quiet_end_cycle;
-#endif
-    result.hidden_bytes =
-        hidden_rows * static_cast<uint64_t>(H) * sizeof(HiddenT);
-    return result;
-}
-
-// ============================================================
-// Phase 3: K-sum staged rows into token-major output
-// ============================================================
-// Token-parallel AIV split. Weights are already in output_sk from Phase 2.
-// Hidden: full-row load ping-pong (ID0/ID1) and dual store credits (ID2/ID3).
-// Ported from get_opt: dst window MTE2'd into UB; load credits live across
-// tokens; next-token decode+preload overlaps store Cast; Cast → V_MTE2 → Add
-// with no Cast↔Add PipeBarrier so MTE2 overlaps accumulate.
-
-template <typename HiddenT>
-__forceinline__ __aicore__ void Phase3IssueHiddenLoad(
-    LocalTensor<HiddenT> row,
-    __gm__ HiddenT* published_hidden,
-    const __gm__ HiddenT* gathered_hidden,
-    uint32_t dest_rank,
-    uint32_t loff,
-    uint32_t route_idx,
-    uint32_t H,
-    uint32_t rank,
-    TEventID event_id) {
-    const __gm__ HiddenT* source_row =
-        dest_rank == rank
-            ? published_hidden + static_cast<uint64_t>(loff) * H
-            : gathered_hidden + static_cast<uint64_t>(route_idx) * H;
-    CombineCopyGmToUb(row, source_row, H);
-    SetFlag<HardEvent::MTE2_V>(event_id);
-}
-
-__forceinline__ __aicore__ uint32_t Phase3DecodeTokenSrcs(
-    LocalTensor<int32_t> ub_dst,
-    uint32_t local_base,
-    uint32_t token_id,
-    uint32_t K,
-    uint32_t R,
-    uint32_t NvS,
-    uint32_t* src_rank,
-    uint32_t* src_loff,
-    uint32_t* src_route) {
-    uint32_t n_src = 0;
-    const uint32_t route_base = token_id * K;
-    for (uint32_t topk_id = 0; topk_id < K; ++topk_id) {
-        int32_t dst_val = ub_dst.GetValue(local_base + topk_id);
-        if (dst_val < 0) {
-            continue;
+    // >=128P DIRECT: two-page MTE2 prefetch; scalar reads use UB instead of per-record GM access/Flush.
+    // Metadata pages are not send batches: retain selected across pages and collect 64 rows
+    // in original order before PostChunk. Per-page tail batches would change chunk/QP assignment.
+    __aicore__ void PostDirect128(uint32_t source, uint32_t count,
+                                  uint32_t txBase, uint32_t targetBase,
+                                  uint32_t& payloadChunkOrdinal, uint32_t ownerQp) {
+        LocalTensor<uint32_t> txPages[2] = {
+            Ub<uint32_t>(120U * 1024U, 64U * 8U),
+            Ub<uint32_t>(122U * 1024U, 64U * 8U),
+        }; // 2KiB per page; does not overlap the WQE buffer starting at 128KiB.
+        uint32_t inputs[64], targets[64], selected = 0U, current = 0U;
+        if (count) SubmitDirectTxRowLoad128(txPages[current], txBase,
+                                          count < 64U ? count : 64U);
+        for (uint32_t first = 0U; first < count; first += 64U) {
+            const uint32_t size = count - first < 64U ? count - first : 64U;
+            WaitFlag<HardEvent::MTE2_S>(EVENT_ID1);
+            const uint32_t next = current ^ 1U, nextFirst = first + 64U;
+            if (nextFirst < count) {
+                const uint32_t nextSize = count - nextFirst < 64U ? count - nextFirst : 64U;
+                SubmitDirectTxRowLoad128(txPages[next], txBase + nextFirst, nextSize);
+            }
+            // Prefetch the next page before filtering this page to overlap MTE2 with filtering/scalar WQE submission.
+            for (uint32_t j = 0U; j < size; ++j) {
+                if (txPages[current].GetValue(j * 8U + 3U) != 1U) continue;
+                inputs[selected] = txPages[current].GetValue(j * 8U);
+                targets[selected++] = targetBase + first + j;
+                if (selected == 64U) {
+                    // Both QP cores enumerate the same chunks; PostChunk first excludes batches owned by the other QP.
+                    PostChunk(source, ownerQp, payloadChunkOrdinal++, inputs, targets,
+                              selected, true, false);
+                    selected = 0U;
+                }
+            }
+            current = next;
         }
-        uint32_t dest_rank = CombineDecodeRank(dst_val, NvS);
-        if (dest_rank >= R) {
-            continue;
+        // The last page's MTE2_S is consumed; empty sources/DIRECT streams leave no pending events.
+        if (selected) {
+            PostChunk(source, ownerQp, payloadChunkOrdinal++, inputs, targets,
+                      selected, true, false);
         }
-        uint32_t loff = CombineDecodeLoff(dst_val, NvS);
-        if (loff >= NvS) {
-            continue;
+    }
+
+    // >=128P: cores 24..39 own QP0, 40..55 own QP1; no cross-core SQ/CQ handoff.
+    // Each logical source lane retains its cumulative DIRECT+result chunk ordinal,
+    // unchanged from before the core split; core24+j and core40+j must enumerate identical counts.
+    __aicore__ void SendSource128(uint32_t source, uint32_t pass, uint32_t ownerQp,
+                                 uint32_t& payloadChunkOrdinal) {
+        if (LocalSource(source)) return;
+
+        auto sc = Meta(p.source_counts, source);
+        uint32_t inputs[64], targets[64], selected = 0U;
+        if (pass == 0U) {
+            PostDirect128(source, static_cast<uint32_t>(sc[0]),
+                          static_cast<uint32_t>(sc[2]), static_cast<uint32_t>(sc[1]),
+                          payloadChunkOrdinal, ownerQp);
+        } else {
+            auto desc = Ub<uint64_t>(144U * 1024U, 64U * 4U);
+            for (uint32_t first = 0; first < static_cast<uint32_t>(sc[5]);
+                 first += kCombinePutBatchRows) {
+                const uint32_t size = sc[5] - first < kCombinePutBatchRows
+                    ? sc[5] - first : kCombinePutBatchRows;
+                // Each QP core independently waits for/reads descriptors and submits only its own chunks.
+                Wait(Flag(p.reduce_ready,
+                           uint64_t(source) * p.batches + first / kCombinePutBatchRows), magic);
+                LoadDescriptors(desc, sc[4] + first, size);
+                for (uint32_t j = 0; j < size; ++j) {
+                    const uint64_t value = desc.GetValue(j * 4U);
+                    if (!(value >> 32U)) continue;
+                    const uint32_t txIndex = static_cast<uint32_t>(value);
+                    inputs[selected] = sc[4] + first + j;
+                    targets[selected++] = sc[1] + txIndex - sc[2];
+                    if (selected == 64U) {
+                        PostChunk(source, ownerQp, payloadChunkOrdinal++, inputs, targets,
+                                  selected, false, false);
+                        selected = 0U;
+                    }
+                }
+            }
         }
-        src_rank[n_src] = dest_rank;
-        src_loff[n_src] = loff;
-        src_route[n_src] = route_base + topk_id;
-        ++n_src;
-    }
-    return n_src;
-}
 
-template <typename HiddenT>
-__aicore__ void GatherAccumulatePhase(
-    LocalTensor<uint8_t> ub_base,
-    __gm__ HiddenT* published_hidden,
-    GM_ADDR workspace,
-    const __gm__ int32_t* dst,
-    __gm__ HiddenT* output_sh,
-    uint32_t S,
-    uint32_t H,
-    uint32_t K,
-    uint32_t R,
-    uint32_t NvS,
-    uint32_t rank,
-    uint32_t core_idx,
-    uint32_t core_num) {
-
-    uint32_t tok_start = 0;
-    uint32_t tok_end = 0;
-    CombineSplitRange(S, core_num, core_idx, tok_start, tok_end);
-    if (tok_start >= tok_end) {
-        return;
-    }
-    if (H == 0U || K == 0U ||
-        H * kCombinePrologueDbBytesPerElement > kCombineUbHiddenRowBytes ||
-        K > kCombinePrologueMaxSrcs) {
-        return;
-    }
-
-    const uint32_t row_bytes = H * sizeof(HiddenT);
-    LocalTensor<HiddenT> row0 =
-        CombineMakeUbTensor<HiddenT>(ub_base, 0, H);
-    LocalTensor<HiddenT> row1 =
-        CombineMakeUbTensor<HiddenT>(ub_base, row_bytes, H);
-    LocalTensor<HiddenT> store0 =
-        CombineMakeUbTensor<HiddenT>(ub_base, 2U * row_bytes, H);
-    LocalTensor<HiddenT> store1 =
-        CombineMakeUbTensor<HiddenT>(ub_base, 3U * row_bytes, H);
-    LocalTensor<float> acc =
-        CombineMakeUbTensor<float>(ub_base, 4U * row_bytes, H);
-    LocalTensor<float> tmp = CombineMakeUbTensor<float>(
-        ub_base, 4U * row_bytes + H * sizeof(float), H);
-
-    constexpr uint32_t kDstUbCap =
-        kCombineProloguePlanBytes / sizeof(int32_t);
-    const uint32_t max_tok_window = kDstUbCap / K;
-    if (max_tok_window == 0U) {
-        return;
-    }
-    LocalTensor<int32_t> ubDst = CombineMakeUbTensor<int32_t>(
-        ub_base, kCombineProloguePlanOffset, kDstUbCap);
-
-    const __gm__ HiddenT* gathered_hidden = reinterpret_cast<const __gm__ HiddenT*>(
-        workspace);
-
-    SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID2);
-    SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
-    uint32_t store_stage = 0;
-    bool ping_pending = false;
-    bool pong_pending = false;
-    bool preload_issued = false;
-
-    uint32_t src_rank[kCombinePrologueMaxSrcs];
-    uint32_t src_loff[kCombinePrologueMaxSrcs];
-    uint32_t src_route[kCombinePrologueMaxSrcs];
-    uint32_t n_src = 0;
-
-    for (uint32_t win_start = tok_start; win_start < tok_end;
-         win_start += max_tok_window) {
-        uint32_t win_end = win_start + max_tok_window;
-        if (win_end > tok_end) {
-            win_end = tok_end;
+        if (selected) {
+            PostChunk(source, ownerQp, payloadChunkOrdinal++, inputs, targets,
+                      selected, pass == 0U, false);
         }
-        if (ping_pending) {
+
+        if (pass == 0U) {
+            // Only two-port cores poll per peer; six-port cores are no longer blocked by two-port CQ waits.
+            // Low-level protective polling when SQ space runs low remains enabled.
+            if (ownerQp == 1U) Drain(source, ownerQp);
+        } else {
+            // Publish ready only for this QP, even if it has no payload.
+            // Final waits for both QPs; never publish early on behalf of the other core.
+            aclshmemx_submit_state_t state{};
+            SendReady(p.final_ready, uint64_t(rank) * 2U + ownerQp,
+                      source, ownerQp, state);
+            // Drain result/ready for both QPs at the end of Send128; queue-space protection is unchanged.
+        }
+    }
+
+    __aicore__ void Send128() {
+        const uint32_t ownerQp = CombinePutSenderLane128(core);
+        const uint32_t worker = CombinePutSenderWorker128(core);
+        uint32_t payloadChunkOrdinal = 0U;
+        for (uint32_t pass = 0U; pass < 2U; ++pass) {
+            for (uint32_t phase = 0U; phase * kCombinePutSourceLanes < r; ++phase) {
+                const uint32_t ord = phase * kCombinePutSourceLanes + worker;
+                const uint32_t source = Source(ord);
+                SendSource128(source, pass, ownerQp, payloadChunkOrdinal);
+            }
+        }
+        // QP1 DIRECT still drains per peer; drain all result/ready and QP0 DIRECT here.
+        for (uint32_t phase = 0U; phase * kCombinePutSourceLanes < r; ++phase) {
+            const uint32_t source = Source(phase * kCombinePutSourceLanes + worker);
+            if (LocalSource(source)) continue;
+            Drain(source, ownerQp);
+        }
+    }
+
+    __aicore__ void Send() {
+        uint32_t lane = CombinePutSenderLane(core); // QP assignment: cores 40..55 use QP0, cores 56..63 use QP1.
+        uint32_t workers = lane == 0U ? 1U : 2U; // Source workers per core: one for QP0, two for QP1.
+        for (uint32_t pass = 0; pass < 2U; ++pass) {
+            // pass=0: DIRECT rows that do not need server reduce.
+            // pass=1: duplicate-group results after server reduce.
+            for (uint32_t phase = 0; phase * 16U < r; ++phase) {
+                // Each phase covers a group of 16 sources.
+                for (uint32_t i = 0; i < workers; ++i) {
+                    // One iteration for QP0, two for QP1.
+                    uint32_t ord = phase * 16U + CombinePutSenderWorker(core, i);
+                    if (ord < r) {
+                        SendSource(Source(ord), lane, pass);
+                    }
+                }
+            }
+        }
+    }
+
+    __aicore__ __gm__ uint32_t* FinalRoutes(uint32_t token) {
+        return reinterpret_cast<__gm__ uint32_t*>(
+            (execution_plan + plan_layout.final_routes) + uint64_t(token) * 128U);
+    }
+
+    __aicore__ __gm__ bf16_t* FinalInput(uint32_t route) {
+        return (route & 0x80000000U)
+            ? hidden + uint64_t(route & 0x7fffffffU) * h
+            : Row(p.final_hidden, route);
+    }
+
+    __aicore__ void PrefetchFinalRoutes(
+        uint32_t token, uint32_t bank, LocalTensor<uint32_t> routeEntries,
+        bool routeReusable[2]) {
+        const TEventID event = bank == 0U ? EVENT_ID2 : EVENT_ID3;
+        if (routeReusable[bank]) {
+            // Scalar has finished reading this UB bank; only now may MTE2
+            // overwrite it with the descriptor for a later token.
+            SetFlag<HardEvent::S_MTE2>(event);
+            WaitFlag<HardEvent::S_MTE2>(event);
+            routeReusable[bank] = false;
+        }
+        Load(routeEntries[bank * 32U], FinalRoutes(token), 32U);
+        SetFlag<HardEvent::MTE2_S>(event);
+    }
+
+    // A singleton token needs no BF16->FP32 cast, accumulator, add, or
+    // FP32->BF16 cast.  Copy its only contributor directly through one input
+    // UB page.  The copy is completed before that page is reused.
+    __aicore__ void FinalCopyToken(
+        uint32_t token, uint32_t route, LocalTensor<bf16_t> inputRows,
+        bool inputPending[2]) {
+        if (inputPending[0]) {
             WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-            ping_pending = false;
+            inputPending[0] = false;
         }
-        if (pong_pending) {
-            WaitFlag<HardEvent::V_MTE2>(EVENT_ID1);
-            pong_pending = false;
+        auto input = inputRows[0];
+        auto source = FinalInput(route);
+        for (uint32_t off = 0U; off < h; off += kAlignedFinalTile) {
+            const uint32_t size = h - off < kAlignedFinalTile ?
+                h - off : kAlignedFinalTile;
+            Load(input, source + off, size);
+            SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+            Store(out + uint64_t(token) * h + off, input, size);
+            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
         }
-        preload_issued = false;
+    }
 
-        const uint32_t win_elems = (win_end - win_start) * K;
-        CombineCopyGmToUbForScalar(
-            ubDst, dst + static_cast<uint64_t>(win_start) * K, win_elems);
+    // TileXR source-final pipeline for one token.  `routes` has already been
+    // decoded once from final_map, so the fallback never re-reads route
+    // metadata.  Two MTE2 banks prefetch the next four contributors while V
+    // reduces the current four; two MTE3 slots let the next token proceed while
+    // the preceding output store retires.
+    __aicore__ void FinalReduceToken(
+        uint32_t token, LocalTensor<uint32_t> routes, uint32_t routeCount,
+        LocalTensor<bf16_t> inputRows, LocalTensor<bf16_t> outputRows,
+        LocalTensor<float> accumulator, LocalTensor<float> temporary,
+        bool inputPending[2],
+        bool outputPending[2], uint32_t& outputSlot) {
+        for (uint32_t off = 0U; off < h; off += kAlignedFinalTile) {
+            const uint32_t size = h - off < kAlignedFinalTile ? h - off : kAlignedFinalTile;
+            const uint32_t slot = outputSlot;
+            const TEventID outputEvent = slot == 0U ? EVENT_ID2 : EVENT_ID3;
+            if (outputPending[slot]) {
+                WaitFlag<HardEvent::MTE3_V>(outputEvent);
+                outputPending[slot] = false;
+            }
 
-        n_src = Phase3DecodeTokenSrcs(
-            ubDst, 0, win_start, K, R, NvS,
-            src_rank, src_loff, src_route);
-
-        for (uint32_t token_id = win_start; token_id < win_end; ++token_id) {
-            if (n_src == 0U) {
-                Duplicate(acc, 0.0f, static_cast<int32_t>(H));
-                PipeBarrier<PIPE_V>();
-            } else {
-                if (!preload_issued) {
-                    if (ping_pending) {
-                        WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-                        ping_pending = false;
+            uint32_t begin = 0U, bank = 0U;
+            uint32_t batchCount = routeCount < kAlignedFinalRouteBatch ?
+                routeCount : kAlignedFinalRouteBatch;
+            TEventID inputEvent = EVENT_ID0;
+            if (inputPending[bank]) {
+                WaitFlag<HardEvent::V_MTE2>(inputEvent);
+                inputPending[bank] = false;
+            }
+            for (uint32_t row = 0U; row < batchCount; ++row)
+                Load(inputRows[row * kAlignedFinalTile],
+                     FinalInput(routes.GetValue(row)) + off, size);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            bool accumulatorValid = false;
+            while (true) {
+                const uint32_t nextBegin = begin + batchCount;
+                const bool finalBatch = nextBegin >= routeCount;
+                if (!finalBatch) {
+                    const uint32_t nextBank = bank ^ 1U;
+                    const TEventID nextInputEvent = nextBank == 0U ? EVENT_ID0 : EVENT_ID1;
+                    if (inputPending[nextBank]) {
+                        WaitFlag<HardEvent::V_MTE2>(nextInputEvent);
+                        inputPending[nextBank] = false;
                     }
-                    SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
-                    WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
-                    Phase3IssueHiddenLoad<HiddenT>(
-                        row0, published_hidden, gathered_hidden,
-                        src_rank[0], src_loff[0], src_route[0], H, rank,
-                        EVENT_ID0);
+                    const uint32_t nextCount = routeCount - nextBegin < kAlignedFinalRouteBatch ?
+                        routeCount - nextBegin : kAlignedFinalRouteBatch;
+                    for (uint32_t row = 0U; row < nextCount; ++row)
+                        Load(inputRows[(nextBank * kAlignedFinalRouteBatch + row) *
+                                           kAlignedFinalTile],
+                             FinalInput(routes.GetValue(nextBegin + row)) + off, size);
+                    SetFlag<HardEvent::MTE2_V>(nextInputEvent);
                 }
-                preload_issued = false;
 
-                int32_t cur = 0;
-                for (uint32_t i = 0; i < n_src; ++i) {
-                    TEventID cur_ev = cur == 0 ? EVENT_ID0 : EVENT_ID1;
-                    LocalTensor<HiddenT> cur_row = cur == 0 ? row0 : row1;
-                    WaitFlag<HardEvent::MTE2_V>(cur_ev);
-
-                    uint32_t next_i = i + 1U;
-                    if (next_i < n_src) {
-                        int32_t next_buf = 1 - cur;
-                        TEventID next_ev =
-                            next_buf == 0 ? EVENT_ID0 : EVENT_ID1;
-                        LocalTensor<HiddenT> next_row =
-                            next_buf == 0 ? row0 : row1;
-                        if (next_buf == 0 && ping_pending) {
-                            WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-                            ping_pending = false;
-                        } else if (next_buf == 1 && pong_pending) {
-                            WaitFlag<HardEvent::V_MTE2>(EVENT_ID1);
-                            pong_pending = false;
-                        }
-                        Phase3IssueHiddenLoad<HiddenT>(
-                            next_row, published_hidden, gathered_hidden,
-                            src_rank[next_i], src_loff[next_i],
-                            src_route[next_i], H, rank, next_ev);
-                    }
-
-                    if (i == 0U) {
-                        Cast(acc, cur_row, RoundMode::CAST_NONE,
-                             static_cast<int32_t>(H));
-                        SetFlag<HardEvent::V_MTE2>(cur_ev);
-                        if (cur == 0) {
-                            ping_pending = true;
-                        } else {
-                            pong_pending = true;
-                        }
+                WaitFlag<HardEvent::MTE2_V>(inputEvent);
+                for (uint32_t row = 0U; row < batchCount; ++row) {
+                    auto input = inputRows[(bank * kAlignedFinalRouteBatch + row) *
+                                           kAlignedFinalTile];
+                    if (!accumulatorValid && row == 0U) {
+                        Cast(accumulator, input, RoundMode::CAST_NONE, size);
+                        accumulatorValid = true;
                     } else {
-                        Cast(tmp, cur_row, RoundMode::CAST_NONE,
-                             static_cast<int32_t>(H));
-                        SetFlag<HardEvent::V_MTE2>(cur_ev);
-                        if (cur == 0) {
-                            ping_pending = true;
-                        } else {
-                            pong_pending = true;
-                        }
-                        Add(acc, acc, tmp, static_cast<int32_t>(H));
+                        Cast(temporary, input, RoundMode::CAST_NONE, size);
+                        PipeBarrier<PIPE_V>();
+                        Add(accumulator, accumulator, temporary, size);
+                        PipeBarrier<PIPE_V>();
                     }
-                    cur = 1 - cur;
                 }
-            }
-
-            PipeBarrier<PIPE_V>();
-            TEventID store_ev =
-                store_stage == 0U ? EVENT_ID2 : EVENT_ID3;
-            LocalTensor<HiddenT> store_row =
-                store_stage == 0U ? store0 : store1;
-            WaitFlag<HardEvent::MTE3_MTE2>(store_ev);
-            Cast(store_row, acc, RoundMode::CAST_RINT, static_cast<int32_t>(H));
-            SetFlag<HardEvent::V_MTE3>(store_ev);
-
-            const uint32_t next_token = token_id + 1U;
-            if (next_token < win_end) {
-                n_src = Phase3DecodeTokenSrcs(
-                    ubDst, (next_token - win_start) * K, next_token, K, R, NvS,
-                    src_rank, src_loff, src_route);
-                if (n_src > 0U) {
-                    if (ping_pending) {
-                        WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-                        ping_pending = false;
-                    }
-                    SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
-                    WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
-                    Phase3IssueHiddenLoad<HiddenT>(
-                        row0, published_hidden, gathered_hidden,
-                        src_rank[0], src_loff[0], src_route[0], H, rank,
-                        EVENT_ID0);
-                    preload_issued = true;
+                if (finalBatch)
+                    Cast(outputRows[slot * kAlignedFinalTile], accumulator,
+                         RoundMode::CAST_RINT, size);
+                SetFlag<HardEvent::V_MTE2>(inputEvent);
+                inputPending[bank] = true;
+                if (finalBatch) {
+                    SetFlag<HardEvent::V_MTE3>(outputEvent);
+                    WaitFlag<HardEvent::V_MTE3>(outputEvent);
+                    Store(out + uint64_t(token) * h + off,
+                          outputRows[slot * kAlignedFinalTile], size);
+                    SetFlag<HardEvent::MTE3_V>(outputEvent);
+                    outputPending[slot] = true;
+                    outputSlot ^= 1U;
+                    break;
                 }
-            } else {
-                n_src = 0;
+                begin = nextBegin;
+                bank ^= 1U;
+                batchCount = routeCount - begin < kAlignedFinalRouteBatch ?
+                    routeCount - begin : kAlignedFinalRouteBatch;
+                inputEvent = bank == 0U ? EVENT_ID0 : EVENT_ID1;
             }
-
-            WaitFlag<HardEvent::V_MTE3>(store_ev);
-            CombineIssueUbToGm(
-                output_sh + static_cast<uint64_t>(token_id) * H,
-                store_row,
-                H);
-            SetFlag<HardEvent::MTE3_MTE2>(store_ev);
-            store_stage ^= 1U;
         }
     }
 
-    if (ping_pending) {
-        WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+    // Shared >=128P per-token computation matches ReduceOneToken in moonep-r18-128p-2454us.
+    // Preserve this planner's compact valid routes in their original order and zero-copy self-input addressing.
+    // Queues manage MTE2/V/MTE3 dependencies instead of 64P's fixed 4096-row stride and manual bank events.
+    __aicore__ void FinalReduceToken128(
+        uint32_t token, LocalTensor<uint32_t> routes, uint32_t routeCount) {
+        auto accumulator = finalAccumulatorBuf.Get<float>();
+        auto row = finalTempBuf.Get<float>();
+        for (uint32_t off = 0U; off < h; off += kAlignedFinalTile) {
+            const uint32_t size = h - off < kAlignedFinalTile ? h - off : kAlignedFinalTile;
+            // Match the reference MoonEpCombineV2ReduceInputStrideElements:
+            // align this tile to 32B; H3584 uses stride 3584 instead of a fixed 4096.
+            const uint32_t stride = (size + 15U) / 16U * 16U;
+            if (routeCount == 1U) {
+                // CopyOneFinalRoute: a single input goes directly MTE2->MTE3 without floating-point conversion.
+                auto input = inputQ.AllocTensor<bf16_t>();
+                Load(input, FinalInput(routes.GetValue(0U)) + off, size);
+                inputQ.EnQue(input);
+                input = inputQ.DeQue<bf16_t>();
+                SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+                Store(out + uint64_t(token) * h + off, input, size);
+                SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                inputQ.FreeTensor(input);
+                continue;
+            }
+            Duplicate(accumulator, 0.0f, size);
+            PipeBarrier<PIPE_V>();
+            for (uint32_t begin = 0U; begin < routeCount; begin += kAlignedFinalRouteBatch) {
+                const uint32_t count = routeCount - begin < kAlignedFinalRouteBatch
+                    ? routeCount - begin : kAlignedFinalRouteBatch;
+                auto input = inputQ.AllocTensor<bf16_t>();
+                for (uint32_t j = 0U; j < count; ++j)
+                    Load(input[j * stride], FinalInput(routes.GetValue(begin + j)) + off, size);
+                inputQ.EnQue(input);
+                input = inputQ.DeQue<bf16_t>();
+                for (uint32_t j = 0U; j < count; ++j) {
+                    Cast(row, input[j * stride], RoundMode::CAST_NONE, size);
+                    PipeBarrier<PIPE_V>();
+                    Add(accumulator, accumulator, row, size);
+                    PipeBarrier<PIPE_V>();
+                }
+                inputQ.FreeTensor(input);
+            }
+            // routeCount==0 also takes this path, producing zeros instead of retaining the previous output.
+            auto output = outputQ.AllocTensor<bf16_t>();
+            Cast(output, accumulator, RoundMode::CAST_RINT, size);
+            outputQ.EnQue(output);
+            output = outputQ.DeQue<bf16_t>();
+            Store(out + uint64_t(token) * h + off, output, size);
+            outputQ.FreeTensor(output);
+        }
     }
-    if (pong_pending) {
-        WaitFlag<HardEvent::V_MTE2>(EVENT_ID1);
-    }
-    WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID2);
-    WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
-}
 
-#if MOONEP_UDMA_PROFILE_STATISTIC
-__aicore__ inline void MoonEPUdmaCombinePrintHiddenBandwidth(
-    GM_ADDR bandwidth_scratch,
-    const CombineGatherResult& gather_result,
-    uint64_t gather_cycles,
-    uint32_t rank,
-    uint32_t world_size,
-    uint32_t core_idx,
-    uint32_t core_num)
-{
-    if (bandwidth_scratch == nullptr) {
+    __aicore__ void FinalReference128() {
+        // Double queues match the reference InitReduceBuffers sizes; Final has already completed fan-in.
+        pipe.Reset();
+        pipe.InitBuffer(inputQ, 2U, kAlignedFinalRouteBatch * kAlignedFinalTile * sizeof(bf16_t));
+        pipe.InitBuffer(outputQ, 2U, kAlignedFinalTile * sizeof(bf16_t));
+        pipe.InitBuffer(finalAccumulatorBuf, kAlignedFinalTile * sizeof(float));
+        pipe.InitBuffer(finalTempBuf, kAlignedFinalTile * sizeof(float));
+        pipe.InitBuffer(finalRouteBuf, 2U * 128U);
+        auto routeEntries = finalRouteBuf.Get<uint32_t>();
+        bool routeReusable[2] = {false, false};
+        const uint32_t tokenCount = n / k;
+        uint32_t bank = 0U;
+        if (core < tokenCount) PrefetchFinalRoutes(core, bank, routeEntries, routeReusable);
+        for (uint32_t token = core; token < tokenCount; token += kCores) {
+            WaitFlag<HardEvent::MTE2_S>(bank == 0U ? EVENT_ID2 : EVENT_ID3);
+            const uint32_t count = routeEntries.GetValue(bank * 32U);
+            const uint32_t nextBank = bank ^ 1U;
+            if (token + kCores < tokenCount)
+                PrefetchFinalRoutes(token + kCores, nextBank, routeEntries, routeReusable);
+            FinalReduceToken128(token, routeEntries[bank * 32U + 1U], count);
+            routeReusable[bank] = true;
+            bank = nextBank;
+        }
+        PipeBarrier<PIPE_ALL>();
+        pipe.Reset();
+    }
+
+    __aicore__ void Final() {
+        // Parallel final fan-in.  At 64P, every core owns exactly one source
+        // peer: 56 cores wait one remote peer and the remaining eight wait the
+        // local-server peers.  This replaces core0's serial 120-flag scan.
+        // For larger worlds a core advances by kCores, preserving correctness.
+        for (uint32_t ord = core; ord < r; ord += kCores) {
+            const uint32_t peer = Source(ord);
+            Wait(Flag(p.final_ready, uint64_t(peer) * 2U), magic);
+            // This is the reverse direction: decide using the producer peer's
+            // schedule.  A 64P tail wave has no QP1 payload, ready WQE or CQE.
+            if (!LocalSource(peer) &&
+                !CombinePutSenderTailQp0Only(peer, rank, r)) {
+                Wait(Flag(p.final_ready, uint64_t(peer) * 2U + 1U), magic);
+            }
+        }
+        // A rank-local core barrier is the new fan-in gate: nobody reads
+        // final_hidden until every peer's completion has been observed.
+        aclshmemi_sync_core<true>();
+        if (r >= 128U) {
+            FinalReference128();
+            return;
+        }
+        InitVector(true);
+        auto inputRows = finalInputBuf.Get<bf16_t>();
+        auto outputRows = finalOutputBuf.Get<bf16_t>();
+        auto accumulator = finalAccumulatorBuf.Get<float>();
+        auto temporary = finalTempBuf.Get<float>();
+        auto routeEntries = finalRouteBuf.Get<uint32_t>();
+        bool inputPending[2] = {false, false};
+        bool outputPending[2] = {false, false};
+        bool routeReusable[2] = {false, false};
+        uint32_t outputSlot = 0U;
+
+        // Exact TileXR ownership: one token per active core, token-strided.
+        // Unlike the previous fallback, routes are collected once and fed
+        // directly into the 4-route double-buffered source-final pipeline.
+        const uint32_t tokenCount = n / k;
+        uint32_t routeBank = 0U;
+        if (core < tokenCount)
+            PrefetchFinalRoutes(core, routeBank, routeEntries, routeReusable);
+        for (uint32_t token = core; token < tokenCount; token += kCores) {
+            const TEventID routeEvent = routeBank == 0U ? EVENT_ID2 : EVENT_ID3;
+            WaitFlag<HardEvent::MTE2_S>(routeEvent);
+            const uint32_t count = routeEntries.GetValue(routeBank * 32U);
+            const uint32_t nextToken = token + kCores;
+            const uint32_t nextBank = routeBank ^ 1U;
+            if (nextToken < tokenCount)
+                PrefetchFinalRoutes(nextToken, nextBank, routeEntries, routeReusable);
+            auto routes = routeEntries[routeBank * 32U + 1U];
+            if (count > 1U) {
+                FinalReduceToken(token, routes, count, inputRows, outputRows,
+                                 accumulator, temporary, inputPending,
+                                 outputPending, outputSlot);
+            } else if (count == 1U) {
+                FinalCopyToken(token, routes.GetValue(0), inputRows, inputPending);
+            }
+            else {
+                // Match TileXR's zero-route source-final path tile by tile;
+                // this also remains correct when H exceeds one 4096-element
+                // final buffer.
+                for (uint32_t off = 0U; off < h; off += kAlignedFinalTile) {
+                    const uint32_t size = h - off < kAlignedFinalTile ?
+                        h - off : kAlignedFinalTile;
+                    const uint32_t slot = outputSlot;
+                    const TEventID event = slot == 0U ? EVENT_ID2 : EVENT_ID3;
+                    if (outputPending[slot]) {
+                        WaitFlag<HardEvent::MTE3_V>(event);
+                        outputPending[slot] = false;
+                    }
+                    Duplicate(outputRows[slot * kAlignedFinalTile], bf16_t(0), size);
+                    SetFlag<HardEvent::V_MTE3>(event);
+                    WaitFlag<HardEvent::V_MTE3>(event);
+                    Store(out + uint64_t(token) * h + off,
+                          outputRows[slot * kAlignedFinalTile], size);
+                    SetFlag<HardEvent::MTE3_V>(event);
+                    outputPending[slot] = true;
+                    outputSlot ^= 1U;
+                }
+            }
+            routeReusable[routeBank] = true;
+            routeBank = nextBank;
+        }
+        for (uint32_t slot = 0U; slot < 2U; ++slot) {
+            if (outputPending[slot])
+                WaitFlag<HardEvent::MTE3_V>(slot == 0U ? EVENT_ID2 : EVENT_ID3);
+        }
+        for (uint32_t bank = 0U; bank < 2U; ++bank) {
+            if (inputPending[bank])
+                WaitFlag<HardEvent::V_MTE2>(bank == 0U ? EVENT_ID0 : EVENT_ID1);
+        }
+        PipeBarrier<PIPE_ALL>();
+        pipe.Reset();
+    }
+};
+
+__aicore__ void Run(GM_ADDR hidden, GM_ADDR weights, GM_ADDR dst, GM_ADDR groups,
+    GM_ADDR dups, GM_ADDR counts, GM_ADDR out, GM_ADDR outw, GM_ADDR workspace,
+    ascend_moonep::MoonEPUdmaCombineTilingData t, uint64_t magic,
+    GM_ADDR execution_plan) {
+    uint32_t core = get_block_idx(), qp_num = aclshmemi_udma_qp_info_fetch()->qp_num;
+    uint32_t active = qp_num == 6U ? 4U : qp_num;
+    if (active == 0U || active > 4U || qp_num == 4U) return;
+    if (t.server_dedup != 0U && active < 2U) {
+        aclshmemi_kernel_abort("server PUT combine requires at least 2 QPs\n");
         return;
     }
+    Pipeline x{reinterpret_cast<__gm__ uint8_t*>(workspace),
+        reinterpret_cast<__gm__ bf16_t*>(hidden), reinterpret_cast<__gm__ float*>(weights),
+        reinterpret_cast<const __gm__ int32_t*>(dst), reinterpret_cast<const __gm__ int32_t*>(groups),
+        reinterpret_cast<const __gm__ int32_t*>(dups), reinterpret_cast<const __gm__ int32_t*>(counts),
+        reinterpret_cast<__gm__ bf16_t*>(out), reinterpret_cast<__gm__ float*>(outw),
+        ascend_moonep::MakeCombinePutLayout(t.S * t.K, t.H, t.R),
+        t.S * t.K, t.H, t.K, t.R, t.rank, core, t.server_dedup != 0, t.with_weights != 0, magic};
 
-    AscendC::GlobalTensor<int64_t> statsGlobal;
-    statsGlobal.SetGlobalBuffer(
-        reinterpret_cast<__gm__ int64_t*>(bandwidth_scratch));
-    AscendC::GlobalTensor<int64_t> localStats =
-        statsGlobal[core_idx * kCombineBandwidthStatsStride];
-    localStats(kCombineStatHiddenBytes) =
-        static_cast<int64_t>(gather_result.hidden_bytes);
-    localStats(kCombineStatGatherCycles) =
-        static_cast<int64_t>(gather_cycles);
-    localStats(kCombineStatHiddenSubmitCycles) =
-        static_cast<int64_t>(gather_result.hidden_submit_cycles);
-    localStats(kCombineStatWeightGetCycles) =
-        static_cast<int64_t>(gather_result.weight_get_cycles);
-    localStats(kCombineStatWeightSyncCycles) =
-        static_cast<int64_t>(gather_result.weight_sync_cycles);
-    localStats(kCombineStatWeightAssembleCycles) =
-        static_cast<int64_t>(gather_result.weight_assemble_cycles);
-    localStats(kCombineStatHiddenQuietCycles) =
-        static_cast<int64_t>(gather_result.hidden_quiet_cycles);
-    localStats(kCombineStatFinalSyncCycles) =
-        static_cast<int64_t>(gather_result.final_sync_cycles);
-    AscendC::PipeBarrier<PIPE_ALL>();
-    __asm__ __volatile__("");
-    AscendC::DataCacheCleanAndInvalid<
-        int64_t,
-        AscendC::CacheLine::SINGLE_CACHE_LINE,
-        AscendC::DcciDst::CACHELINE_OUT>(localStats[0]);
-    __asm__ __volatile__("");
-
-    CombineLocalAivBarrier();
-    if (core_idx == 0U) {
-        uint64_t rank_hidden_bytes = 0;
-        uint64_t max_gather_cycles = 0;
-        uint64_t max_phase_cycles[6] = {0, 0, 0, 0, 0, 0};
-        uint32_t max_phase_aiv[6] = {0, 0, 0, 0, 0, 0};
-        for (uint32_t aiv_idx = 0; aiv_idx < core_num; ++aiv_idx) {
-            AscendC::GlobalTensor<int64_t> coreStats =
-                statsGlobal[aiv_idx * kCombineBandwidthStatsStride];
-            __asm__ __volatile__("");
-            AscendC::DataCacheCleanAndInvalid<
-                int64_t,
-                AscendC::CacheLine::SINGLE_CACHE_LINE,
-                AscendC::DcciDst::CACHELINE_OUT>(coreStats[0]);
-            __asm__ __volatile__("");
-            const uint64_t core_hidden_bytes =
-                static_cast<uint64_t>(
-                    coreStats.GetValue(kCombineStatHiddenBytes));
-            const uint64_t core_gather_cycles =
-                static_cast<uint64_t>(
-                    coreStats.GetValue(kCombineStatGatherCycles));
-            rank_hidden_bytes += core_hidden_bytes;
-            if (core_gather_cycles > max_gather_cycles) {
-                max_gather_cycles = core_gather_cycles;
-            }
-            for (uint32_t phase_idx = 0; phase_idx < 6U; ++phase_idx) {
-                const uint64_t phase_cycles = static_cast<uint64_t>(
-                    coreStats.GetValue(
-                        kCombineStatHiddenSubmitCycles + phase_idx));
-                if (phase_cycles > max_phase_cycles[phase_idx]) {
-                    max_phase_cycles[phase_idx] = phase_cycles;
-                    max_phase_aiv[phase_idx] = aiv_idx;
-                }
-            }
-        }
-
-        const float gather_time_us =
-            static_cast<float>(max_gather_cycles) /
-            kCombineCyclesPerMicrosecond;
-        const float hidden_bandwidth_gbps = gather_time_us > 0.0F
-            ? static_cast<float>(rank_hidden_bytes) /
-                gather_time_us / 1000.0F
-            : 0.0F;
-        AscendC::printf(
-            "[moonep_combine][dispatch-group-2qp-v1] rank=%u/%u "
-            "GatherToStagingPhase hidden: "
-            "data_bytes=%lld, time_us=%f, bandwidth=%f GB/s\n",
-            rank,
-            world_size,
-            static_cast<long long>(rank_hidden_bytes),
-            gather_time_us,
-            hidden_bandwidth_gbps);
-
-        AscendC::printf(
-            "[moonep_combine] rank=%u phase_max_us: "
-            "hidden_submit=%f(aiv=%u), weight_get=%f(aiv=%u), "
-            "weight_sync=%f(aiv=%u)\n",
-            rank,
-            static_cast<float>(max_phase_cycles[0]) /
-                kCombineCyclesPerMicrosecond,
-            max_phase_aiv[0],
-            static_cast<float>(max_phase_cycles[1]) /
-                kCombineCyclesPerMicrosecond,
-            max_phase_aiv[1],
-            static_cast<float>(max_phase_cycles[2]) /
-                kCombineCyclesPerMicrosecond,
-            max_phase_aiv[2]);
-        AscendC::printf(
-            "[moonep_combine] rank=%u phase_max_us: "
-            "weight_assemble=%f(aiv=%u), hidden_quiet=%f(aiv=%u), "
-            "final_sync=%f(aiv=%u)\n",
-            rank,
-            static_cast<float>(max_phase_cycles[3]) /
-                kCombineCyclesPerMicrosecond,
-            max_phase_aiv[3],
-            static_cast<float>(max_phase_cycles[4]) /
-                kCombineCyclesPerMicrosecond,
-            max_phase_aiv[4],
-            static_cast<float>(max_phase_cycles[5]) /
-                kCombineCyclesPerMicrosecond,
-            max_phase_aiv[5]);
-
-        AscendC::printf(
-            "[moonep_combine] rank=%u group_width=%u group_count=%u "
-            "slowest_group_aiv=%u\n",
-            rank,
-            CombineGetGroupWidth(world_size),
-            world_size / CombineGetGroupWidth(world_size),
-            max_phase_aiv[0]);
+    x.Init();
+    x.BindPlan(reinterpret_cast<__gm__ uint8_t*>(execution_plan));
+    x.phase_id = 4U;
+    if (t.R >= 128U) {
+        if (core < kCombinePut128ReducerBegin) x.Relay();
+        else if (core < kCombinePut128SenderBegin) x.Reduce128();
+        else if (core < kCombinePut128SenderEnd) x.Send128();
+    } else {
+        // Preserve the existing 64P and smaller-world core ownership exactly.
+        if (core < kReduceBegin) x.Relay();
+        else if (core < kSendBegin) x.Reduce();
+        else if (core < kSendEnd) x.Send();
     }
-    // Keep other AIVs from reusing the buffer while AIV0 reads the reduction.
-    CombineLocalAivBarrier();
+    // All >=128P worlds reuse the parallel final fan-in, then the same final reducer.
+    // Keep the token-ready/out-of-order experiment out of this path.
+    x.phase_id = 5U;
+    x.FinalWeights(); // Fetch weights after this core's WORK, before waiting for hidden ready, to hide part of the wait.
+    x.Final();
+    aclshmemx_sync_vec_all();
+
 }
-#endif
-
-// Args order: buffers, workspace, bandwidth scratch, tiling.
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void moonep_udma_combine_kernel(
-    GM_ADDR hidden_nvsh_gm,       // bf16 [NvS, H]
-    GM_ADDR route_weights_nvs_gm, // fp32 [NvS]
-    GM_ADDR dst_gm,               // int32 [S*K]
-    GM_ADDR dup_groups_gm,        // int32 [NvS, 3]
-    GM_ADDR dup_loffs_gm,         // int32 [NvS]
-    GM_ADDR dup_counts_gm,        // int32 [2]
-    GM_ADDR output_sh_gm,         // bf16 [S, H]
-    GM_ADDR output_sk_gm,         // fp32 [S, K]
-    GM_ADDR sync_buffer_gm,       // symmetric grant/done cacheline pool
-    GM_ADDR workspace_gm,         // rank-local GM gather workspace
-    GM_ADDR bandwidth_scratch,    // int64 bandwidth scratch, 1 line per AIV
-    ascend_moonep::MoonEPUdmaCombineTilingData tiling,
-    uint64_t invocation_magic)
-{
-    uint32_t S = tiling.S;
-    uint32_t H = tiling.H;
-    uint32_t K = tiling.K;
-    uint32_t NvS = S * K;
-    uint32_t with_weights = tiling.with_weights;
-    uint32_t rank = tiling.rank;
-
-    uint32_t core_idx = get_block_idx();
-
-    LocalTensor<uint8_t> ub_base;
-    ub_base.address_.logicPos = static_cast<uint8_t>(TPosition::VECIN);
-    ub_base.address_.bufferAddr = 0;
-    ub_base.address_.dataLen = kCombineUbBytes;
-
-    const __gm__ bf16_t* hidden_nvsh = reinterpret_cast<const __gm__ bf16_t*>(hidden_nvsh_gm);
-    const __gm__ float* rw = reinterpret_cast<const __gm__ float*>(route_weights_nvs_gm);
-    const __gm__ int32_t* dst_ptr = reinterpret_cast<const __gm__ int32_t*>(dst_gm);
-    const __gm__ int32_t* dgrp = reinterpret_cast<const __gm__ int32_t*>(dup_groups_gm);
-    const __gm__ int32_t* dloff = reinterpret_cast<const __gm__ int32_t*>(dup_loffs_gm);
-    const __gm__ int32_t* dcnt = reinterpret_cast<const __gm__ int32_t*>(dup_counts_gm);
-    __gm__ bf16_t* output_sh = reinterpret_cast<__gm__ bf16_t*>(output_sh_gm);
-    __gm__ float* output_sk = reinterpret_cast<__gm__ float*>(output_sk_gm);
-
-    // Inputs are always SHMEM symmetric. Buffer(use_udma=True).combine() publishes
-    // ordinary tensors into its symmetric shard before launching this kernel.
-    __gm__ bf16_t* published_hidden =
-        const_cast<__gm__ bf16_t*>(hidden_nvsh);
-    __gm__ float* published_weights = const_cast<__gm__ float*>(rw);
-
-    PlanProloguePhase<bf16_t>(
-        ub_base, published_hidden, dgrp, dloff, dcnt,
-        H, NvS, core_idx, kCombineAivNum);
-
-    // Every prologue GM write is already completed by the MTE3 dependency in
-    // CombineStoreAccAsBf16, and PlanProloguePhase ends with PIPE_ALL. Avoid
-    // aclshmemx_mte_quiet here: it repeats the pipe drain and flushes the whole
-    // data cache on every AIV before the cross-rank barrier.
-    aclshmemx_barrier_all_vec();
-
-#if MOONEP_UDMA_PROFILE_STATISTIC
-    for (int i = 0; i < 1; i++) {
-        (void)GatherToStagingPhase<bf16_t>(
-        ub_base, published_hidden, published_weights,
-        reinterpret_cast<__gm__ uint8_t*>(sync_buffer_gm),
-        workspace_gm, dst_ptr, output_sk,
-        H, tiling.R, NvS, false,
-        invocation_magic * 2U,
-        rank, core_idx, kCombineAivNum);
-    }
-    const uint64_t gather_start_cycle = AscendC::GetSystemCycle();
-#endif
-
-    CombineGatherResult gather_result{};
-    for (int i = 0; i < 1; i++) {
-        const CombineGatherResult iter_result =
-            GatherToStagingPhase<bf16_t>(
-                ub_base, published_hidden, published_weights,
-                reinterpret_cast<__gm__ uint8_t*>(sync_buffer_gm),
-                workspace_gm, dst_ptr, output_sk,
-                H, tiling.R, NvS, with_weights != 0,
-                invocation_magic * 2U + 1U,
-                rank, core_idx, kCombineAivNum);
-        gather_result.hidden_bytes += iter_result.hidden_bytes;
-#if MOONEP_UDMA_PROFILE_STATISTIC
-        gather_result.hidden_submit_cycles +=
-            iter_result.hidden_submit_cycles;
-        gather_result.weight_get_cycles += iter_result.weight_get_cycles;
-        gather_result.weight_sync_cycles += iter_result.weight_sync_cycles;
-        gather_result.weight_assemble_cycles +=
-            iter_result.weight_assemble_cycles;
-        gather_result.hidden_quiet_cycles += iter_result.hidden_quiet_cycles;
-        gather_result.final_sync_cycles += iter_result.final_sync_cycles;
-#endif
-    }
-
-#if MOONEP_UDMA_PROFILE_STATISTIC
-    const uint64_t gather_end_cycle = AscendC::GetSystemCycle();
-    MoonEPUdmaCombinePrintHiddenBandwidth(
-        bandwidth_scratch,
-        gather_result,
-        gather_end_cycle - gather_start_cycle,
-        rank,
-        tiling.R,
-        core_idx,
-        kCombineAivNum);
-#endif
-
-    GatherAccumulatePhase<bf16_t>(
-        ub_base, published_hidden,
-        workspace_gm, dst_ptr, output_sh,
-        S, H, K, tiling.R, NvS,
-        rank, core_idx, kCombineAivNum);
+} // namespace
+// Payload-only entry: its immutable plan is produced by planning.cpp.
+[[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void
+moonep_udma_combine_prepared_kernel(GM_ADDR hidden, GM_ADDR weights, GM_ADDR dst,
+    GM_ADDR groups, GM_ADDR dups, GM_ADDR counts, GM_ADDR out, GM_ADDR outw,
+    GM_ADDR workspace, GM_ADDR plan,
+    ascend_moonep::MoonEPUdmaCombineTilingData t, uint64_t magic) {
+    Run(hidden, weights, dst, groups, dups, counts, out, outw,
+        workspace, t, magic, plan);
 }
-
-
-// ============================================================
-// Host-side launcher (C-linkage)
-// ============================================================
-
-extern "C" __attribute__((visibility("default")))
-void moonep_udma_combine_kernel_do(
-    void* stream,
-    uint8_t* hidden_nvsh,
-    uint8_t* route_weights_nvs,
-    uint8_t* sync_buffer,
-    uint8_t* dst,
-    uint8_t* dup_groups,
-    uint8_t* dup_loffs,
-    uint8_t* dup_counts,
-    uint8_t* output_sh,
-    uint8_t* output_sk,
-    uint8_t* local_workspace,
-    uint8_t* bandwidth_scratch,
-    uint8_t* tiling_host,
-    uint64_t invocation_magic)
-{
-    auto* td = reinterpret_cast<ascend_moonep::MoonEPUdmaCombineTilingData*>(tiling_host);
-
-    moonep_udma_combine_kernel<<<kCombineAivNum, nullptr, stream>>>(
-        hidden_nvsh,
-        route_weights_nvs,
-        dst,
-        dup_groups,
-        dup_loffs,
-        dup_counts,
-        output_sh,
-        output_sk,
-        sync_buffer,
-        local_workspace,
-        bandwidth_scratch,
-        *td,
-        invocation_magic);
+extern "C" __attribute__((visibility("default"))) void moonep_udma_combine_plan_kernel_do(
+    void* stream, uint8_t* hidden, uint8_t* weights, uint8_t* dst,
+    uint8_t* groups, uint8_t* dups, uint8_t* counts, uint8_t* out, uint8_t* outw,
+    uint8_t* workspace, uint8_t* plan, uint8_t* tiling,
+    uint64_t magic) {
+    auto t = *reinterpret_cast<ascend_moonep::MoonEPUdmaCombineTilingData*>(tiling);
+    moonep_udma_combine_prepared_kernel<<<kCores, CombinePutSimt::kLaunchUbBytes, stream>>>(
+        hidden, weights, dst, groups, dups, counts, out, outw, workspace, plan, t, magic);
 }

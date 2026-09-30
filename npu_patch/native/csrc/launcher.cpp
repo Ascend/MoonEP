@@ -188,39 +188,27 @@ void LaunchPlanningKernel(
         ffts_addr);
 }
 
-void LaunchMoonEPUdmaCombineKernel(
-    torch::Tensor hidden_nvsh,
-    torch::Tensor route_weights_nvs,
-    torch::Tensor sync_buffer,
-    torch::Tensor dst,
-    torch::Tensor dup_groups,
-    torch::Tensor dup_loffs,
-    torch::Tensor dup_counts,
-    torch::Tensor output_sh,
-    torch::Tensor output_sk,
-    void* bandwidth_scratch,
+void LaunchMoonEPUdmaCombinePlanKernel(
+    torch::Tensor hidden, torch::Tensor weights, torch::Tensor dst,
+    torch::Tensor groups, torch::Tensor dups, torch::Tensor counts,
+    torch::Tensor out, torch::Tensor outw, torch::Tensor workspace,
+    torch::Tensor plan,
     const ascend_moonep::MoonEPUdmaCombineTilingData& tiling,
-    void* local_workspace,
-    uint64_t invocation_magic) {
-    TORCH_CHECK(local_workspace != nullptr, "local_workspace must not be null");
-    TORCH_CHECK(bandwidth_scratch != nullptr,
-                "bandwidth_scratch must not be null");
+    uint64_t magic) {
+    moonep_udma_combine_plan_kernel_do(
+        GetCurrentAclStream(), BytePtr(hidden.data_ptr()), BytePtr(weights.data_ptr()),
+        BytePtr(dst.data_ptr()), BytePtr(groups.data_ptr()), BytePtr(dups.data_ptr()),
+        BytePtr(counts.data_ptr()), BytePtr(out.data_ptr()), BytePtr(outw.data_ptr()),
+        BytePtr(workspace.data_ptr()), BytePtr(plan.data_ptr()),
+        reinterpret_cast<uint8_t*>(const_cast<ascend_moonep::MoonEPUdmaCombineTilingData*>(&tiling)),
+        magic);
+}
 
-    aclrtStream stream = GetCurrentAclStream();
-    moonep_udma_combine_kernel_do(
-        stream,
-        BytePtr(hidden_nvsh.data_ptr()),
-        BytePtr(route_weights_nvs.data_ptr()),
-        BytePtr(sync_buffer.data_ptr()),
-        BytePtr(dst.data_ptr()),
-        BytePtr(dup_groups.data_ptr()),
-        BytePtr(dup_loffs.data_ptr()),
-        BytePtr(dup_counts.data_ptr()),
-        BytePtr(output_sh.data_ptr()),
-        BytePtr(output_sk.data_ptr()),
-        BytePtr(local_workspace),
-        BytePtr(bandwidth_scratch),
-        reinterpret_cast<uint8_t*>(
-            const_cast<ascend_moonep::MoonEPUdmaCombineTilingData*>(&tiling)),
-        invocation_magic);
+void LaunchPlanningMetadataOnly(
+    torch::Tensor dst, torch::Tensor groups, torch::Tensor dups, torch::Tensor counts,
+    const ascend_moonep::PlanningTilingData& tiling) {
+    planning_kernel_do(GetCurrentAclStream(), nullptr, nullptr, BytePtr(dst.data_ptr()),
+        nullptr, nullptr, BytePtr(groups.data_ptr()), BytePtr(dups.data_ptr()), BytePtr(counts.data_ptr()),
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        reinterpret_cast<uint8_t*>(const_cast<ascend_moonep::PlanningTilingData*>(&tiling)), 0);
 }

@@ -27,21 +27,11 @@ ASCEND_MOONEP_EXPORT void moonep_combine_kernel_do(
     uint8_t* route_weights_sk_out,
     uint8_t* tiling_host);
 
-ASCEND_MOONEP_EXPORT void moonep_udma_combine_kernel_do(
-    void* stream,
-    uint8_t* hidden_nvsh,
-    uint8_t* route_weights_nvs,
-    uint8_t* sync_buffer,
-    uint8_t* dst,
-    uint8_t* dup_groups,
-    uint8_t* dup_loffs,
-    uint8_t* dup_counts,
-    uint8_t* output_sh,
-    uint8_t* output_sk,
-    uint8_t* local_workspace,
-    uint8_t* bandwidth_scratch,
-    uint8_t* tiling_host,
-    uint64_t invocation_magic);
+ASCEND_MOONEP_EXPORT void moonep_udma_combine_plan_kernel_do(
+    void* stream, uint8_t* hidden, uint8_t* weights, uint8_t* dst,
+    uint8_t* groups, uint8_t* dups, uint8_t* counts, uint8_t* out, uint8_t* outw,
+    uint8_t* workspace, uint8_t* plan, uint8_t* tiling,
+    uint64_t magic);
 
 ASCEND_MOONEP_EXPORT void moonep_dispatch_kernel_do(
     void* stream,

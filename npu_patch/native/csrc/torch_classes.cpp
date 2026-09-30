@@ -45,49 +45,7 @@ void CheckShmem(const c10::intrusive_ptr<ShmemInstance>& shmem) {
     TORCH_CHECK(shmem->Initialized(), "ShmemInstance is not initialized");
 }
 
-std::size_t MoonEPUdmaCombineWorkspaceBytes(
-    int64_t S,
-    int64_t H,
-    int64_t K,
-    int64_t R) {
-    TORCH_CHECK(S > 0 && H > 0 && K > 0 && R > 0,
-                "MoonEP UDMA combine workspace requires S/H/K/R > 0");
-    const auto s = static_cast<uint64_t>(S);
-    const auto h = static_cast<uint64_t>(H);
-    const auto k = static_cast<uint64_t>(K);
-    TORCH_CHECK(s <= std::numeric_limits<uint64_t>::max() / k,
-                "MoonEP UDMA combine S*K overflows uint64_t");
-    const uint64_t slots = s * k;
-    TORCH_CHECK(slots <= std::numeric_limits<uint64_t>::max() / h / sizeof(c10::BFloat16),
-                "MoonEP UDMA combine hidden workspace size overflows uint64_t");
-    const uint64_t hidden_bytes = slots * h * sizeof(c10::BFloat16);
-    const uint64_t weight_regions = static_cast<uint64_t>(R);
-    TORCH_CHECK(
-        slots <= std::numeric_limits<uint64_t>::max() /
-            weight_regions / sizeof(float),
-        "MoonEP UDMA combine weight workspace size overflows uint64_t");
-    const uint64_t weight_bytes = weight_regions * slots * sizeof(float);
-    TORCH_CHECK(
-        hidden_bytes <=
-            std::numeric_limits<uint64_t>::max() - weight_bytes,
-        "MoonEP UDMA combine gathered hidden workspace size overflows uint64_t");
-    const uint64_t alignment =
-        ascend_moonep::kMoonEPUdmaCombineBandwidthScratchAlign;
-    TORCH_CHECK(
-        hidden_bytes + weight_bytes <=
-            std::numeric_limits<uint64_t>::max() - (alignment - 1),
-        "MoonEP UDMA combine workspace alignment overflows uint64_t");
-    uint64_t bytes =
-        (hidden_bytes + weight_bytes + alignment - 1) & ~(alignment - 1);
-    TORCH_CHECK(
-        bytes <= std::numeric_limits<uint64_t>::max() -
-            ascend_moonep::kMoonEPUdmaCombineBandwidthScratchBytes,
-        "MoonEP UDMA combine bandwidth scratch size overflows uint64_t");
-    bytes += ascend_moonep::kMoonEPUdmaCombineBandwidthScratchBytes;
-    TORCH_CHECK(bytes <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
-                "MoonEP UDMA combine workspace size overflows int64_t");
-    return static_cast<std::size_t>(bytes);
-}
+
 
 }  // namespace
 
@@ -207,6 +165,35 @@ public:
 class Planning : public torch::jit::CustomClassHolder {
 public:
     Planning() = default;
+
+    torch::Tensor compute_fused(
+        torch::Tensor topk_idx, torch::Tensor dst, torch::Tensor cu_seqlens,
+        torch::Tensor experts_to_copy, torch::Tensor dup_groups, torch::Tensor dup_loffs,
+        torch::Tensor dup_counts, torch::Tensor local_workspace,
+        int64_t symmetric_workspace_addr, int64_t symmetric_workspace_bytes,
+        int64_t num_tokens, int64_t num_topk, int64_t num_experts,
+        int64_t num_max_tokens_per_rank, int64_t num_prefetch_slots,
+        int64_t core_num, int64_t rank, int64_t world_size, bool use_udma,
+        torch::Tensor combine_workspace, int64_t hidden_size) {
+        TORCH_CHECK(rank == aclshmem_my_pe() && world_size == aclshmem_n_pes(),
+                    "planning topology must match the active SHMEM runtime");
+        return ascend_moonep::ops::Planning(topk_idx, dst, cu_seqlens, experts_to_copy,
+            dup_groups, dup_loffs, dup_counts, local_workspace,
+            symmetric_workspace_addr, symmetric_workspace_bytes,
+            num_tokens, num_topk, num_experts, num_max_tokens_per_rank,
+            num_prefetch_slots, core_num, rank, world_size, use_udma,
+            combine_workspace, hidden_size);
+    }
+
+    torch::Tensor prepare_combine_plan(
+        torch::Tensor workspace, torch::Tensor dst, torch::Tensor groups,
+        torch::Tensor dups, torch::Tensor counts,
+        int64_t S, int64_t H, int64_t K, int64_t R, int64_t rank) {
+        TORCH_CHECK(rank == aclshmem_my_pe() && R == aclshmem_n_pes(),
+                    "planning topology must match the active SHMEM runtime");
+        return ascend_moonep::ops::PlanningPrepareCombinePlan(
+            workspace, dst, groups, dups, counts, S, H, K, R, rank);
+    }
 
     int64_t symmetric_workspace_bytes(
         int64_t num_experts,
@@ -399,30 +386,57 @@ public:
     }
 };
 
-// Buffer-facing UDMA combine. Inputs are symmetric; gather scratch is an
-// ordinary rank-local NPU tensor cached by this class instance.
+// Buffer-facing UDMA combine. Inputs and gather workspace are symmetric tensors
+// owned by Buffer; this custom class is intentionally stateless.
 class CombineUrma : public torch::jit::CustomClassHolder {
 public:
     CombineUrma() = default;
+    ~CombineUrma() override = default;
 
-    ~CombineUrma() override {
-        try {
-            destroy();
-        } catch (...) {
-        }
-    }
+    void destroy() {}
 
-    void destroy() {
-        if (local_workspace_.defined()) {
-            SynchronizeCurrentNpuStream();
-            local_workspace_ = torch::Tensor();
-        }
+    void compute_prepared(
+        torch::Tensor hidden, c10::optional<torch::Tensor> weights,
+        torch::Tensor sync, torch::Tensor workspace,
+        torch::Tensor dst, torch::Tensor groups, torch::Tensor dups, torch::Tensor counts,
+        torch::Tensor out, c10::optional<torch::Tensor> outw, torch::Tensor plan,
+        int64_t S, int64_t H, int64_t K, int64_t R, int64_t rank) {
+        TORCH_CHECK(rank == aclshmem_my_pe() && R == aclshmem_n_pes(),
+                    "plan topology must match the active SHMEM runtime");
+        ascend_moonep::ops::MoonEPUdmaCombine(hidden, weights, sync, dst, groups,
+            dups, counts, out, outw, S, H, K, R, rank, workspace, plan);
     }
 
     void compute(
         torch::Tensor hidden_nvsh,
         c10::optional<torch::Tensor> route_weights_nvs,
         torch::Tensor sync_buffer,
+        torch::Tensor combine_workspace,
+        torch::Tensor dst,
+        torch::Tensor dup_groups,
+        torch::Tensor dup_loffs,
+        torch::Tensor dup_counts,
+        torch::Tensor output_sh,
+        c10::optional<torch::Tensor> output_sk,
+        int64_t S,
+        int64_t H,
+        int64_t K,
+        int64_t R,
+        int64_t rank) {
+        compute_impl(
+            hidden_nvsh, route_weights_nvs, sync_buffer, combine_workspace, dst,
+            dup_groups, dup_loffs, dup_counts, output_sh, output_sk,
+            S, H, K, R, rank);
+    }
+
+
+
+private:
+    void compute_impl(
+        torch::Tensor hidden_nvsh,
+        c10::optional<torch::Tensor> route_weights_nvs,
+        torch::Tensor sync_buffer,
+        torch::Tensor combine_workspace,
         torch::Tensor dst,
         torch::Tensor dup_groups,
         torch::Tensor dup_loffs,
@@ -440,23 +454,6 @@ public:
         TORCH_CHECK(
             R == aclshmem_n_pes(),
             "world size does not match the active CANN-SHMEM runtime");
-        const std::size_t workspace_bytes =
-            MoonEPUdmaCombineWorkspaceBytes(S, H, K, R);
-        const bool replace_workspace =
-            !local_workspace_.defined() ||
-            local_workspace_.device() != hidden_nvsh.device() ||
-            static_cast<std::size_t>(local_workspace_.numel()) < workspace_bytes;
-        if (replace_workspace) {
-            if (local_workspace_.defined()) {
-                SynchronizeCurrentNpuStream();
-            }
-            local_workspace_ = torch::empty(
-                {static_cast<int64_t>(workspace_bytes)},
-                torch::TensorOptions()
-                    .device(hidden_nvsh.device())
-                    .dtype(torch::kUInt8));
-        }
-
         ascend_moonep::ops::MoonEPUdmaCombine(
             hidden_nvsh,
             route_weights_nvs,
@@ -472,11 +469,8 @@ public:
             K,
             R,
             rank,
-            local_workspace_);
+            combine_workspace);
     }
-
-private:
-    torch::Tensor local_workspace_;
 };
 
 }  // namespace ascend_moonep::torch_classes
@@ -511,6 +505,8 @@ static auto planning_registry =
         .def(
             "local_workspace_elements",
             &ascend_moonep::torch_classes::Planning::local_workspace_elements)
+        .def("prepare_combine_plan", &ascend_moonep::torch_classes::Planning::prepare_combine_plan)
+        .def("compute_fused", &ascend_moonep::torch_classes::Planning::compute_fused)
         .def("compute", &ascend_moonep::torch_classes::Planning::compute);
 
 static auto dispatch_registry =
@@ -527,5 +523,7 @@ static auto combine_registry =
 static auto combine_urma_registry =
     torch::jit::class_<ascend_moonep::torch_classes::CombineUrma>("AscendMoonEP", "CombineUrma")
         .def(torch::jit::init<>())
+        .def("compute_prepared", &ascend_moonep::torch_classes::CombineUrma::compute_prepared)
+
         .def("compute", &ascend_moonep::torch_classes::CombineUrma::compute)
         .def("destroy", &ascend_moonep::torch_classes::CombineUrma::destroy);

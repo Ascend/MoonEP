@@ -294,6 +294,7 @@ def build_route_reference(
     alloc_cumsum: torch.Tensor,
     expert_offsets: torch.Tensor,
     NvS: int,
+    dedup_mode: str = "rank",
 ):
     world_size, num_tokens, num_topk = (int(v) for v in topk.shape)
     route_count = num_tokens * num_topk
@@ -349,10 +350,12 @@ def build_route_reference(
 
     raw_dst = raw_dst_flat.reshape(world_size, num_tokens, num_topk)
     dest_ranks = torch.div(raw_dst, NvS, rounding_mode="floor")
+    # Server mode picks the first route within the 8-rank dedup domain; rank mode keeps single-card dedup.
+    dedup_domains = torch.div(dest_ranks, 8, rounding_mode="floor") if dedup_mode == "server" else dest_ranks
     duplicate_mask = torch.zeros_like(dest_ranks, dtype=torch.bool)
     for kidx in range(1, num_topk):
         duplicate_mask[:, :, kidx] = (
-            dest_ranks[:, :, :kidx] == dest_ranks[:, :, kidx:kidx + 1]
+            dedup_domains[:, :, :kidx] == dedup_domains[:, :, kidx:kidx + 1]
         ).any(dim=2)
     dst = torch.where(duplicate_mask, -raw_dst - 1, raw_dst)
     return order, raw_dst, dst
@@ -362,12 +365,52 @@ def build_dup_reference_for_rank(
     raw_dst_by_route: torch.Tensor,
     NvS: int,
     dup_rank: int,
+    dedup_mode: str = "rank",
 ):
     world_size = int(raw_dst_by_route.shape[0])
     if dup_rank < 0 or dup_rank >= world_size:
         raise ValueError(f"dup_rank must be in [0, {world_size}), got {dup_rank}")
 
     dest_ranks = torch.div(raw_dst_by_route, NvS, rounding_mode="floor")
+    # The first same-server route of each source token decides the primary card; secondary keeps the full destination
+    # encoding.
+    if dedup_mode == "server":
+        domains = torch.div(dest_ranks, 8, rounding_mode="floor")
+        first_routes = torch.ones_like(domains, dtype=torch.bool)
+        # Later routes in the same domain are marked secondary; the primary must be this card first route.
+        for kidx in range(1, domains.shape[2]):
+            first_routes[:, :, kidx] = (
+                domains[:, :, :kidx] != domains[:, :, kidx:kidx + 1]
+            ).all(dim=2)
+        primary_mask = first_routes & (dest_ranks == dup_rank)
+        primary_indices = primary_mask.to(torch.int64).argmax(dim=2)
+        primary_domains = domains.gather(2, primary_indices.unsqueeze(2))
+        later_routes = torch.arange(domains.shape[2]).view(1, 1, -1) > primary_indices.unsqueeze(2)
+        duplicate_mask = primary_mask.any(dim=2).unsqueeze(2) & (domains == primary_domains) & later_routes
+        duplicate_counts_by_token = duplicate_mask.sum(dim=2)
+        valid_groups = duplicate_counts_by_token > 0
+        duplicate_counts = duplicate_counts_by_token[valid_groups]
+        group_count = int(duplicate_counts.numel())
+        loff_count = int(duplicate_counts.sum().item())
+        if group_count > NvS or loff_count > 8 * NvS:
+            raise ValueError(f"server-dup reference exceeds capacity: groups={group_count}, loffs={loff_count}")
+
+        dup_groups = torch.zeros((NvS, 3), dtype=torch.int32)
+        dup_loffs = torch.zeros(8 * NvS, dtype=torch.int32)
+        group_counts_by_source = valid_groups.sum(dim=1)
+        group_prefixes = group_counts_by_source.cumsum(dim=0) - group_counts_by_source
+        dup_counts = torch.cat((
+            torch.tensor((group_count, loff_count), dtype=torch.int64), group_prefixes,
+        )).to(torch.int32)
+        # Only the compact prefix is valid; P[src] records the first group position of that source.
+        if group_count > 0:
+            primary_raw = raw_dst_by_route.gather(2, primary_indices.unsqueeze(2)).squeeze(2)
+            dup_groups[:group_count, 0] = torch.remainder(primary_raw[valid_groups], NvS).to(torch.int32)
+            dup_groups[:group_count, 1] = (duplicate_counts.cumsum(dim=0) - duplicate_counts).to(torch.int32)
+            dup_groups[:group_count, 2] = duplicate_counts.to(torch.int32)
+            dup_loffs[:loff_count] = raw_dst_by_route[duplicate_mask].to(torch.int32)
+        return dup_groups, dup_loffs, dup_counts
+
     loffs = torch.remainder(raw_dst_by_route, NvS)
     local_mask = dest_ranks == dup_rank
     local_route_ordinals = local_mask.cumsum(dim=2)
@@ -409,6 +452,7 @@ def planning_reference(
     num_prefetch_slots: int,
     NvS: int,
     dup_rank: int,
+    dedup_mode: str = "rank",
 ) -> PlanningReference:
     topk = topk.detach().cpu().to(torch.int64).contiguous()
     if topk.ndim != 3:
@@ -425,6 +469,10 @@ def planning_reference(
         raise ValueError("current Ascend planning kernel requires B == E / R")
     if NvS < route_count:
         raise ValueError("NvS must be at least S * K")
+    if dedup_mode not in ("rank", "server"):
+        raise ValueError("dedup_mode must be rank or server")
+    if dedup_mode == "server" and (world_size % 8 != 0 or NvS != route_count):
+        raise ValueError("server dedup requires complete eight-rank servers and NvS == S*K")
 
     tpe = tokens_per_expert_from_topk(topk.to(torch.int32), num_experts).to(torch.int64)
     tpe_cumsum = tpe.cumsum(dim=0)
@@ -526,6 +574,7 @@ def planning_reference(
         alloc_cumsum,
         expert_offsets,
         NvS,
+        dedup_mode,
     )
     raw_dst = raw_dst_3d.reshape(world_size, route_count)
 
@@ -533,6 +582,7 @@ def planning_reference(
         raw_dst_3d,
         NvS,
         dup_rank,
+        dedup_mode,
     )
 
     return PlanningReference(

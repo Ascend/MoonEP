@@ -1,7 +1,8 @@
-"""Plan-driven fused MoonEP dispatch test.
+"""MoonEP Dispatch accuracy test: uses either a handcrafted plan or a plan produced by the real Planning operator.
 
-The test generates planning outputs directly, so the dispatch kernel does not
-read src_info or build dedup tables.
+``--plan-source golden`` (default) builds the plan on the CPU and checks Dispatch single-operator accuracy.
+``--plan-source kernel`` generates the plan with the real Planning operator, then checks Planning -> Dispatch.
+Both sources support ``--dedup-mode rank|server``.
 
 By default all R ranks are spawned on one host. For multi-node runs, launch this
 script once per node with the same bootstrap endpoint, then pass a unique
@@ -22,7 +23,6 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from kernel_test_utils import init_shmem
 import argparse
 import os
 import random
@@ -108,12 +108,12 @@ def validate_args(args) -> None:
         raise ValueError(f"H is too large for UB row buffer: H*2={args.H * 2} > {MAX_UB_ROW_BYTES}")
     if args.R * args.S * args.K >= 2**31:
         raise ValueError("R*S*K must fit in positive int32 dst encoding")
-    if args.profile and args.mode != "kernel":
-        raise ValueError("--profile requires --mode kernel")
-    if args.profile_iters <= 0:
-        raise ValueError("profile-iters must be positive")
-    if args.profile_warmup < 0:
-        raise ValueError("profile-warmup must be non-negative")
+    if args.plan_source == "kernel" and args.mode != "kernel":
+        raise ValueError("--plan-source kernel requires --mode kernel")
+    if args.dedup_mode == "server" and args.R % 8 != 0:
+        raise ValueError("server dedup requires a complete eight-rank server")
+    if args.dedup_mode == "server" and args.K < 2:
+        raise ValueError("server dedup accuracy requires K >= 2 to exercise forwarding")
     needs_master_endpoint = args.bootstrap == "uid" or not args.shmem_ip_port
     if needs_master_endpoint:
         if not args.master_addr:
@@ -184,12 +184,14 @@ def expected_weight(src_rank: int, token_id: int, topk_id: int, args) -> float:
     return float((base + local_route).item())
 
 
-def make_plan(args, local_rank: int):
+def make_raw_destinations(args) -> torch.Tensor:
+    """Build the not-yet-deduplicated global destination slot permutation, the shared input of the plan and the output checks."""
     slots = num_output_slots(args)
     total_routes = args.R * slots
 
+    # cyclic keeps the cyclic permutation; random uses a fixed-seed global random permutation.
     if getattr(args, "plan_mode", "random") == "cyclic":
-        # Cyclic order-preserving distribution (the source repo's golden.py default): target_slot == source_slot,
+        # Cyclic order-preserving distribution: target_slot == source_slot,
         # target_rank = (src_rank - ((token + topk) % R) + R) % R.
         # Global route index global_idx = src_rank*slots + token*K + topk,
         # and each route's dst = target_rank*slots + slot (unique destination slot -> a global permutation).
@@ -211,6 +213,13 @@ def make_plan(args, local_rank: int):
             generator=generator,
             dtype=torch.int32,
         )
+    return destination_by_route
+
+
+def make_plan(args, local_rank: int):
+    slots = num_output_slots(args)
+    server_dedup = getattr(args, "dedup_mode", "rank") == "server"
+    destination_by_route = make_raw_destinations(args)
 
     # Build this source rank's dst directly from its contiguous route slice.
     source_start = local_rank * slots
@@ -220,11 +229,13 @@ def make_plan(args, local_rank: int):
         slots,
         rounding_mode="floor",
     ).reshape(args.S, args.K)
+    # Within a token, only the first positively encoded route to a target rank or server is kept.
+    dedup_domains = local_dest_ranks // 8 if server_dedup else local_dest_ranks
     canonical = torch.ones((args.S, args.K), dtype=torch.bool)
+    # Later routes in the same domain are negatively encoded and left to the duplicate expansion stage.
     for topk_id in range(1, args.K):
         canonical[:, topk_id] = torch.all(
-            local_dest_ranks[:, :topk_id]
-            != local_dest_ranks[:, topk_id].unsqueeze(1),
+            dedup_domains[:, :topk_id] != dedup_domains[:, topk_id].unsqueeze(1),
             dim=1,
         )
     dst_local = torch.where(
@@ -259,9 +270,15 @@ def make_plan(args, local_rank: int):
         token_id, topk_id = divmod(route_in_rank, args.K)
         expected_local[loff] = RouteEntry(src_rank, token_id, topk_id)
 
-    # Sorting source route ids orders rows by (src_rank, token_id, topk_id),
-    # giving the deterministic group and duplicate ordering carried by plan.
-    sorted_source_routes, sorted_loffs = torch.sort(received_source_routes)
+    # server expansion needs every route of this server; the source index order also fixes primary and the source
+    # prefix.
+    if server_dedup:
+        server_start = (local_rank // 8) * 8 * slots
+        server_mask = (destination_by_route >= server_start) & (destination_by_route < server_start + 8 * slots)
+        sorted_source_routes = torch.nonzero(server_mask, as_tuple=False).reshape(-1)
+        sorted_loffs = destination_by_route[sorted_source_routes]
+    else:
+        sorted_source_routes, sorted_loffs = torch.sort(received_source_routes)
     global_tokens = torch.div(
         sorted_source_routes,
         args.K,
@@ -273,6 +290,9 @@ def make_plan(args, local_rank: int):
     )
     token_starts = torch.cumsum(token_counts, dim=0) - token_counts
     duplicate_groups = token_counts > 1
+    # Each server group belongs only to the card hosting the primary; secondary keeps the full destination encoding.
+    if server_dedup:
+        duplicate_groups &= sorted_loffs[token_starts] // slots == local_rank
     group_counts = token_counts[duplicate_groups]
     group_starts = token_starts[duplicate_groups]
     duplicate_counts = group_counts - 1
@@ -281,23 +301,62 @@ def make_plan(args, local_rank: int):
     dup_groups_local = torch.full((slots, 3), -1, dtype=torch.int32)
     group_count = int(group_counts.numel())
     if group_count > 0:
-        dup_groups_local[:group_count, 0] = sorted_loffs[group_starts].to(torch.int32)
+        dup_groups_local[:group_count, 0] = (sorted_loffs[group_starts] % slots).to(torch.int32)
         dup_groups_local[:group_count, 1] = duplicate_starts.to(torch.int32)
         dup_groups_local[:group_count, 2] = duplicate_counts.to(torch.int32)
 
-    duplicate_members = torch.zeros(slots, dtype=torch.bool)
-    if slots > 1:
-        duplicate_members[1:] = global_tokens[1:] == global_tokens[:-1]
+    duplicate_members = torch.repeat_interleave(duplicate_groups, token_counts)
+    duplicate_members[token_starts] = False
     duplicate_loffs = sorted_loffs[duplicate_members].to(torch.int32)
     duplicate_count = int(duplicate_loffs.numel())
-    dup_loffs_local = torch.full((slots,), -1, dtype=torch.int32)
+    dup_capacity = 8 * slots if server_dedup else slots
+    dup_loffs_local = torch.full((dup_capacity,), -1, dtype=torch.int32)
     dup_loffs_local[:duplicate_count] = duplicate_loffs
     dup_counts_local = torch.tensor(
         [group_count, duplicate_count],
         dtype=torch.int32,
     )
+    # P[src] is the start of this card groups for each source, letting server forwarding wait on that source rank
+    # completion flag.
+    if server_dedup:
+        group_sources = global_tokens[group_starts] // args.S
+        groups_per_source = torch.bincount(group_sources, minlength=args.R)
+        source_prefixes = groups_per_source.cumsum(dim=0) - groups_per_source
+        dup_counts_local = torch.cat((dup_counts_local, source_prefixes.to(torch.int32)))
 
     return dst_local, dup_groups_local, dup_loffs_local, dup_counts_local, expected_local
+
+
+def make_planning_topk(args) -> torch.Tensor:
+    """Build a balanced topk that contains cross-card same-server routes, ensuring the server forwarding path is covered."""
+    group_width = 8 if args.R % 8 == 0 else args.R
+    num_servers = args.R // group_width
+    experts_per_rank = num_experts(args) // args.R
+    src_ranks = torch.arange(args.R, dtype=torch.int32).view(-1, 1, 1)
+    tokens = torch.arange(args.S, dtype=torch.int32).view(1, -1, 1)
+    topk_ids = torch.arange(args.K, dtype=torch.int32).view(1, 1, -1)
+    dest_servers = (src_ranks // group_width + tokens % num_servers) % num_servers
+    dest_ranks = dest_servers * group_width + (tokens + topk_ids) % group_width
+    local_experts = (tokens // num_servers + topk_ids // group_width) % experts_per_rank
+    return (dest_ranks * experts_per_rank + local_experts).contiguous()
+
+
+def expected_from_raw_dst(raw_dst: torch.Tensor, rank: int, args) -> dict[int, RouteEntry]:
+    """Invert the raw destination addresses of the independent CPU reference into all source routes this card should receive."""
+    slots = num_output_slots(args)
+    raw = raw_dst.reshape(-1).to(torch.int64)
+    source_routes = torch.nonzero(raw // slots == rank, as_tuple=False).reshape(-1)
+    local_loffs = raw[source_routes] % slots
+    if source_routes.numel() != slots or not torch.equal(torch.sort(local_loffs).values, torch.arange(slots)):
+        raise AssertionError(f"rank={rank} CPU reference did not cover every output slot exactly once")
+
+    expected = {}
+    # Recover source rank, token, and topk from the raw route index; never use the operator dst as the answer.
+    for loff, source_route in zip(local_loffs.tolist(), source_routes.tolist()):
+        src_rank, local_route = divmod(source_route, slots)
+        token_id, topk_id = divmod(local_route, args.K)
+        expected[loff] = RouteEntry(src_rank, token_id, topk_id)
+    return expected
 
 
 def selected_loffs(expected_for_rank: dict[int, RouteEntry], args) -> list[int]:
@@ -308,64 +367,6 @@ def selected_loffs(expected_for_rank: dict[int, RouteEntry], args) -> list[int]:
     return sorted(rng.sample(loffs, args.max_checks))
 
 
-def collect_dispatch_profile(args, rank: int, shmem, dispatch_once):
-    import torch_npu
-    import torch_npu.profiler
-
-    profile_dir = os.path.abspath(os.path.join(args.profile_dir, f"rank_{rank}"))
-    os.makedirs(profile_dir, exist_ok=True)
-
-    hidden_out = None
-    weight_out = None
-    for _ in range(args.profile_warmup):
-        hidden_out, weight_out = dispatch_once()
-        torch_npu.npu.synchronize()
-
-    shmem.barrier()
-    experimental_config = torch_npu.profiler._ExperimentalConfig(
-        export_type=[torch_npu.profiler.ExportType.Text],
-        profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
-        msprof_tx=False,
-        aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
-        l2_cache=False,
-        op_attr=False,
-        data_simplification=False,
-        record_op_args=False,
-    )
-    with torch_npu.profiler.profile(
-        activities=[
-            torch_npu.profiler.ProfilerActivity.CPU,
-            torch_npu.profiler.ProfilerActivity.NPU,
-        ],
-        schedule=torch_npu.profiler.schedule(
-            wait=0,
-            warmup=0,
-            active=args.profile_iters,
-            repeat=1,
-            skip_first=0,
-        ),
-        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(profile_dir),
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
-        with_modules=False,
-        with_flops=False,
-        experimental_config=experimental_config,
-    ) as prof:
-        for _ in range(args.profile_iters):
-            hidden_out, weight_out = dispatch_once()
-            torch_npu.npu.synchronize()
-            prof.step()
-
-    shmem.barrier()
-    print(
-        f"[rank {rank}] profile saved: warmup={args.profile_warmup} "
-        f"active={args.profile_iters} path={profile_dir}",
-        flush=True,
-    )
-    return hidden_out, weight_out
-
-
 def validate_golden_plan(
     args,
     dst: torch.Tensor,
@@ -373,9 +374,13 @@ def validate_golden_plan(
     dup_loffs: torch.Tensor,
     dup_counts: torch.Tensor,
     expected: dict[int, RouteEntry],
+    *,
+    rank: int,
 ) -> None:
     slots = num_output_slots(args)
+    server_dedup = getattr(args, "dedup_mode", "rank") == "server"
     seen_destinations = set()
+    # Per token, check that only the first route in each dedup domain is positively encoded.
     for token_id in range(args.S):
         routes_by_dest = {}
         for topk_id in range(args.K):
@@ -385,7 +390,8 @@ def validate_golden_plan(
             if dest_rank >= args.R or raw in seen_destinations:
                 raise AssertionError(f"invalid or repeated dst entry at token={token_id}, topk={topk_id}")
             seen_destinations.add(raw)
-            routes_by_dest.setdefault(dest_rank, []).append((topk_id, encoded))
+            domain = dest_rank // 8 if server_dedup else dest_rank
+            routes_by_dest.setdefault(domain, []).append((topk_id, encoded))
         for members in routes_by_dest.values():
             members.sort()
             if members[0][1] < 0 or any(encoded >= 0 for _, encoded in members[1:]):
@@ -393,10 +399,45 @@ def validate_golden_plan(
 
     group_count = int(dup_counts[0])
     dup_count = int(dup_counts[1])
-    if not (0 <= group_count <= slots and 0 <= dup_count <= slots):
+    dup_capacity = 8 * slots if server_dedup else slots
+    if not (0 <= group_count <= slots and 0 <= dup_count <= dup_capacity):
         raise AssertionError(f"invalid dup_counts={dup_counts.tolist()}")
     if len(expected) != slots:
         raise AssertionError(f"expected {slots} populated rows, got {len(expected)}")
+
+    # server duplicates may span other cards of this server; verify full addresses and source prefixes against the raw
+    # routes.
+    if server_dedup:
+        raw_routes = make_raw_destinations(args).reshape(args.R, args.S, args.K)
+        server_routes = raw_routes // (8 * slots) == rank // 8
+        route_counts = server_routes.sum(dim=2)
+        first_routes = server_routes.to(torch.int64).argmax(dim=2)
+        primary_dst = raw_routes.gather(2, first_routes.unsqueeze(2)).squeeze(2)
+        owned_groups = (route_counts > 1) & (primary_dst // slots == rank)
+        group_tokens = torch.nonzero(owned_groups, as_tuple=False).tolist()
+        groups_per_source = owned_groups.sum(dim=1)
+        prefixes = groups_per_source.cumsum(dim=0) - groups_per_source
+        expected_counts = torch.cat((
+            torch.tensor([len(group_tokens), int((route_counts[owned_groups] - 1).sum())]), prefixes,
+        )).to(torch.int32)
+        if not torch.equal(dup_counts, expected_counts):
+            raise AssertionError("server dup_counts or source prefixes do not match raw routes")
+        dup_start = 0
+        # Replay the full destination addresses of same-source tokens per group, covering cross-card duplicates,
+        # ordering, and the compact prefix.
+        for gid, (src, token) in enumerate(group_tokens):
+            members = raw_routes[src, token][server_routes[src, token]].tolist()
+            primary, start, count = map(int, dup_groups[gid].tolist())
+            expected_group = (members[0] % slots, dup_start, len(members) - 1)
+            if (primary, start, count) != expected_group:
+                raise AssertionError(f"server group {gid} does not match raw routes")
+            entry = expected[primary]
+            if (entry.src_rank, entry.token_id, entry.topk_id) != (src, token, int(first_routes[src, token])):
+                raise AssertionError(f"server group {gid} primary points to a different source token")
+            if dup_loffs[start:start + count].tolist() != members[1:]:
+                raise AssertionError(f"server group {gid} duplicate destinations do not match raw routes")
+            dup_start += count
+        return
 
     consumed_loffs = set()
     for gid in range(group_count):
@@ -438,7 +479,7 @@ def run_rank(local_rank: int, args) -> None:
 
     if args.mode == "golden":
         dst, dup_groups, dup_loffs, dup_counts, expected = make_plan(args, rank)
-        validate_golden_plan(args, dst, dup_groups, dup_loffs, dup_counts, expected)
+        validate_golden_plan(args, dst, dup_groups, dup_loffs, dup_counts, expected, rank=rank)
         print(
             f"[rank {rank}] golden plan validated: groups={int(dup_counts[0])} "
             f"dups={int(dup_counts[1])} checked_rows={len(selected_loffs(expected, args))}",
@@ -447,6 +488,7 @@ def run_rank(local_rank: int, args) -> None:
         return
 
     import torch_npu
+    from kernel_test_utils import init_shmem
     from npu_patch._device import local_device_index
     from npu_patch import (
         Buffer,
@@ -454,6 +496,9 @@ def run_rank(local_rank: int, args) -> None:
         ShmemRuntime,
     )
     from npu_patch.dispatch import launch_dispatch, materialize_dispatch_outputs
+    from npu_patch.launchers import launch_planning
+    from npu_patch.planning import allocate_planning_outputs
+    from mte.test_planning import assert_dup_plan_equal, assert_tensor_equal, planning_reference
 
     # Must come *after* the import above: a function-local ``import`` makes the
     # name local to this whole scope, so any earlier call would raise
@@ -515,7 +560,6 @@ def run_rank(local_rank: int, args) -> None:
         hidden_shared = ctx["hidden_buf_local"]
         weights_shared = ctx["weights_buf_local"].view(torch.float32)
 
-        dst, dup_groups, dup_loffs, dup_counts, expected = make_plan(args, rank)
         hidden = make_hidden(rank, args)
         hidden_npu = hidden.to(device=f"npu:{device_id}")
         weights_npu = None
@@ -523,25 +567,39 @@ def run_rank(local_rank: int, args) -> None:
             weights_npu = make_weights(rank, args).to(device=f"npu:{device_id}")
         device = hidden_npu.device
 
-        plan = MoonEPCommPlan(
-            dst=dst.to(device=device),
-            experts_to_copy=torch.full(
-                (args.R, B), -1, dtype=torch.int32, device=device
-            ),
-            zero_fill_ranges=torch.zeros(
-                (E + B, 2), dtype=torch.int32, device=device
-            ),
-            remote_stats=torch.zeros(2, dtype=torch.int32, device=device),
-            dup_groups=dup_groups.to(device=device),
-            dup_loffs=dup_loffs.to(device=device),
-            dup_counts=dup_counts.to(device=device),
-            N=num_output_slots(args),
-            R=args.R,
-            E=E,
-            B=B,
-            NvS=num_output_slots(args),
-            K=args.K,
-        )
+        # The real Planning uses the same topk input; an independent CPU reference checks the plan and the final data.
+        if args.plan_source == "kernel":
+            topk_all = make_planning_topk(args)
+            reference = planning_reference(topk_all, E, B, num_output_slots(args), rank, args.dedup_mode)
+            expected = expected_from_raw_dst(reference.raw_dst, rank, args)
+            plan, cu_seqlens = allocate_planning_outputs(ctx, dedup_mode=args.dedup_mode)
+            topk_npu = topk_all[rank].reshape(-1).to(device=device)
+            tpe_npu = reference.tokens_per_expert[rank].to(device=device)
+            ShmemRuntime.barrier()
+            launch_planning(ctx, topk_npu, tpe_npu, cu_seqlens, plan)
+            torch_npu.npu.synchronize()
+            ShmemRuntime.barrier()
+            assert_tensor_equal(f"rank={rank}/dst", plan.dst, reference.dst[rank].reshape(-1))
+            assert_tensor_equal(f"rank={rank}/cu_seqlens", cu_seqlens, reference.cu_seqlens[rank])
+            assert_tensor_equal(f"rank={rank}/experts_to_copy", plan.experts_to_copy, reference.experts_to_copy)
+            assert_dup_plan_equal(
+                f"rank={rank}", plan.dup_groups, plan.dup_loffs, plan.dup_counts,
+                reference.dup_groups, reference.dup_loffs, reference.dup_counts,
+            )
+        else:
+            # The CPU golden directly builds rank/server plans, verifying Dispatch independently.
+            dst, dup_groups, dup_loffs, dup_counts, expected = make_plan(args, rank)
+            plan = MoonEPCommPlan(
+                dst=dst.to(device=device),
+                experts_to_copy=torch.full((args.R, B), -1, dtype=torch.int32, device=device),
+                zero_fill_ranges=torch.zeros((E + B, 2), dtype=torch.int32, device=device),
+                remote_stats=torch.zeros(2, dtype=torch.int32, device=device),
+                dup_groups=dup_groups.to(device=device),
+                dup_loffs=dup_loffs.to(device=device),
+                dup_counts=dup_counts.to(device=device),
+                N=num_output_slots(args), R=args.R, E=E, B=B,
+                NvS=num_output_slots(args), K=args.K,
+            )
 
         if args.clear_symmetric:
             hidden_shared.zero_()
@@ -551,19 +609,6 @@ def run_rank(local_rank: int, args) -> None:
         launch_dispatch(ctx, hidden_npu, weights_npu, plan)
         torch_npu.npu.synchronize()
         ShmemRuntime.barrier()
-
-        if args.profile:
-            def profile_dispatch_once():
-                launch_dispatch(ctx, hidden_npu, weights_npu, plan)
-                return materialize_dispatch_outputs(
-                    ctx,
-                    with_weights=weights_npu is not None,
-                    zero_copy=True,
-                )
-
-            collect_dispatch_profile(
-                args, rank, ShmemRuntime, profile_dispatch_once
-            )
 
         for output_mode in selected_output_modes(args):
             zero_copy = output_mode == "zero-copy"
@@ -634,12 +679,21 @@ def run_rank(local_rank: int, args) -> None:
                 buffer.destroy()
             if dist.is_initialized():
                 dist.destroy_process_group()
+    # The real-Planning verdict labels the dedup domain separately, so multi-node summaries can cross-check the
+    # verification path.
+    if args.plan_source == "kernel":
+        print(f"[rank {rank}] Planning+Dispatch {args.dedup_mode} PASS", flush=True)
     print(f"[rank {rank}] MoonEPDispatch PASS", flush=True)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Plan-driven fused MoonEP dispatch test")
+    parser = argparse.ArgumentParser(description="MoonEP Planning/Dispatch accuracy test")
     parser.add_argument("--mode", choices=("golden", "kernel"), default="golden")
+    parser.add_argument(
+        "--plan-source", choices=("golden", "kernel"), default="golden",
+        help="golden: build the plan on CPU; kernel: the Planning operator generates the plan (both support rank/server)",
+    )
+    parser.add_argument("--dedup-mode", choices=("rank", "server"), default="rank")
     parser.add_argument(
         "--bootstrap",
         choices=("uid", "ipport"),
@@ -718,28 +772,6 @@ def parse_args():
         help="0 means check every populated local row; use a positive value for large shapes.",
     )
     parser.add_argument(
-        "--profile",
-        action="store_true",
-        help="collect an Ascend PyTorch profile for repeated dispatch iterations",
-    )
-    parser.add_argument(
-        "--profile-warmup",
-        type=int,
-        default=5,
-        help="number of unrecorded dispatch warmup iterations (default: 5)",
-    )
-    parser.add_argument(
-        "--profile-iters",
-        type=int,
-        default=20,
-        help="number of dispatch iterations recorded by the profiler (default: 20)",
-    )
-    parser.add_argument(
-        "--profile-dir",
-        default="dispatch_perf",
-        help="profile output directory, relative to the launch working directory by default",
-    )
-    parser.add_argument(
         "--active-qp-count",
         type=int,
         default=2,
@@ -752,7 +784,7 @@ def parse_args():
         default="random",
         help=(
             "plan distribution: random permutation (default) or cyclic ordered "
-            "(source repo golden.py default, target_slot == source_slot)"
+            "(target_slot == source_slot)"
         ),
     )
     return parser.parse_args()
@@ -784,9 +816,8 @@ def main():
         f"slots={num_output_slots(args)}, "
         f"with_weights={not args.no_weights}, output_mode={args.output_mode}, "
         f"clear_symmetric={args.clear_symmetric}, max_checks={args.max_checks}, "
-        f"profile={args.profile}, profile_warmup={args.profile_warmup}, "
-        f"profile_iters={args.profile_iters}, profile_dir={args.profile_dir}, "
-        f"active_qp_count={args.active_qp_count}, plan_mode={args.plan_mode}, "
+        f"active_qp_count={args.active_qp_count}, plan_source={args.plan_source}, "
+        f"dedup_mode={args.dedup_mode}, plan_mode={args.plan_mode}, "
         f"effective_shmem={effective_shmem_bytes(args)}, "
         f"shmem_ip_port={effective_shmem_ip_port(args) if args.bootstrap == 'ipport' else 'unused'}, "
         f"master={master_endpoint}, "

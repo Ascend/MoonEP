@@ -47,7 +47,8 @@ CheckedDispatchArgs CheckDispatchArgs(
     int64_t H,
     int64_t K,
     int64_t R,
-    int64_t rank) {
+    int64_t rank,
+    bool use_udma) {
 
     CheckNpuContiguous(hidden_sh, "hidden_sh");
     CheckNpuContiguous(dst, "dst");
@@ -118,12 +119,19 @@ CheckedDispatchArgs CheckDispatchArgs(
                 dup_groups.dim() == 2 &&
                 dup_groups.size(0) == NvS && dup_groups.size(1) == 3,
                 "dup_groups must be int32 [NvS, 3]");
+    // Detect the protocol from the counts length; server plans go only to the already-adapted UDMA operator.
+    const bool server_dedup = dup_counts.dim() == 1 && dup_counts.size(0) == R + 2;
+    TORCH_CHECK(!server_dedup || use_udma, "server dedup requires UDMA dispatch");
+    TORCH_CHECK(!server_dedup || R % kMoonEPDispatchRanksPerServer == 0,
+                "server dedup requires R divisible by 8");
+    const int64_t dup_capacity = server_dedup ? kMoonEPDispatchRanksPerServer * NvS : NvS;
+    const int64_t count_size = server_dedup ? R + 2 : 2;
     TORCH_CHECK(dup_loffs.scalar_type() == torch::kInt32 &&
-                dup_loffs.dim() == 1 && dup_loffs.size(0) == NvS,
-                "dup_loffs must be int32 [NvS]");
+                dup_loffs.dim() == 1 && dup_loffs.size(0) == dup_capacity,
+                "dup_loffs must be int32 [", dup_capacity, "] for the selected dup format");
     TORCH_CHECK(dup_counts.scalar_type() == torch::kInt32 &&
-                dup_counts.dim() == 1 && dup_counts.size(0) == 2,
-                "dup_counts must be int32 [2]");
+                dup_counts.dim() == 1 && dup_counts.size(0) == count_size,
+                "dup_counts must be int32 [2] or [R+2]");
     TORCH_CHECK(H % 8 == 0, "H must be multiple of 8");
     TORCH_CHECK(static_cast<uint64_t>(H) * 2 <= 128ull * 1024ull,
                 "H row bytes exceed MoonEP dispatch UB row capacity");
@@ -139,7 +147,7 @@ CheckedDispatchArgs CheckDispatchArgs(
     tiling.R = static_cast<uint32_t>(R);
     tiling.rank = static_cast<uint32_t>(rank);
     tiling.with_weights = with_weights ? 1u : 0u;
-    tiling.reserved = 0;
+    tiling.server_dedup = server_dedup ? 1u : 0u;
 
     return {route_weights_arg, route_weights_buf_arg, tiling};
 }
@@ -174,7 +182,7 @@ MoonEPDispatch(
 
     auto args = CheckDispatchArgs(
         hidden_sh, route_weights, dst, dup_groups, dup_loffs, dup_counts,
-        hidden_buf, route_weights_buf, S, H, K, R, rank);
+        hidden_buf, route_weights_buf, S, H, K, R, rank, use_udma);
 
     if (use_udma) {
         LaunchMoonEPDispatchUdmaKernel(
@@ -212,7 +220,7 @@ MoonEPDispatchProfile(
 
     auto args = CheckDispatchArgs(
         hidden_sh, route_weights, dst, dup_groups, dup_loffs, dup_counts,
-        hidden_buf, route_weights_buf, S, H, K, R, rank);
+        hidden_buf, route_weights_buf, S, H, K, R, rank, use_udma);
     CheckNpuContiguous(profile_cycles, "profile_cycles");
     CheckSameDevice(profile_cycles, hidden_sh, "profile_cycles");
 

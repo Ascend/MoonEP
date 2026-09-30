@@ -48,7 +48,8 @@ void MoonEPUdmaCombine(
     int64_t K,
     int64_t R,
     int64_t rank,
-    torch::Tensor local_workspace) {
+    torch::Tensor local_workspace,
+    c10::optional<torch::Tensor> execution_plan) {
 
     CheckNpuContiguous(hidden_nvsh, "hidden_nvsh");
     CheckNpuContiguous(sync_buffer, "sync_buffer");
@@ -61,19 +62,23 @@ void MoonEPUdmaCombine(
                 "S/H/K/R must be positive");
     TORCH_CHECK(rank >= 0 && rank < R, "rank must be in [0, R)");
     TORCH_CHECK(K <= 16, "K must be <= 16");
+    constexpr int64_t kSmallWorldGroupWidth = 8;
+    constexpr int64_t kTwoFrameWorldSize = 128;
     constexpr int64_t kMaxGroupWidth = 16;
     TORCH_CHECK(
         R == 1 ||
             (R % 2 == 0 &&
-             (R <= kMaxGroupWidth || R % kMaxGroupWidth == 0)),
-        "grouped MoonEP UDMA combine requires R=1, an even R<=16, "
-        "or an R divisible by 16");
-    constexpr int64_t kHiddenUbBytes = 128 * 1024;
-    constexpr int64_t kFullRowDbBytesPerElement = 16;
+             ((R < kTwoFrameWorldSize &&
+               (R <= kSmallWorldGroupWidth ||
+                R % kSmallWorldGroupWidth == 0)) ||
+              (R >= kTwoFrameWorldSize && R % kMaxGroupWidth == 0))),
+        "grouped MoonEP UDMA combine requires R=1, an even R<=8, "
+        "an R<128 divisible by 8, or an R>=128 divisible by 16");
+    constexpr uint64_t kMaxTokenBytes = 8ULL * 1024ULL * 1024ULL;
     TORCH_CHECK(
-        H <= kHiddenUbBytes / kFullRowDbBytesPerElement,
-        "MoonEP UDMA combine requires H<=8192 so its full-row "
-        "double buffer fits in 128 KiB of UB");
+        static_cast<uint64_t>(H) <=
+            kMaxTokenBytes / sizeof(c10::BFloat16),
+        "MoonEP UDMA combine requires one bf16 token row to be <=8 MiB");
     TORCH_CHECK(static_cast<uint64_t>(S) <= std::numeric_limits<uint32_t>::max() &&
                 static_cast<uint64_t>(H) <= std::numeric_limits<uint32_t>::max() &&
                 static_cast<uint64_t>(K) <= std::numeric_limits<uint32_t>::max() &&
@@ -85,8 +90,10 @@ void MoonEPUdmaCombine(
                 "S*K must fit in uint32");
     TORCH_CHECK(num_output_slots_u64 <= std::numeric_limits<uint32_t>::max() / 3,
                 "S*K is too large for dup_groups indexing");
-    TORCH_CHECK(static_cast<uint64_t>(R) * num_output_slots_u64 < (1ull << 31),
-                "MoonEP combine requires R*NvS to fit in positive int32 encoding");
+    TORCH_CHECK(num_output_slots_u64 <= std::numeric_limits<uint32_t>::max() / 8,
+                "S*K is too large for contiguous 8*N contributor scratch indexing");
+    TORCH_CHECK(static_cast<uint64_t>(R) * num_output_slots_u64 < (1ull << 30),
+                "PUT combine requires R*NvS < 2^30 for disjoint route tags");
     const int64_t NvS = static_cast<int64_t>(num_output_slots_u64);
 
     TORCH_CHECK(hidden_nvsh.dim() == 2, "hidden_nvsh must be [NvS, H]");
@@ -98,9 +105,13 @@ void MoonEPUdmaCombine(
     CheckSameDevice(sync_buffer, hidden_nvsh, "sync_buffer");
     TORCH_CHECK(sync_buffer.scalar_type() == torch::kUInt8,
                 "sync_buffer must be uint8");
-    constexpr uint64_t kGroupSyncBytesPerRank = 16ULL * 2ULL * 512ULL;
+    constexpr uint64_t kGroupSignalBytesPerRank = 16ULL * 6ULL * 512ULL;
+    constexpr uint64_t kLocalAivSyncBytes = 16ULL * 4ULL * 512ULL;
+    const uint64_t required_sync_bytes =
+        static_cast<uint64_t>(R) * kGroupSignalBytesPerRank +
+        kLocalAivSyncBytes;
     TORCH_CHECK(static_cast<uint64_t>(sync_buffer.numel()) >=
-                    static_cast<uint64_t>(R) * kGroupSyncBytesPerRank,
+                    required_sync_bytes,
                 "sync_buffer is too small for grouped combine");
     CheckSameDevice(dup_groups, hidden_nvsh, "dup_groups");
     CheckSameDevice(dup_loffs, hidden_nvsh, "dup_loffs");
@@ -137,12 +148,29 @@ void MoonEPUdmaCombine(
                 dup_groups.dim() == 2 &&
                 dup_groups.size(0) == NvS && dup_groups.size(1) == 3,
                 "dup_groups must be int32 [NvS, 3]");
+    // Server plans store full rank*NvS+loff addresses for same-server
+    // secondaries. Preserve the compact rank-plan format alongside them.
+    const bool server_dedup =
+        dup_counts.dim() == 1 && dup_counts.size(0) == R + 2;
+    TORCH_CHECK(!server_dedup || R % kMoonEPDispatchRanksPerServer == 0,
+                "server dedup combine requires R divisible by 8");
+    TORCH_CHECK(
+        !server_dedup || num_output_slots_u64 <= kMoonEPServerDupRouteLimit,
+        "server dedup source route exceeds packed route capacity");
+    TORCH_CHECK(
+        !server_dedup ||
+            static_cast<uint64_t>(R) * num_output_slots_u64 < (1ULL << 30),
+        "server dedup requires R*NvS < 2^30 for streamed-primary dst encoding");
+    const int64_t dup_capacity = server_dedup
+        ? kMoonEPDispatchRanksPerServer * NvS : NvS;
     TORCH_CHECK(dup_loffs.scalar_type() == torch::kInt32 &&
-                dup_loffs.dim() == 1 && dup_loffs.size(0) == NvS,
-                "dup_loffs must be int32 [NvS]");
+                dup_loffs.dim() == 1 && dup_loffs.size(0) == dup_capacity,
+                "dup_loffs must be int32 [", dup_capacity,
+                "] for the selected dedup format");
     TORCH_CHECK(dup_counts.scalar_type() == torch::kInt32 &&
-                dup_counts.dim() == 1 && dup_counts.size(0) == 2,
-                "dup_counts must be int32 [2]");
+                dup_counts.dim() == 1 &&
+                dup_counts.size(0) == (server_dedup ? R + 2 : 2),
+                "dup_counts must be int32 [2] or [R+2]");
     TORCH_CHECK(H % 8 == 0, "H must be multiple of 8");
     CheckNpuContiguous(local_workspace, "local_workspace");
     CheckSameDevice(local_workspace, hidden_nvsh, "local_workspace");
@@ -155,38 +183,27 @@ void MoonEPUdmaCombine(
         "MoonEP UDMA combine hidden workspace size overflows uint64_t");
     const uint64_t hidden_bytes =
         num_output_slots_u64 * static_cast<uint64_t>(H) * sizeof(c10::BFloat16);
-    const uint64_t weight_regions = static_cast<uint64_t>(R);
+    const uint64_t ready_bytes =
+        num_output_slots_u64 * sizeof(uint64_t);
+    const uint64_t scratch_bytes =
+        static_cast<uint64_t>(kCombinePutCores) *
+        kMoonEPUdmaCombineScratchTilesPerAiv *
+        kMoonEPUdmaCombineScratchTileElements * sizeof(c10::BFloat16);
     TORCH_CHECK(
-        num_output_slots_u64 <=
-            std::numeric_limits<uint64_t>::max() /
-                weight_regions / sizeof(float),
-        "MoonEP UDMA combine gathered weight workspace size overflows uint64_t");
-    const uint64_t weight_bytes =
-        weight_regions * num_output_slots_u64 * sizeof(float);
-    TORCH_CHECK(
-        hidden_bytes <=
-            std::numeric_limits<uint64_t>::max() - weight_bytes,
+        hidden_bytes <= std::numeric_limits<uint64_t>::max() - ready_bytes &&
+            hidden_bytes + ready_bytes <=
+                std::numeric_limits<uint64_t>::max() - scratch_bytes,
         "MoonEP UDMA combine workspace size overflows uint64_t");
-    const uint64_t bandwidth_alignment =
-        ascend_moonep::kMoonEPUdmaCombineBandwidthScratchAlign;
-    TORCH_CHECK(
-        hidden_bytes + weight_bytes <=
-            std::numeric_limits<uint64_t>::max() - (bandwidth_alignment - 1),
-        "MoonEP UDMA combine workspace alignment overflows uint64_t");
-    const uint64_t bandwidth_offset =
-        (hidden_bytes + weight_bytes + bandwidth_alignment - 1) &
-        ~(bandwidth_alignment - 1);
-    TORCH_CHECK(
-        bandwidth_offset <= std::numeric_limits<uint64_t>::max() -
-            ascend_moonep::kMoonEPUdmaCombineBandwidthScratchBytes,
-        "MoonEP UDMA combine bandwidth scratch size overflows uint64_t");
-    const uint64_t required_workspace_bytes = bandwidth_offset +
-        ascend_moonep::kMoonEPUdmaCombineBandwidthScratchBytes;
+    TORCH_CHECK(hidden_bytes <= (std::numeric_limits<uint64_t>::max() / 16U),
+                "PUT combine workspace payload size overflows uint64_t");
+    const uint64_t required_workspace_bytes = MakeCombinePutLayout(
+        static_cast<uint32_t>(NvS), static_cast<uint32_t>(H),
+        static_cast<uint32_t>(R)).bytes;
     const uint64_t local_workspace_bytes =
         static_cast<uint64_t>(local_workspace.numel()) *
         static_cast<uint64_t>(local_workspace.element_size());
     TORCH_CHECK(required_workspace_bytes <= local_workspace_bytes,
-                "local workspace is too small: need ",
+                "combine workspace is too small: need ",
                 required_workspace_bytes, " bytes, got ",
                 local_workspace_bytes, " bytes");
 
@@ -202,17 +219,28 @@ void MoonEPUdmaCombine(
     tiling.R = static_cast<uint32_t>(R);
     tiling.rank = static_cast<uint32_t>(rank);
     tiling.with_weights = with_weights ? 1u : 0u;
-    tiling.reserved = 0;
+    tiling.server_dedup = server_dedup ? 1u : 0u;
 
-    auto* workspace_ptr = static_cast<uint8_t*>(local_workspace.data_ptr());
-    void* bandwidth_scratch = workspace_ptr + bandwidth_offset;
+    TORCH_CHECK(execution_plan.has_value(), "UDMA combine requires the execution plan generated by PlanningOp");
+    if (execution_plan.has_value()) {
+        CheckNpuContiguous(*execution_plan, "execution_plan");
+        CheckSameDevice(*execution_plan, hidden_nvsh, "execution_plan");
+        const auto required = MakeCombineExecutionPlanLayout(NvS, R).bytes;
+        TORCH_CHECK(execution_plan->scalar_type() == torch::kUInt8 &&
+                    execution_plan->dim() == 1 &&
+                    static_cast<uint64_t>(execution_plan->numel()) == required,
+                    "execution_plan has wrong dtype/shape/layout");
+        TORCH_CHECK(!execution_plan->is_alias_of(local_workspace) &&
+                    !execution_plan->is_alias_of(hidden_nvsh) &&
+                    !execution_plan->is_alias_of(output_sh),
+                    "execution_plan must not alias mutable workspace/input/output");
+    }
 
-    LaunchMoonEPUdmaCombineKernel(
-        hidden_nvsh, route_weights_arg, sync_buffer, dst,
-        dup_groups, dup_loffs, dup_counts,
-        output_sh, output_sk_arg,
-        bandwidth_scratch,
-        tiling, local_workspace.data_ptr(), NextCombineMagic());
+
+    LaunchMoonEPUdmaCombinePlanKernel(
+        hidden_nvsh, route_weights_arg, dst, dup_groups, dup_loffs, dup_counts,
+        output_sh, output_sk_arg, local_workspace, *execution_plan,
+        tiling, NextCombineMagic());
 }
 
 }  // namespace ascend_moonep::ops

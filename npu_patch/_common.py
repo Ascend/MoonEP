@@ -24,6 +24,8 @@ import os
 
 import torch
 
+from .planning import RANKS_PER_SERVER
+
 from ._C import (
     acl_shmem_putmem,
     acl_shmem_getmem,
@@ -101,7 +103,28 @@ def planning_symmetric_workspace_nbytes(E: int, NvS: int, R: int) -> int:
     dup_payload_done_off = dup_rank_counts_off + 2 * R * align_elems
     dup_groups_off = dup_payload_done_off + align_up(R)
     dup_loffs_off = dup_groups_off + align_up(NvS * 3)
-    return (dup_loffs_off + align_up(NvS)) * 4
+    # Workspace serves both rank and server modes; the latter must hold secondary addresses for the whole board.
+    required_ints = dup_loffs_off + align_up(RANKS_PER_SERVER * NvS)
+    assert required_ints <= 2**31 - 1, "planning symmetric workspace exceeds int32 device offsets"
+    return required_ints * 4
+
+
+# Weight aggregation gives each source an exclusive inbox and each worker AIV an exclusive local staging.
+WEIGHT_AGG_REGION_BYTES = 256 * 1024
+WEIGHT_AGG_STAGING_AIVS = 16
+WEIGHT_AGG_STAGING_BYTES = 256 * 1024
+WEIGHT_AGG_DEBUG_BYTES = 1024
+
+
+def weight_agg_capacity_entries() -> int:
+    # Keep in sync with the kernel region header, segment header, and per-record byte size.
+    return (WEIGHT_AGG_REGION_BYTES - 64) // 8
+
+
+def dispatch_sync_buffer_nbytes(R: int) -> int:
+    # Region order matches the address computation in the Dispatch UDMA kernel.
+    return (R * 16 * 6 * 512 + 16 * 4 * 512 + R * WEIGHT_AGG_REGION_BYTES
+            + WEIGHT_AGG_STAGING_AIVS * WEIGHT_AGG_STAGING_BYTES + WEIGHT_AGG_DEBUG_BYTES)
 
 
 def compute_shmem_mem_size(
@@ -155,6 +178,9 @@ def compute_shmem_mem_size(
         + BARRIER_SLOTS * 4        # barrier_buf (int32)
         + R * 16 * 6 * 512         # dispatch_sync_buffer Token control region
         + 16 * 4 * 512             # four-round local sync region for 16 Token AIVs
+        + R * WEIGHT_AGG_REGION_BYTES
+        + WEIGHT_AGG_STAGING_AIVS * WEIGHT_AGG_STAGING_BYTES
+        + WEIGHT_AGG_DEBUG_BYTES
     )
     op_workspaces = planning_symmetric_workspace_nbytes(E, NvS, R) + 2 * op_ws_bytes
     grad_reduce = num_reduce_buffers * B * H * H_prime * _ELEM_SIZE[torch.float32]

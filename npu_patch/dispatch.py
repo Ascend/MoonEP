@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from .planning import MoonEPCommPlan
+from .planning import MoonEPCommPlan, RANKS_PER_SERVER
 
 
 def _check_tensor(
@@ -95,17 +95,25 @@ def _check_dispatch_inputs(
         torch.int32,
         hidden_sh.device,
     )
+    # The source prefix in counts marks the server protocol; rank plans keep their original capacity.
+    server_dedup = plan.dedup_mode == "server"
+    if server_dedup and R % RANKS_PER_SERVER != 0:
+        raise ValueError("server dedup requires R divisible by 8")
+    if server_dedup and not ctx.get("_dispatch_use_udma", False):
+        raise ValueError("server dedup requires UDMA dispatch")
+    dup_capacity = RANKS_PER_SERVER * NvS if server_dedup else NvS
+    count_size = R + 2 if server_dedup else 2
     _check_tensor(
         plan.dup_loffs,
         "plan.dup_loffs",
-        (NvS,),
+        (dup_capacity,),
         torch.int32,
         hidden_sh.device,
     )
     _check_tensor(
         plan.dup_counts,
         "plan.dup_counts",
-        (2,),
+        (count_size,),
         torch.int32,
         hidden_sh.device,
     )

@@ -340,7 +340,7 @@ aclrtPhysicalMemProp vmm_mem_prop(int64_t device_id) {
     aclrtPhysicalMemProp prop{};
     prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
     prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
-    prop.memAttr = ACL_HBM_MEM_HUGE;
+    prop.memAttr = ACL_HBM_MEM_HUGE1G;
     prop.location = aclrtMemLocation{
         static_cast<uint32_t>(device_id), ACL_MEM_LOCATION_TYPE_DEVICE};
     prop.reserve = 0;

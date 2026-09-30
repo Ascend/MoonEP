@@ -84,11 +84,13 @@ def launch_planning_op(
     core_num: int,
     rank: int,
     world_size: int,
-) -> None:
+    combine_workspace: torch.Tensor | None = None,
+    hidden_size: int = 0,
+) -> torch.Tensor | None:
     global _PLANNING
     if _PLANNING is None:
         _PLANNING = torch.classes.AscendMoonEP.Planning()
-    _PLANNING.compute(
+    args = (
         topk_idx,
         dst,
         cu_seqlens,
@@ -109,6 +111,10 @@ def launch_planning_op(
         world_size,
         _env_use_udma('planning'),
     )
+    if combine_workspace is not None:
+        return _PLANNING.compute_fused(*args, combine_workspace, hidden_size)
+    _PLANNING.compute(*args)
+    return None
 
 
 def launch_dispatch_op(
@@ -193,6 +199,7 @@ def launch_combine_op(
     hidden_buf: torch.Tensor,
     weight_buf: torch.Tensor | None,
     sync_buffer: torch.Tensor,
+    combine_workspace: torch.Tensor,
     dst: torch.Tensor,
     dup_groups: torch.Tensor,
     dup_loffs: torch.Tensor,
@@ -207,13 +214,17 @@ def launch_combine_op(
 ) -> None:
     """Select native/UDMA combine from the process environment."""
     global _COMBINE, _COMBINE_UDMA
-    if _env_use_udma("combine"):
+    use_udma = _env_use_udma("combine")
+    if not use_udma and tuple(dup_counts.shape) == (world_size + 2,):
+        raise RuntimeError("server dedup combine requires the UDMA backend")
+    if use_udma:
         if _COMBINE_UDMA is None:
             _COMBINE_UDMA = torch.classes.AscendMoonEP.CombineUrma()
         _COMBINE_UDMA.compute(
             hidden_buf,
             weight_buf,
             sync_buffer,
+            combine_workspace,
             dst,
             dup_groups,
             dup_loffs,

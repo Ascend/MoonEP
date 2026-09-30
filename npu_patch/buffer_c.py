@@ -49,6 +49,7 @@ _ELEM_SIZE = {
     torch.float32: 4,
     torch.bfloat16: 2,
     torch.int32: 4,
+    torch.int64: 8,
     torch.uint8: 1,
 }
 

@@ -414,3 +414,51 @@ NODES=2 NODE_RANK=1 MASTER_ADDR=192.168.1.10 bash npu_patch/benchmarks/run_bench
 # MoonEP vs torch.distributed all_to_all（同样支持 NODES/NODE_RANK 多机）
 bash npu_patch/benchmarks/run_bench.sh bench_vs_all2all.py
 ```
+
+## UDMA Dispatch 精度与性能测试
+
+完成前面的构建后，在仓库根目录执行。下面以 **8 节点 × 8 卡**为例，每个节点各运行一次，
+共用 `MASTER_ADDR`、`MASTER_PORT`，`NODE_RANK` 分别设置为 0～7。各节点需先加载 CANN 和 Python 环境。
+
+```bash
+export MASTER_ADDR="<node-0-address>"
+export MASTER_PORT=29500
+export NODE_RANK=0
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export SHMEM_IP_PORT="tcp://${MASTER_ADDR}:$((MASTER_PORT + 1))"
+```
+
+### 精度验证
+
+```bash
+python3 test_npu/urma/test_moonep_dispatch_udma_with_plan.py \
+    --mode kernel --bootstrap ipport --R 64 \
+    --nproc-per-node 8 --node-rank "$NODE_RANK" \
+    --shmem-ip-port "$SHMEM_IP_PORT" \
+    --S 8192 --K 16 --H 3584 --E 1024 \
+    --plan-source kernel --dedup-mode server \
+    --output-mode both --max-checks 0
+```
+
+- `--plan-source golden`：CPU 生成 plan，验证 Dispatch；`kernel`：验证 Planning + Dispatch。
+- `--dedup-mode rank|server`：分别按目标卡或连续八卡 server 去重；server 内需支持 MTE 转发。
+- 两组选项组合可验证 `golden/rank`、`golden/server`、`kernel/rank`、`kernel/server` 四种路径。
+- `--output-mode both --max-checks 0` 全量检查 copy 和 zero-copy 输出；所有 rank 应打印 `MoonEPDispatch PASS`，
+  所有节点应打印 `NODE <index> LOCAL RANKS PASS` 并正常退出。
+
+### 性能验证
+
+精度任务在所有节点结束后，再执行：
+
+```bash
+torchrun --nnodes 8 --nproc-per-node 8 --node-rank "$NODE_RANK" \
+    --master-addr "$MASTER_ADDR" --master-port "$MASTER_PORT" \
+    npu_patch/benchmarks/bench_dispatch_maxvio.py \
+    --engine urma --no-dist --dedup-mode server --ip-port "$SHMEM_IP_PORT" \
+    --tokens 8192 --topk 16 --hidden 3584 --experts 1024 \
+    --maxvios 0.2,1,10,20 --kernel-timing --out maxvio_server.csv
+```
+
+改为 `--dedup-mode rank --out maxvio_rank.csv` 可测 rank 去重。每档先运行 Planning，计时仅覆盖 Dispatch；
+`--kernel-timing` 额外输出模块耗时。rank 0 打印结果表并保存 CSV，模块耗时保留在其日志中。
+`--no-dist` 使用 CPU TCPStore 汇总统计，需允许其他节点连接 rank 0 的 `MASTER_PORT + 2` 端口。

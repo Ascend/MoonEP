@@ -24,6 +24,7 @@ from ._common import (
     BARRIER_SLOTS,
     OP_WS_BYTES_DEFAULT,
     cross_rank_barrier,
+    dispatch_sync_buffer_nbytes,
     record_streams,
 )
 from .buffer_c import (
@@ -43,11 +44,13 @@ from .ops import (
     PrefetchOp,
 )
 from .launchers import planning_workspace_sizes
+from .combine import combine_put_workspace_bytes
 from .shmem_runtime import ShmemRuntime
 
 logger = logging.getLogger(__name__)
 
-_COMBINE_SYNC_BYTES_PER_RANK = 16 * 2 * 512
+_COMBINE_SYNC_BYTES_PER_RANK = 16 * 6 * 512
+_COMBINE_LOCAL_AIV_SYNC_BYTES = 16 * 4 * 512
 
 def _is_ascend950(device: int, props) -> bool:
     names = [os.environ.get("SOC_VERSION", ""), os.environ.get("ASCEND_SOC_VERSION", ""),
@@ -123,14 +126,7 @@ def _log_context_buffer_size(ctx: dict) -> None:
     ))
     local_temp_bytes = tensor_nbytes(ctx['planning_workspace'])
     op_workspace_bytes = sum(op._ws_bytes for op in ctx['kernels'].values())
-    combine_udma_payload_bytes = (
-        int(ctx['NvS']) * int(ctx['H']) * torch.bfloat16.itemsize
-        + int(ctx['R']) * int(ctx['NvS']) * torch.float32.itemsize
-    )
-    combine_udma_local_workspace_bytes = (
-        (combine_udma_payload_bytes + 63) // 64 * 64
-        + 32 * 64
-    )
+    combine_udma_local_workspace_bytes = tensor_nbytes(ctx['combine_workspace'])
 
     log_lines = [
         "MoonEP-Ascend comm buffer sizes (per rank):",
@@ -143,7 +139,7 @@ def _log_context_buffer_size(ctx: dict) -> None:
         f"  meta_vars              : {format_nbytes(meta_vars_bytes)}",
         f"  local_temp             : {format_nbytes(local_temp_bytes)}",
         f"  op_symmetric_workspace : {format_nbytes(op_workspace_bytes)}",
-        f"  combine_udma_ws (lazy) : "
+        f"  combine_udma_workspace : "
         f"{format_nbytes(combine_udma_local_workspace_bytes)}",
         f"  total_shmem+local      : "
         f"{format_nbytes(hidden_chunk_bytes + meta_vars_bytes + local_temp_bytes + op_workspace_bytes + combine_udma_local_workspace_bytes)}",
@@ -232,6 +228,14 @@ def _create_context(
     # Buffer._ensure_shmem_views then maps each chunk to the symmetric
     # address the kernels use (not the source VA).
     # ================================================================
+    ctx_udma_flags = {'planning': False, 'dispatch': True, 'combine': True,
+                      'prefetch': True, 'grad_reduce': True}
+    requested_udma = {name: bool(use_udma) for name in ctx_udma_flags}
+    if udma_flags:
+        requested_udma.update({name: bool(value) for name, value in udma_flags.items()})
+    effective_udma = {name: bool(udma_supported and ctx_udma_flags[name] and requested_udma[name])
+                      for name in ctx_udma_flags}
+
     hidden_buf, _, _ = create_vmm_physical([NvS, H], torch.bfloat16, device)
     # Cross-rank (symmetric) dispatch metadata.
     weights_buf, _, _ = create_vmm_physical([NvS], torch.int32, device)
@@ -243,18 +247,27 @@ def _create_context(
         'barrier_buf': barrier_buf._vmm_allocation,
     }
 
+    # PUT workspace must be symmetric; MTE does not need these large arenas.
+    if effective_udma['combine']:
+        combine_workspace, _, _ = create_vmm_physical(
+            [combine_put_workspace_bytes(NvS, H, R)], torch.uint8, device)
+        vmm_chunks['combine_workspace'] = combine_workspace._vmm_allocation
+    else:
+        combine_workspace = torch.empty(0, dtype=torch.uint8, device=dev)
+
     # Combine owns a separate grant/done cacheline pool.  Keeping this distinct
     # from dispatch prevents the two protocols from sharing flag generations or
     # becoming coupled through their unrelated layouts.
     combine_sync_buffer, _, _ = create_vmm_physical(
-        [R * _COMBINE_SYNC_BYTES_PER_RANK], torch.uint8, device)
+        [R * _COMBINE_SYNC_BYTES_PER_RANK + _COMBINE_LOCAL_AIV_SYNC_BYTES], torch.uint8, device)
     combine_sync_buffer.zero_()
     vmm_chunks['combine_sync_buffer'] = combine_sync_buffer._vmm_allocation
 
     # Dispatch sync_buffer: Token control region followed by the four-round
     # local sync region for the 16 Token AIVs.
+    # Weight aggregation uses the subsequent inbox, staging, and diagnostics regions.
     dispatch_sync_buffer, _, _ = create_vmm_physical(
-        [R * 16 * 6 * 512 + 16 * 4 * 512], torch.uint8, device)
+        [dispatch_sync_buffer_nbytes(R)], torch.uint8, device)
     dispatch_sync_buffer.zero_()
     vmm_chunks['dispatch_sync_buffer'] = dispatch_sync_buffer._vmm_allocation
     # Zero this rank's barrier words (writes through to the VMM source VA).
@@ -275,13 +288,6 @@ def _create_context(
         'prefetch': PrefetchOp(ws_bytes=0, num_sms=num_sms),
         'grad_reduce': GradReduceOp(ws_bytes=0, num_sms=num_sms),
     }
-    ctx_udma_flags = {'planning': False, 'dispatch': True, 'combine': True,
-                      'prefetch': True, 'grad_reduce': True}
-    requested_udma = {name: bool(use_udma) for name in ctx_udma_flags}
-    if udma_flags:
-        requested_udma.update({name: bool(value) for name, value in udma_flags.items()})
-    effective_udma = {name: bool(udma_supported and ctx_udma_flags[name] and requested_udma[name])
-                      for name in ctx_udma_flags}
     os.environ['ASCEND_MOONEP_USE_UDMA'] = '1' if any(effective_udma.values()) else '0'
     for name, enabled in effective_udma.items():
         os.environ[f'ASCEND_MOONEP_{name.upper()}_USE_UDMA'] = '1' if enabled else '0'
@@ -307,6 +313,7 @@ def _create_context(
         # shmem symmetric chunks (tensors; tensor.data_ptr() is the symmetric
         # base for peer addressing / device RMA — no separate Buffer handles).
         'hidden_buf': hidden_buf,
+        'combine_workspace': combine_workspace,
         'weights_buf': weights_buf,
         'barrier_buf': barrier_buf,
         'combine_sync_buffer': combine_sync_buffer,
@@ -317,7 +324,7 @@ def _create_context(
             barrier_buf,
             combine_sync_buffer,
             dispatch_sync_buffer,
-        ],
+        ] + ([combine_workspace] if effective_udma['combine'] else []),
         # CANN VMM allocations (source_va + mem_handle + shareable_va):
         # collected by the framework for buffer-backed shmem init
         # (ShmemRuntime.init_with_buffer); Buffer.destroy reverses the VMM ops.
@@ -488,12 +495,15 @@ class Buffer:
                 "ShmemRuntime.init_with_buffer")
         for name in (
             'hidden_buf',
+            'combine_workspace',
             'weights_buf',
             'barrier_buf',
             'combine_sync_buffer',
             'dispatch_sync_buffer',
         ):
-            allocation = ctx['vmm_chunks'][name]
+            allocation = ctx['vmm_chunks'].get(name)
+            if allocation is None:
+                continue
             sym = map_to_sym_ptr(allocation.source_va, name)
             src = ctx[name]
             ctx[name] = create_sym_tensor_from_ptr(
@@ -540,6 +550,7 @@ class Buffer:
             op.destroy()
         for name in (
             'hidden_buf',
+            'combine_workspace',
             'weights_buf',
             'barrier_buf',
             'combine_sync_buffer',
@@ -557,6 +568,7 @@ class Buffer:
             'hidden_buf_local',
             'weights_buf_local',
             'hidden_buf',
+            'combine_workspace',
             'weights_buf',
             'barrier_buf',
             'combine_sync_buffer',
@@ -814,6 +826,7 @@ class Buffer:
 
     # ------------------------------------------------------------------
     # Public API (identical signatures to moonep.api.Buffer)
+    # Ascend extension exposes an optional dedup_mode argument; the default remains rank.
     # ------------------------------------------------------------------
     def dispatch(
         self,
@@ -827,6 +840,7 @@ class Buffer:
         inter_rank_sync: bool = True,
         zero_copy: bool = False,
         router_weights_zero_copy: bool = False,
+        dedup_mode: str = "rank",
     ):
         """dispatch fwd: run planning (unless reusing a plan) and scatter tokens
         to their expert-grouped positions on remote ranks.
@@ -836,9 +850,15 @@ class Buffer:
         into via the peer address), and ``router_weights_zero_copy`` independently
         returns the ``route_weights_nvs`` fp32 view of ``weights_buf_local``
         instead of a fresh copy (default False, matching the CUDA API).
+        ``dedup_mode`` selects rank/server planning when ``plan`` is absent.
         """
         ctx = self._require_ctx()
         self._ensure_shmem_views()
+
+        # server plans must go through the already-adapted UDMA Dispatch so failure happens up front, not at send time
+        # after Planning ran.
+        if plan is None and dedup_mode == "server" and not ctx['_dispatch_use_udma']:
+            raise ValueError("server dedup requires UDMA dispatch")
 
         if plan is None:
             assert topk_experts_sk is not None and tokens_per_expert is not None
@@ -846,7 +866,7 @@ class Buffer:
             assert topk_flat.dtype == torch.int32 and topk_flat.numel() == int(ctx['N'])
             assert tokens_per_expert.dtype == torch.int32
             assert tokens_per_expert.numel() == int(ctx['E']) and tokens_per_expert.is_contiguous()
-            plan, cu_seqlens = allocate_planning_outputs(ctx)
+            plan, cu_seqlens = allocate_planning_outputs(ctx, dedup_mode=dedup_mode)
             planning_args = (topk_flat, tokens_per_expert, cu_seqlens)
         else:
             cu_seqlens = None
@@ -987,6 +1007,19 @@ class Buffer:
         done = self._comm_stream.record_event()
 
         return done
+
+    def prepare_combine_plan(self, plan: MoonEPCommPlan):
+        """Collectively prepare manually built/cloned routes before UDMA combine.
+
+        All ranks call after dst is ready. Ordinary dispatch planning does this
+        automatically. No preparation is hidden inside the combine timed loop.
+        """
+        ctx = self._require_ctx()
+        self._ensure_shmem_views()
+        if not ctx['_combine_use_udma']:
+            raise RuntimeError('prepare_combine_plan requires UDMA combine')
+        from .planning import prepare_combine_plan
+        return prepare_combine_plan(ctx, plan)
 
     def combine(
         self,

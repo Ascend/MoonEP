@@ -12,6 +12,7 @@ namespace {
 constexpr int64_t kMinPlanningCores = 8;
 constexpr int64_t kMaxPlanningCores = 56;
 constexpr int64_t kMaxPlanningRanks = 1024;
+constexpr int64_t kPlanningRanksPerServer = ascend_moonep::kMoonEPDispatchRanksPerServer;
 constexpr int64_t kInt32Bytes = 4;
 constexpr int64_t kUbAlignBytes = 32;
 constexpr int64_t kAlignElems = kUbAlignBytes / kInt32Bytes;
@@ -161,7 +162,10 @@ int64_t SourceDupUbBytes(
     const int64_t materialize_bytes =
         AlignUp(world_size * 2 * kInt32Bytes, kUbAlignBytes) +
         2 * AlignUp(kDupSrcTileElems * kInt32Bytes, kUbAlignBytes);
-    return std::max({prefix_bytes, group_bytes, materialize_bytes});
+    // The source prefix and the [G,D,P...] outputs occupy separate partitions in UB and must not overwrite each other.
+    const int64_t destination_prefix_bytes = world_size * kSourceDupInboxSlotElems * kInt32Bytes +
+        AlignUp((world_size + 2) * kInt32Bytes, kUbAlignBytes);
+    return std::max({prefix_bytes, group_bytes, materialize_bytes, destination_prefix_bytes});
 }
 
 uint32_t SelectSourceDupTokensPerTile(
@@ -395,6 +399,9 @@ int64_t PlanningSymmetricWorkspaceBytes(
     TORCH_CHECK(num_experts > 0, "num_experts must be positive");
     TORCH_CHECK(num_max_tokens_per_rank > 0, "num_max_tokens_per_rank must be positive");
     TORCH_CHECK(world_size > 0, "world_size must be positive");
+    TORCH_CHECK(world_size <= kMaxPlanningRanks && num_experts <= std::numeric_limits<int32_t>::max() &&
+                num_max_tokens_per_rank <= std::numeric_limits<int32_t>::max(),
+                "planning workspace dimensions must fit device indices");
     const int64_t dup_rank_counts_off = AlignUp(num_experts, kAlignElems);
     const int64_t dup_payload_done_off = dup_rank_counts_off +
         CheckedMul(
@@ -405,8 +412,11 @@ int64_t PlanningSymmetricWorkspaceBytes(
         dup_payload_done_off + AlignUp(world_size, kAlignElems);
     const int64_t dup_loffs_off =
         dup_groups_off + AlignUp(num_max_tokens_per_rank * 3, kAlignElems);
-    const int64_t required_ints =
-        dup_loffs_off + AlignUp(num_max_tokens_per_rank, kAlignElems);
+    // The symmetric workspace is sized for the server mode maximum receive capacity; rank mode can reuse it too.
+    const int64_t dup_capacity = CheckedMul(kPlanningRanksPerServer, num_max_tokens_per_rank, "server dup capacity");
+    const int64_t required_ints = dup_loffs_off + AlignUp(dup_capacity, kAlignElems);
+    TORCH_CHECK(required_ints <= std::numeric_limits<int32_t>::max(),
+                "planning symmetric workspace exceeds int32 device offsets");
     return CheckedMul(required_ints, kInt32Bytes, "planning symmetric workspace");
 }
 
@@ -420,7 +430,7 @@ int64_t PlanningLocalWorkspaceElements(
         num_tokens, num_topk, num_experts, world_size, core_num).total_elems;
 }
 
-void Planning(
+torch::Tensor Planning(
     torch::Tensor topk_idx,
     torch::Tensor dst,
     torch::Tensor cu_seqlens,
@@ -439,7 +449,7 @@ void Planning(
     int64_t core_num,
     int64_t rank,
     int64_t world_size,
-    bool use_udma) {
+    bool use_udma, torch::Tensor combine_workspace, int64_t hidden_size) {
     (void)use_udma;
     CheckNpuInt32(topk_idx, "topk_idx");
     CheckNpuInt32(dst, "dst");
@@ -484,8 +494,12 @@ void Planning(
         CheckedMul(world_size, num_experts, "rank-expert table") <=
             std::numeric_limits<int32_t>::max(),
         "planning requires world_size * num_experts to fit int32 indexing");
-    TORCH_CHECK(num_max_tokens_per_rank >= route_count,
-                "num_max_tokens_per_rank must be at least num_tokens * num_topk");
+    // Detect the protocol from the counts length; rank mode still lets legacy callers reserve NvS larger than S*K.
+    const bool server_dedup = dup_counts.dim() == 1 && dup_counts.numel() == world_size + 2;
+    TORCH_CHECK(!server_dedup || world_size % kPlanningRanksPerServer == 0,
+                "server planning requires world_size divisible by 8");
+    TORCH_CHECK(num_max_tokens_per_rank >= route_count && (!server_dedup || num_max_tokens_per_rank == route_count),
+                "server planning requires NvS == S*K; rank planning requires NvS >= S*K");
     TORCH_CHECK(topk_idx.numel() == route_count,
                 "topk_idx numel must equal num_tokens * num_topk");
     TORCH_CHECK(dst.numel() == route_count, "dst shape mismatch");
@@ -493,11 +507,15 @@ void Planning(
                 "cu_seqlens shape mismatch");
     TORCH_CHECK(experts_to_copy.numel() == world_size * num_prefetch_slots,
                 "experts_to_copy shape mismatch");
-    TORCH_CHECK(dup_groups.numel() == num_max_tokens_per_rank * 3,
-                "dup_groups shape mismatch");
-    TORCH_CHECK(dup_loffs.numel() == num_max_tokens_per_rank,
-                "dup_loffs shape mismatch");
-    TORCH_CHECK(dup_counts.numel() == 2, "dup_counts shape mismatch");
+    const int64_t dup_capacity = server_dedup ? kPlanningRanksPerServer * num_max_tokens_per_rank :
+        num_max_tokens_per_rank;
+    const int64_t count_size = server_dedup ? world_size + 2 : 2;
+    TORCH_CHECK(dup_groups.dim() == 2 && dup_groups.size(0) == num_max_tokens_per_rank &&
+                dup_groups.size(1) == 3, "dup_groups must be int32 [NvS, 3]");
+    TORCH_CHECK(dup_loffs.dim() == 1 && dup_loffs.numel() == dup_capacity,
+                "dup_loffs must be int32 [", dup_capacity, "] for the selected dup format");
+    TORCH_CHECK(dup_counts.dim() == 1 && dup_counts.numel() == count_size,
+                "dup_counts must be int32 [2] or [R+2]");
     TORCH_CHECK(symmetric_workspace_addr != 0,
                 "planning symmetric workspace address must not be zero");
     TORCH_CHECK(
@@ -535,7 +553,16 @@ void Planning(
             num_experts / world_size,
             core_num,
             static_cast<int64_t>(kPlanningUbSizeBytes)));
-    tiling.reserved = 0;
+    tiling.server_dedup = server_dedup ? 1U : 0U;
+    torch::Tensor combine_plan;
+    if (combine_workspace.defined()) {
+        combine_plan = AllocateCombinePlan(combine_workspace, dst, dup_groups,
+            dup_loffs, dup_counts, num_tokens, hidden_size, num_topk, world_size, rank);
+        tiling.combine_mode = 1U;
+        tiling.combine_h = hidden_size;
+        tiling.combine_workspace = reinterpret_cast<uint64_t>(combine_workspace.data_ptr());
+        tiling.combine_plan = reinterpret_cast<uint64_t>(combine_plan.data_ptr());
+    }
 
     auto tpe_all = SliceWorkspace(local_workspace, layout.tpe_all);
     auto tpe_prefix = SliceWorkspace(local_workspace, layout.tpe_prefix);
@@ -569,6 +596,65 @@ void Planning(
         tiling,
         reinterpret_cast<void*>(static_cast<uintptr_t>(symmetric_workspace_addr)),
         0);
+    return combine_plan;
+}
+
+torch::Tensor AllocateCombinePlan(
+    torch::Tensor workspace, torch::Tensor dst, torch::Tensor groups,
+    torch::Tensor dups, torch::Tensor counts,
+    int64_t S, int64_t H, int64_t K, int64_t R, int64_t rank) {
+    TORCH_CHECK(S > 0 && H > 0 && H % 8 == 0 && H <= 4 * 1024 * 1024 &&
+                K > 0 && K <= 16 && R > 0 && R <= 1024 && rank >= 0 && rank < R &&
+                uint64_t(S) <= ((1ULL << 30) - 1) / uint64_t(K) / uint64_t(R),
+                "invalid combine execution-plan dimensions");
+    TORCH_CHECK(R == 1 || (R % 2 == 0 &&
+                (R < 128 ? (R <= 8 || R % 8 == 0) : R % 16 == 0)),
+                "unsupported combine topology");
+    const int64_t n = S * K;
+    TORCH_CHECK(n <= std::numeric_limits<uint32_t>::max() / 8U,
+                "combine scratch index exceeds uint32");
+    for (const auto& tensor : {workspace, dst, groups, dups, counts}) {
+        TORCH_CHECK(tensor.device().type() == c10::DeviceType::PrivateUse1 &&
+                    tensor.device() == dst.device() && tensor.is_contiguous(),
+                    "combine planning tensors must be contiguous on the same NPU");
+    }
+    TORCH_CHECK(dst.scalar_type() == torch::kInt32 && dst.dim() == 1 && dst.numel() == n,
+                "dst must be int32 [S*K]");
+    TORCH_CHECK(groups.scalar_type() == torch::kInt32 && groups.dim() == 2 &&
+                groups.size(0) == n && groups.size(1) == 3, "groups must be int32 [S*K,3]");
+    TORCH_CHECK(counts.scalar_type() == torch::kInt32 && counts.dim() == 1 &&
+                (counts.numel() == 2 || counts.numel() == R + 2), "invalid dup counts");
+    const bool server = counts.numel() == R + 2;
+    TORCH_CHECK(!server || R % 8 == 0, "server planning requires full 8-rank servers");
+    TORCH_CHECK(!server || uint64_t(n) <= kMoonEPServerDupRouteLimit,
+                "server planning route exceeds packed capacity");
+    TORCH_CHECK(dups.scalar_type() == torch::kInt32 && dups.dim() == 1 &&
+                dups.numel() == (server ? 8 * n : n), "invalid dup member capacity");
+    const auto p = MakeCombinePutLayout(n, H, R);
+    TORCH_CHECK(workspace.scalar_type() == torch::kUInt8 && workspace.dim() == 1 &&
+                uint64_t(workspace.numel()) >= p.bytes, "combine planning workspace too small");
+    for (const auto& tensor : {dst, groups, dups, counts})
+        TORCH_CHECK(!workspace.is_alias_of(tensor), "planning input must not alias exchange workspace");
+    const auto q = MakeCombineExecutionPlanLayout(n, R);
+    auto plan = torch::empty({static_cast<int64_t>(q.bytes)}, dst.options().dtype(torch::kUInt8));
+    return plan;
+}
+
+torch::Tensor PlanningPrepareCombinePlan(
+    torch::Tensor workspace, torch::Tensor dst, torch::Tensor groups,
+    torch::Tensor dups, torch::Tensor counts,
+    int64_t S, int64_t H, int64_t K, int64_t R, int64_t rank) {
+    auto plan = AllocateCombinePlan(workspace, dst, groups, dups, counts, S, H, K, R, rank);
+    PlanningTilingData tiling{};
+    tiling.num_tokens = S; tiling.num_topk = K; tiling.world_size = R;
+    tiling.rank = rank; tiling.server_dedup = counts.numel() == R + 2;
+    tiling.block_dim = kCombinePutCores;
+    tiling.combine_mode = 2U; // Synthetic/precomputed routes: same planning entry.
+    tiling.combine_h = H;
+    tiling.combine_workspace = reinterpret_cast<uint64_t>(workspace.data_ptr());
+    tiling.combine_plan = reinterpret_cast<uint64_t>(plan.data_ptr());
+    LaunchPlanningMetadataOnly(dst, groups, dups, counts, tiling);
+    return plan;
 }
 
 }  // namespace ascend_moonep::ops

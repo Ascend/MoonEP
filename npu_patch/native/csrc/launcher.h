@@ -80,17 +80,14 @@ void LaunchPlanningKernel(
     void* symmetric_buffer,
     uint64_t ffts_addr);
 
-void LaunchMoonEPUdmaCombineKernel(
-    torch::Tensor hidden_nvsh,
-    torch::Tensor route_weights_nvs,
-    torch::Tensor sync_buffer,
-    torch::Tensor dst,
-    torch::Tensor dup_groups,
-    torch::Tensor dup_loffs,
-    torch::Tensor dup_counts,
-    torch::Tensor output_sh,
-    torch::Tensor output_sk,
-    void* bandwidth_scratch,
+void LaunchMoonEPUdmaCombinePlanKernel(
+    torch::Tensor hidden, torch::Tensor weights, torch::Tensor dst,
+    torch::Tensor groups, torch::Tensor dups, torch::Tensor counts,
+    torch::Tensor out, torch::Tensor outw, torch::Tensor workspace,
+    torch::Tensor plan,
     const ascend_moonep::MoonEPUdmaCombineTilingData& tiling,
-    void* local_workspace,
-    uint64_t invocation_magic);
+    uint64_t magic);
+
+void LaunchPlanningMetadataOnly(
+    torch::Tensor dst, torch::Tensor groups, torch::Tensor dups, torch::Tensor counts,
+    const ascend_moonep::PlanningTilingData& tiling);

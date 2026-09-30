@@ -5,8 +5,8 @@
 namespace ascend_moonep::ops {
 
 // Caller-owned-output overload selected by ASCEND_MOONEP_COMBINE_USE_UDMA.
-// local_workspace is
-// ordinary rank-local NPU memory; only the inputs are symmetric.
+// local_workspace is a Buffer-owned symmetric tensor used as this rank's
+// gathered payload staging area, allocated in the same SHMEM heap as inputs.
 void MoonEPUdmaCombine(
     torch::Tensor hidden_nvsh,
     c10::optional<torch::Tensor> route_weights_nvs,
@@ -22,6 +22,7 @@ void MoonEPUdmaCombine(
     int64_t K,
     int64_t R,
     int64_t rank,
-    torch::Tensor local_workspace);
+    torch::Tensor local_workspace,
+    c10::optional<torch::Tensor> execution_plan = c10::nullopt);
 
 }  // namespace ascend_moonep::ops

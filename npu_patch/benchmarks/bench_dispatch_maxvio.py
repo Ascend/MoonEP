@@ -7,8 +7,7 @@ local duplicate-expansion kernel.
 
 The report contains two bandwidth views:
 
-* ``logical_hidden_gbps`` uses ``S*K*H*2 / latency``, matching the MoonEP
-  communication benchmark convention.
+* ``logical_hidden_gbps`` uses ``S*K*H*2 / mean-rank latency``.
 * ``aggregate_remote_payload_gbps`` decodes ``plan.dst`` and counts bytes that
   all EP ranks actually send to another rank.  Canonical hidden rows and fp32
   route weights are counted; local writes and local duplicate expansion are
@@ -35,7 +34,9 @@ EP group = the whole torchrun world.  Examples:
 
 import argparse
 import csv
+import json
 import os
+from datetime import timedelta
 
 import torch
 import torch_npu
@@ -49,14 +50,9 @@ from _bench_common import (
 )
 
 from npu_patch import Buffer, ShmemRuntime
-from npu_patch._common import sym_put_from
 from npu_patch._device import local_device_index
-from npu_patch.buffer_c import (
-    create_sym_tensor_from_source,
-    create_vmm_physical,
-    reset_symmetric_descriptors,
-)
-from npu_patch.launchers import launch_dispatch, launch_planning
+from npu_patch.buffer_c import reset_symmetric_descriptors
+from npu_patch.launchers import launch_dispatch, launch_dispatch_profile, launch_planning
 from npu_patch.planning import allocate_planning_outputs
 from npu_patch.shmem_runtime import default_shmem_ip_port
 
@@ -65,8 +61,112 @@ def gbps(nbytes: int, us: float) -> float:
     return nbytes / (us * 1e-6) / 1e9 if us > 0 else 0.0
 
 
+def print_box_table(headers, rows, alignments, min_widths):
+    """Print a two-line header and a border after every row."""
+    header_lines = [header.split("\n") for header in headers]
+    widths = [max([min_widths[i]] + [len(line) for line in header_lines[i]] +
+                  [len(str(row[i])) for row in rows]) for i in range(len(headers))]
+    border = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+
+    def format_row(values, align):
+        cells = []
+        for value, width, side in zip(values, widths, align):
+            cell = str(value)
+            if side == "left":
+                cell = cell.ljust(width)
+            elif side == "center":
+                cell = cell.center(width)
+            else:
+                cell = cell.rjust(width)
+            cells.append(f" {cell} ")
+        return "|" + "|".join(cells) + "|"
+
+    print(border)
+    for line in range(max(len(lines) for lines in header_lines)):
+        values = tuple(lines[line] if line < len(lines) else "" for lines in header_lines)
+        print(format_row(values, ("center",) * len(headers)))
+    print(border)
+    for row in rows:
+        print(format_row(row, alignments))
+        print(border)
+
+
+def summarize_profile(profile, cycles_per_us, duplicate_rows_by_rank, hidden_size):
+    """Take each rank max AIV time and total bytes, then average across ranks."""
+    matrix = profile.tolist()
+    stages = (("token", 1, 4), ("weight", 6, 7), ("duplicate", 8, None), ("operator", 0, 4))
+    result = {name: {"time": [], "bw": []} for name, _, _ in stages}
+    invalid_rows = 0
+    # Zero out -1 fields that were never written back; mark Duplicate bandwidth NaN on incomplete ranks.
+    for rank, rank_rows in enumerate(matrix):
+        rank_invalid = any(value == -1 for row in rank_rows for value in row)
+        invalid_rows += sum(any(value == -1 for value in row) for row in rank_rows)
+        valid_rows = [[0 if value == -1 else value for value in row] for row in rank_rows]
+        # Every bandwidth uses this rank stage max time as the denominator; Duplicate additionally checks complete
+        # write-back.
+        for name, cycle_field, byte_field in stages:
+            stage_us = max(row[cycle_field] for row in valid_rows) / cycles_per_us
+            if byte_field is None:
+                byte_count = duplicate_rows_by_rank[rank] * hidden_size * 2
+            else:
+                byte_count = sum(row[byte_field] for row in valid_rows)
+            if name == "duplicate" and (rank_invalid or (stage_us == 0 and byte_count != 0)):
+                bandwidth = float("nan")
+            else:
+                bandwidth = byte_count / stage_us / 1000 if stage_us > 0 else 0.0
+            result[name]["time"].append(stage_us)
+            result[name]["bw"].append(bandwidth)
+    for name, _, _ in stages:
+        result[name] = (sum(result[name]["time"]) / len(matrix), sum(result[name]["bw"]) / len(matrix))
+    result["invalid_rows"] = invalid_rows
+    return result
+
+
+def print_summary_tables(rows, profiles, dedup_mode):
+    """Print the algorithm bandwidth table and the four-stage Kernel Timing table."""
+    first = rows[0]
+    print("MoonEP Dispatch UDMA Summary")
+    print(f"EP={first['ep']} S={first['S']} E={first['E']} H={first['H']} K={first['K']} "
+          f"QP=2 Weights={'on' if first['with_weights'] else 'off'} plan_mode=maxvio dedup_mode={dedup_mode}")
+    print()
+    summary_rows = []
+    for row in rows:
+        dedup = row["remote_dedup_ratio"]
+        summary_rows.append((
+            f"{1 + row['maxvio']:.3f}x", f"{row['dispatch_max_us']:.1f}",
+            f"{row['logical_hidden_gbps']:.1f}", f"{row['remote_token_gbps_per_rank']:.1f}",
+            f"{row['remote_weight_gbps_per_rank']:.3f}", f"{row['remote_total_gbps_per_rank']:.1f}",
+            f"{dedup:.3f}" if dedup is not None else "n/a",
+        ))
+    print_box_table(
+        ("Peak/Avg\n", "Latency\n(us)", "Logical BW\n(GB/s/rank)", "Remote Token\n(GB/s/rank)",
+         "Remote Weight\n(GB/s/rank)", "Remote Total\n(GB/s/rank)", "Dedup\n"),
+        summary_rows, ("right",) * 7, (8, 8, 11, 12, 13, 12, 5),
+    )
+    print("Latency / Remote BW use max_us; Logical BW uses mean_us.")
+    print("\nKernel Timing Summary\n")
+    stage_rows = []
+    for case, (row, profile) in enumerate(zip(rows, profiles)):
+        for index, (name, key) in enumerate((
+            ("Token Scatter", "token"), ("Weight Scatter", "weight"),
+            ("Duplicate", "duplicate"), ("Operator", "operator"),
+        )):
+            stage_us, stage_bw = profile[key]
+            stage_rows.append((f"{1 + row['maxvio']:.3f}x" if index == 0 else "", name,
+                               f"{stage_us:.1f}", f"{stage_bw:.3f}"))
+        if case + 1 < len(rows):
+            stage_rows.append(("", "", "", ""))
+    print_box_table(
+        ("Peak/Avg", "Stage", "Avg Rank Time\n(us)", "Avg Rank BW\n(GB/s)"),
+        stage_rows, ("right", "left", "right", "right"), (13, 19, 23, 23),
+    )
+    invalid_rows = sum(profile["invalid_rows"] for profile in profiles)
+    if invalid_rows:
+        print(f"WARNING: {invalid_rows} invalid profile row(s)")
+
+
 def time_op(fn, group, rank, warmup=20, iters=50, stats=None,
-            remote_counts=(0, 0)):
+            remote_counts=(0, 0, 0)):
     """Return per-rank, mean, and slowest-rank eager NPU-event latency."""
     for _ in range(warmup):
         fn()
@@ -74,7 +174,7 @@ def time_op(fn, group, rank, warmup=20, iters=50, stats=None,
     if stats is None:
         dist.barrier(group=group)
     else:
-        ShmemRuntime.barrier()
+        stats.barrier()
 
     start = torch.npu.Event(enable_timing=True)
     end = torch.npu.Event(enable_timing=True)
@@ -146,7 +246,7 @@ class DispatchRunner:
     """Own the Buffer, plan, and fixed dispatch inputs for one benchmark."""
 
     def __init__(self, group, R, S, K, E, H, num_sms, local_rank, with_weights,
-                 rank=None, use_udma=False):
+                 rank=None, use_udma=False, dedup_mode="rank"):
         self.group = group
         self.rank = rank if rank is not None else dist.get_rank(group=group)
         self.R = R
@@ -168,7 +268,7 @@ class DispatchRunner:
             rank=rank,
         )
         self.ctx = self.buffer._require_ctx()
-        self.plan, self.cu_seqlens = allocate_planning_outputs(self.ctx)
+        self.plan, self.cu_seqlens = allocate_planning_outputs(self.ctx, dedup_mode=dedup_mode)
 
         dev = f"npu:{local_rank}"
         generator = torch.Generator(device=dev).manual_seed(7777 + self.rank)
@@ -180,6 +280,7 @@ class DispatchRunner:
             self.weights = torch.rand(
                 S, K, dtype=torch.float32, device=dev, generator=generator
             )
+        self.profile_cycles = None
 
     def activate_symmetric_views(self):
         self.buffer._ensure_shmem_views()
@@ -208,6 +309,16 @@ class DispatchRunner:
             build_dedup_map=False,
         )
 
+    def dispatch_profile(self):
+        """Run the profiling kernel alone; the AIV matrix keeps the result of the last call."""
+        if self.profile_cycles is None:
+            self.profile_cycles = torch.full((32, 9), -1, dtype=torch.int64, device=self.hidden.device)
+        self.profile_cycles.fill_(-1)
+        launch_dispatch_profile(
+            self.ctx, self.hidden, self.weights, self.plan, self.profile_cycles,
+            build_dedup_map=False,
+        )
+
     def local_remote_traffic(self):
         """Decode this rank's plan.dst and count its inter-rank payload."""
         NvS = int(self.ctx["NvS"])
@@ -223,52 +334,59 @@ class DispatchRunner:
             remote_weight_values.zero_()
         return int(remote_hidden_rows.item()), int(remote_weight_values.item())
 
+    def local_duplicate_rows(self):
+        """Read the number of secondary output rows Planning produced for this primary rank."""
+        return int(self.plan.dup_counts[1].item())
+
     def destroy(self):
         self.buffer.destroy()
 
 
-class ShmemStats:
-    """Gather one int32 stats row per rank without torch.distributed."""
+class TcpStoreStats:
+    """Aggregate per-rank timings, traffic, and profiling matrices over a CPU TCPStore."""
 
-    def __init__(self, rank, world_size, local_rank):
+    def __init__(self, rank, world_size):
         self.rank = rank
         self.world_size = world_size
-        self.device = f"npu:{local_rank}"
-        self.source, _, _ = create_vmm_physical(
-            [world_size, 3], torch.int32, local_rank
-        )
-        self.tensor = None
+        self.step = 0
+        # torchrun occupies MASTER_PORT and SHMEM defaults to +1; statistics use +2 on its own.
+        address = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        port = int(os.environ.get("MASTER_PORT", "29500")) + 2
+        self.store = dist.TCPStore(address, port, world_size, rank == 0, timeout=timedelta(minutes=5))
 
-    def activate(self):
-        self.tensor = create_sym_tensor_from_source(
-            self.source.data_ptr(),
-            [self.world_size, 3],
-            torch.int32,
-            self.device,
-            "dispatch_benchmark_stats",
-        )
+    def gather(self, value):
+        """Each rank writes its data; rank 0 reads everything and then signals all ranks to continue."""
+        key = f"stats/{self.step}"
+        self.step += 1
+        self.store.set(f"{key}/rank/{self.rank}", json.dumps(value))
+        values = None
+        # Let only rank 0 read the full data, so ranks do not each fetch the profiling matrices again.
+        if self.rank == 0:
+            values = [json.loads(self.store.get(f"{key}/rank/{peer}")) for peer in range(self.world_size)]
+            self.store.set(f"{key}/release", "1")
+        self.store.get(f"{key}/release")
+        self.store.set(f"{key}/read/{self.rank}", "1")
+        # rank 0 waits until every rank receives the release, so the last gather round completes before exit.
+        if self.rank == 0:
+            self.store.wait([f"{key}/read/{peer}" for peer in range(self.world_size)])
+        return values
 
-    def collect(self, local_us, remote_hidden_rows, remote_weight_values):
-        payload = torch.tensor(
-            [round(local_us * 1000), remote_hidden_rows, remote_weight_values],
-            dtype=torch.int32,
-            device=self.device,
-        )
-        stream = torch.npu.current_stream().npu_stream
-        sym_put_from(self.tensor, self.rank * 3 * 4, payload, 0, stream)
-        torch.npu.synchronize()
-        ShmemRuntime.barrier()
+    def barrier(self):
+        self.gather(None)
+
+    def collect(self, local_us, remote_hidden_rows, remote_weight_values, duplicate_rows):
+        gathered = self.gather([local_us, remote_hidden_rows, remote_weight_values, duplicate_rows])
 
         if self.rank == 0:
-            gathered = self.tensor.cpu()
-            times = [value / 1000.0 for value in gathered[:, 0].tolist()]
-            hidden_rows = int(gathered[:, 1].sum().item())
-            weight_values = int(gathered[:, 2].sum().item())
+            times = [row[0] for row in gathered]
+            hidden_rows = sum(row[1] for row in gathered)
+            weight_values = sum(row[2] for row in gathered)
+            duplicate_rows_by_rank = [row[3] for row in gathered]
         else:
             times = [local_us]
             hidden_rows = remote_hidden_rows
             weight_values = remote_weight_values
-        ShmemRuntime.barrier()
+            duplicate_rows_by_rank = [duplicate_rows]
 
         if self.rank == 0:
             print(
@@ -283,14 +401,14 @@ class ShmemStats:
             "max_us": max(times),
             "remote_hidden_rows": hidden_rows,
             "remote_weight_values": weight_values,
+            "duplicate_rows_by_rank": duplicate_rows_by_rank,
         }
 
-    def destroy(self):
-        self.tensor = None
-        allocation = getattr(self.source, "_vmm_allocation", None)
-        if allocation is not None:
-            allocation.destroy()
-        self.source = None
+    def collect_profile(self, local_matrix):
+        """After the profiling kernel finishes, gather each rank 32x9 raw matrix on the CPU."""
+        local = local_matrix.cpu()
+        gathered = self.gather(local.tolist())
+        return torch.tensor(gathered, dtype=local.dtype) if self.rank == 0 else None
 
 
 def setup_no_dist():
@@ -331,8 +449,10 @@ def main():
     parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--num-sms", type=int, default=32)
+    parser.add_argument("--dedup-mode", choices=("rank", "server"), default="rank")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=50)
+    parser.add_argument("--kernel-timing", action="store_true", help="collect AIV stage cycles per MaxVio case")
     parser.add_argument(
         "--no-weights",
         action="store_true",
@@ -349,7 +469,7 @@ def main():
     parser.add_argument(
         "--no-dist",
         action="store_true",
-        help="Use torchrun only as a process launcher; bootstrap and statistics use SHMEM",
+        help="Use torchrun only as a process launcher; SHMEM bootstrap and CPU TCPStore statistics",
     )
     args = parser.parse_args()
 
@@ -361,6 +481,10 @@ def main():
         group = dist.group.WORLD
     local_rank = local_device_index(local_rank)
     use_udma = apply_engine(args.engine)
+    if args.kernel_timing and not use_udma:
+        raise RuntimeError("--kernel-timing requires the URMA dispatch engine")
+    if args.dedup_mode == "server" and not use_udma:
+        raise RuntimeError("server dedup requires the URMA dispatch engine")
     R = world_size
     S, K, E, H = args.tokens, args.topk, args.experts, args.hidden
     dev = f"npu:{local_rank}"
@@ -372,8 +496,8 @@ def main():
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
     multi_node = world_size > local_world_size
 
-    # Construct Buffer first so all VMM descriptors exist before SHMEM init.
-    stats = ShmemStats(rank, R, local_rank) if args.no_dist else None
+    # Build the Buffer first so its VMM descriptors are registered before SHMEM initializes.
+    stats = None
     runner = DispatchRunner(
         group,
         R,
@@ -386,6 +510,7 @@ def main():
         with_weights=not args.no_weights,
         rank=rank if args.no_dist else None,
         use_udma=use_udma,
+        dedup_mode=args.dedup_mode,
     )
     if not ShmemRuntime.is_initialized():
         if args.no_dist:
@@ -405,10 +530,11 @@ def main():
         else:
             ShmemRuntime.init_with_buffer(group=group, enable_udma=use_udma)
     runner.activate_symmetric_views()
-    if stats is not None:
-        stats.activate()
+    if args.no_dist:
+        stats = TcpStoreStats(rank, R)
 
     rows = []
+    profiles = []
     try:
         for target in targets:
             if args.no_dist:
@@ -453,6 +579,7 @@ def main():
 
             runner.prepare(topk, tpe)
             local_hidden_rows, local_weight_values = runner.local_remote_traffic()
+            local_duplicate_rows = runner.local_duplicate_rows()
             if not args.no_dist:
                 counts = torch.tensor(
                     [local_hidden_rows, local_weight_values],
@@ -463,6 +590,10 @@ def main():
                 remote_hidden_rows, remote_weight_values = [
                     int(value) for value in counts.cpu()
                 ]
+                local_duplicate = torch.tensor([local_duplicate_rows], dtype=torch.int32, device=dev)
+                gathered_duplicates = [torch.empty_like(local_duplicate) for _ in range(R)]
+                dist.all_gather(gathered_duplicates, local_duplicate, group=group)
+                duplicate_rows_by_rank = [int(value.item()) for value in gathered_duplicates]
             timing = time_op(
                 runner.dispatch,
                 group,
@@ -470,11 +601,12 @@ def main():
                 warmup=args.warmup,
                 iters=args.iters,
                 stats=stats,
-                remote_counts=(local_hidden_rows, local_weight_values),
+                remote_counts=(local_hidden_rows, local_weight_values, local_duplicate_rows),
             )
             if args.no_dist:
                 remote_hidden_rows = timing["remote_hidden_rows"]
                 remote_weight_values = timing["remote_weight_values"]
+                duplicate_rows_by_rank = timing["duplicate_rows_by_rank"]
             remote_bytes = (
                 remote_hidden_rows * H * 2 + remote_weight_values * 4
             )
@@ -482,6 +614,23 @@ def main():
             logical_hidden_bytes = S * K * H * 2
             mean_us = timing["mean_us"]
             max_us = timing["max_us"]
+            profile_summary = None
+            if args.kernel_timing:
+                # The normal Dispatch determines the algorithm bandwidth; the profiling Dispatch only provides module
+                # timings.
+                time_op(runner.dispatch_profile, group, rank, warmup=args.warmup,
+                        iters=args.iters, stats=stats)
+                if stats is not None:
+                    profile = stats.collect_profile(runner.profile_cycles)
+                else:
+                    gathered = [torch.empty_like(runner.profile_cycles) for _ in range(R)]
+                    dist.all_gather(gathered, runner.profile_cycles, group=group)
+                    profile = torch.stack(gathered).cpu() if rank == 0 else None
+                if rank == 0:
+                    device_name = torch.npu.get_device_name(torch.npu.current_device())
+                    cycle_rate = 1000.0 if "950" in device_name else 50.0
+                    profile_summary = summarize_profile(profile, cycle_rate, duplicate_rows_by_rank, H)
+                    profiles.append(profile_summary)
             rows.append(
                 {
                     "lib": "moonep",
@@ -498,6 +647,11 @@ def main():
                     "dispatch_max_us": max_us,
                     "logical_hidden_gbps": gbps(logical_hidden_bytes, mean_us),
                     "aggregate_remote_payload_gbps": gbps(remote_bytes, max_us),
+                    "remote_token_gbps_per_rank": gbps(remote_hidden_rows * H * 2, max_us) / R,
+                    "remote_weight_gbps_per_rank": gbps(remote_weight_values * 4, max_us) / R,
+                    "remote_total_gbps_per_rank": gbps(remote_bytes, max_us) / R,
+                    "remote_dedup_ratio": (remote_hidden_rows / remote_weight_values
+                                           if remote_weight_values else None),
                     "aggregate_remote_data_mb": remote_bytes / 1e6,
                     "remote_hidden_rows": remote_hidden_rows,
                     "remote_weight_values": remote_weight_values,
@@ -520,8 +674,6 @@ def main():
         if ShmemRuntime.is_initialized():
             ShmemRuntime.finalize()
         runner.destroy()
-        if stats is not None:
-            stats.destroy()
         reset_symmetric_descriptors()
 
     if rank == 0 and args.out:
@@ -533,6 +685,10 @@ def main():
     if rank == 0 and args.plot:
         plot_rows(rows, args.plot)
         print(f"wrote {args.plot}")
+    if rank == 0 and args.kernel_timing:
+        print("BENCH_TABLE_BEGIN", flush=True)
+        print_summary_tables(rows, profiles, args.dedup_mode)
+        print("BENCH_TABLE_END", flush=True)
 
     if not args.no_dist:
         dist.destroy_process_group()
