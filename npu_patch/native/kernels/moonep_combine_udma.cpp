@@ -403,14 +403,15 @@ struct Pipeline {
         }
         auto info = aclshmemi_udma_qp_info_fetch();
         auto ctx = aclshmemi_udma_get_qp_ctx(info, peer, qp);
+        auto queue_state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(ctx->state_addr);
         if (count > CombinePutSimt::kBatch || peer == rank || ctx->wqe_size != 64U) {
             aclshmemi_kernel_abort("combine SIMT invalid count/peer/WQE size\n");
             return;
         }
         // Apply the same SQ credit guard as the aggregate SHMEM writer, using
         // our checked Drain so a CQ timeout never permits overwriting live SQEs.
-        if (!aclshmemi_udma_sq_has_credit(ctx, count)) Drain(peer, qp);
-        if (!aclshmemi_udma_sq_has_credit(ctx, count)) {
+        if (!aclshmemi_udma_sq_has_credit(queue_state, count)) Drain(peer, qp);
+        if (!aclshmemi_udma_sq_has_credit(queue_state, count)) {
             aclshmemi_kernel_abort("combine SIMT SQ credit unavailable\n");
             return;
         }
@@ -443,7 +444,7 @@ struct Pipeline {
             rec[14] = 0U; rec[15] = 0U;
             simt_peer[cache] = peer; simt_qp[cache] = qp;
         }
-        const uint32_t head = ctx->head;
+        const uint32_t head = queue_state->sq_head;
         for (uint32_t j = 0U; j < count; ++j) {
             auto entry = entries + j * CombinePutSimt::kEntryWords;
             const uint64_t remote = reinterpret_cast<uint64_t>(aclshmem_ptr(targets[j], peer));
@@ -464,8 +465,8 @@ struct Pipeline {
         WaitFlag<HardEvent::V_S>(EVENT_ID0);
         auto db = reinterpret_cast<__gm__ uint32_t*>(ctx->db_addr);
         st_dev(head + count, db, 0);
-        ctx->head = head + count;
-        ctx->cqe_cnt += 1U; // exactly one SO+CQE WQE per nonempty batch
+        queue_state->sq_head = head + count;
+        queue_state->cqe_cnt += 1U; // exactly one SO+CQE WQE per nonempty batch
         ++simt_batches_posted;
     }
     __aicore__ inline uint32_t Source(uint32_t ordinal) {
@@ -491,26 +492,27 @@ struct Pipeline {
     __aicore__ inline void Drain(uint32_t peer, uint32_t qp) {
         auto info = aclshmemi_udma_qp_info_fetch();
         auto ctx = aclshmemi_udma_get_qp_ctx(info, peer, qp);
-        uint32_t status = aclshmemi_udma_poll_cq(peer, qp, ctx->cqe_cnt);
+        auto queue_state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(ctx->state_addr);
+        uint32_t status = aclshmemi_udma_poll_cq(peer, qp, queue_state->cqe_cnt);
         if (status == 0xffU) {
             // The SDK's one-million-spin budget is not a transport error.
             // Retry the same completion target for at most one second on
             // Ascend950 (GetSystemCycle is 1 GHz); never ignore a CQ error.
             uint64_t start = GetSystemCycle();
             do {
-                status = aclshmemi_udma_poll_cq(peer, qp, ctx->cqe_cnt);
+                status = aclshmemi_udma_poll_cq(peer, qp, queue_state->cqe_cnt);
             } while (status == 0xffU && GetSystemCycle() - start < 1000000000ULL);
         }
         if (status != 0U) {
             auto tbl = aclshmemi_udma_active_table(info);
             auto cq = reinterpret_cast<__gm__ aclshmemi_udma_cq_ctx_t*>(tbl->scq_ptr) + peer * info->qp_num + qp;
             AscendC::printf("combine PUT queue head=%u tail=%u expected_cq=%u cq_tail=%u wqe_size=%u cqe_size=%u\n",
-                ctx->head, ctx->tail, ctx->cqe_cnt, cq->tail, ctx->wqe_size, cq->cqe_size);
-            // poll_cq only commits cq->tail after reaching its full target.
+                queue_state->sq_head, queue_state->sq_tail, queue_state->cqe_cnt, queue_state->cq_tail, ctx->wqe_size, cq->cqe_size);
+            // poll_cq only commits queue_state->cq_tail after reaching its full target.
             // Probe without consuming to distinguish zero progress from a missing
             // last checkpoint; cq_tail=0 alone does NOT mean no CQEs arrived.
-            uint32_t observed = cq->tail;
-            while (observed != ctx->cqe_cnt && observed - cq->tail < shm::UDMA_CQ_DEPTH_DEFAULT) {
+            uint32_t observed = queue_state->cq_tail;
+            while (observed != queue_state->cqe_cnt && observed - queue_state->cq_tail < shm::UDMA_CQ_DEPTH_DEFAULT) {
                 auto entry = reinterpret_cast<__gm__ aclshmemi_jfc_cqe_ctx_t*>(
                     cq->buf_addr + uint64_t(cq->cqe_size) * (observed & (shm::UDMA_CQ_DEPTH_DEFAULT - 1U)));
                 dcci_cachelines(reinterpret_cast<__gm__ uint8_t*>(entry), sizeof(aclshmemi_jfc_cqe_ctx_t));
@@ -1454,9 +1456,10 @@ struct Pipeline {
         }
 
         if (pass == 0U) {
-            // Only two-port cores poll per peer; six-port cores are no longer blocked by two-port CQ waits.
+            // At 256P, match the two-port per-peer DIRECT drain on QP0 as well.
+            // Other world sizes retain their original QP1-only per-peer drain.
             // Low-level protective polling when SQ space runs low remains enabled.
-            if (ownerQp == 1U) Drain(source, ownerQp);
+            if (r == 256U || ownerQp == 1U) Drain(source, ownerQp);
         } else {
             // Publish ready only for this QP, even if it has no payload.
             // Final waits for both QPs; never publish early on behalf of the other core.
@@ -1478,7 +1481,8 @@ struct Pipeline {
                 SendSource128(source, pass, ownerQp, payloadChunkOrdinal);
             }
         }
-        // QP1 DIRECT still drains per peer; drain all result/ready and QP0 DIRECT here.
+        // Complete result/ready here for both QPs. Outside 256P, this also
+        // drains QP0 DIRECT; at 256P both QPs already drain DIRECT per peer.
         for (uint32_t phase = 0U; phase * kCombinePutSourceLanes < r; ++phase) {
             const uint32_t source = Source(phase * kCombinePutSourceLanes + worker);
             if (LocalSource(source)) continue;

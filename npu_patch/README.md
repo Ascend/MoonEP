@@ -165,7 +165,12 @@ kernel 侧 `aclshmem_ptr`（AscendC 迁移接缝）。
 
 Ascend多卡传输每个对称块按实际 shape 精确分配
 （各 meta 变量单独分配 shmem 地址），buffer-backed 对称堆的 descriptor
-总大小按 VMM 粒度（2 MiB）对齐，这个对齐目前影响create_vmm_physical不支持创建epn * H * Hp * element_size < 2,097,152的场景。对称块不额外创建 shmem Buffer 对象：tensor
+总大小按 ACL 查询到的 VMM 粒度对齐。默认使用 1 GiB 页；小尺寸专家投影可在
+构造 Buffer、查询粒度和创建任何 VMM chunk 之前设置
+`ASCEND_MOONEP_VMM_PAGE_SIZE=2m`，使用 2 MiB 大页（`1g` 为默认，其他值会报错）。
+同一组对称分配期间须保持此设置一致，所有 rank 使用相同设置。
+`[E+B]` 投影仍要求 `epn * H * Hp * element_size` 是实际粒度的整数倍；
+URMA E2E 测试显式选用 2 MiB 页以覆盖其小尺寸投影。对称块不额外创建 shmem Buffer 对象：tensor
 本身即对称块，下游算子通过 `tensor.data_ptr()` 获取对称基址（host 侧
 put/get/signal/free 需要 Buffer 时现场构造）。
 

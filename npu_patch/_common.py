@@ -317,10 +317,9 @@ def cross_rank_barrier(ctx: dict, stream: int) -> None:
     block; combined with the api async path launching kernels on a dedicated
     comm_stream this yields true async.
 
-    Each call advances the process-wide ``_barrier_round`` so back-to-back
-    async ops drive distinct barrier generations (a slow rank's unfinished
-    round cannot be wrongly consumed by a fast rank entering the next round;
-    this avoids deadlocking on the shared sync_counter).
+    ``_barrier_round`` is a context-local diagnostic count. The native SHMEM
+    primitive owns the device barrier generation; this Python count is not
+    passed to the device and cannot enforce generation ordering.
 
     ``stream`` is the caller's current/comm stream ``npu_stream`` handle,
     forwarded verbatim to the on-stream primitive.

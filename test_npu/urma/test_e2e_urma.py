@@ -311,13 +311,25 @@ def assert_raises_assertion(expected_substr, fn):
 
 
 def test_e2e_urma():
+    """Use 2 MiB VMM pages for the smoke test's small expert projections."""
+    previous = os.environ.get("ASCEND_MOONEP_VMM_PAGE_SIZE")
+    try:
+        os.environ["ASCEND_MOONEP_VMM_PAGE_SIZE"] = "2m"
+        _run_e2e_urma()
+    finally:
+        if previous is None:
+            os.environ.pop("ASCEND_MOONEP_VMM_PAGE_SIZE", None)
+        else:
+            os.environ["ASCEND_MOONEP_VMM_PAGE_SIZE"] = previous
+
+
+def _run_e2e_urma():
     """Full URMA operator-chain e2e: dispatch / prefetch / combine / reduce_grad."""
     enable_urma_env()
     rank, R = setup()
-    # S=128/H=64 mirrors test_npu/buffer_test/test_buffer_plan.py's default config, which is
-    # stable on this hardware; larger S/H intermittently trigger a MaskedSelectV3
-    # OOB (507035) in the planning kernel (see docs/planning_operator_test_notes.md).
-    S, H, K, E = 4096, 256, 16, 64
+    S, H, K = 4096, 256, 16
+    # Keep eight home experts per rank for aligned projections on larger worlds.
+    E = max(64, 8 * R)
     # The Ascend planning kernel requires num_prefetch_slots == E / R.
     B = E // R
     epn = E // R
@@ -373,6 +385,7 @@ def test_e2e_urma():
         cu_sync_cpu = cu_sync.clone()
         assert isinstance(plan_sync, MoonEPCommPlan)
         plan_snapshot = plan_sync.clone()
+        assert plan_snapshot.combine_execution_plan is None
         buffer.prefetch_weight(plan=plan_snapshot, **sync_prefetch_args)
         torch.npu.synchronize()
         assert_prefetched(sync_prefetch_meta, plan_snapshot.experts_to_copy[rank])
@@ -468,6 +481,9 @@ def test_e2e_urma():
         h_for_combine, w_for_combine, _, _ = buffer.dispatch(
             hidden, weights, topk, tpe,
         )
+        # Clones keep routing data but drop context-owned execution metadata.
+        # Every fresh PlanningOp invalidates previous prepared generations.
+        buffer.prepare_combine_plan(plan_snapshot)
         out_sync, _, _ = buffer.combine(
             plan=plan_snapshot, hidden_nvsh=h_for_combine, inter_rank_sync=True,
         )
@@ -477,6 +493,7 @@ def test_e2e_urma():
         h_for_combine, w_for_combine, _, _ = buffer.dispatch(
             hidden, weights, topk, tpe,
         )
+        buffer.prepare_combine_plan(plan_snapshot)
         out_with_weights, gathered_weights, _ = buffer.combine(
             plan=plan_snapshot,
             hidden_nvsh=h_for_combine,
@@ -526,6 +543,7 @@ def test_e2e_urma():
         h_for_combine, _, _, _ = buffer.dispatch(
             hidden, weights, topk, tpe,
         )
+        buffer.prepare_combine_plan(plan_snapshot)
         out_grad_sync, _, _ = buffer.combine(
             plan=plan_snapshot,
             hidden_nvsh=h_for_combine,
@@ -542,6 +560,7 @@ def test_e2e_urma():
         h_for_combine, _, _, _ = buffer.dispatch(
             hidden, weights, topk, tpe,
         )
+        buffer.prepare_combine_plan(plan_snapshot)
         out_async, _, _combine_ev = buffer.combine(
             plan=plan_snapshot,
             hidden_nvsh=h_for_combine,
@@ -573,11 +592,12 @@ def test_e2e_urma():
 
 
 def setup():
+    device = local_device_index()
+    torch.npu.set_device(device)
     # Skip if the process group was already initialized by an earlier pytest file in this process (several files in one torchrun).
     if not dist.is_initialized():
         dist.init_process_group(backend="hccl")
     rank = dist.get_rank()
-    torch.npu.set_device(local_device_index())
     return rank, dist.get_world_size()
 
 

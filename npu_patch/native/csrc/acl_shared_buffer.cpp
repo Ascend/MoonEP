@@ -1,5 +1,6 @@
 #include "acl_shared_buffer.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -340,7 +341,13 @@ aclrtPhysicalMemProp vmm_mem_prop(int64_t device_id) {
     aclrtPhysicalMemProp prop{};
     prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
     prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
-    prop.memAttr = ACL_HBM_MEM_HUGE1G;
+    // Keep the existing 1 GiB default; small expert projections can opt into
+    // 2 MiB huge pages before querying granularity and allocating VMM chunks.
+    const char* page_size = std::getenv("ASCEND_MOONEP_VMM_PAGE_SIZE");
+    const std::string policy = page_size == nullptr ? "1g" : page_size;
+    TORCH_CHECK(policy == "1g" || policy == "2m",
+                "ASCEND_MOONEP_VMM_PAGE_SIZE must be 1g or 2m, got ", policy);
+    prop.memAttr = policy == "2m" ? ACL_HBM_MEM_HUGE : ACL_HBM_MEM_HUGE1G;
     prop.location = aclrtMemLocation{
         static_cast<uint32_t>(device_id), ACL_MEM_LOCATION_TYPE_DEVICE};
     prop.reserve = 0;
@@ -623,6 +630,20 @@ static int init_with_buffers_impl(
     }
     attr.option_attr.data_op_engine_type =
         static_cast<data_op_engine_type_t>(data_op_engine_type);
+
+    // Large multi-node VMM teardown can take longer than the SDK's default
+    // control-collective timeout. This affects bootstrap/finalize waits only;
+    // kernel configuration and benchmark timing remain unchanged.
+    if (const char* text = std::getenv("MOONEP_SHMEM_CONTROL_TIMEOUT_S")) {
+        char* end = nullptr;
+        const long seconds = std::strtol(text, &end, 10);
+        TORCH_CHECK(end != text && *end == '\0' && seconds >= 1 && seconds <= 3600,
+                    "MOONEP_SHMEM_CONTROL_TIMEOUT_S must be an integer in [1, 3600]");
+        attr.option_attr.control_operation_timeout = static_cast<uint32_t>(seconds);
+        if (my_pe == 0) {
+            std::fprintf(stderr, "[SHMEM] control_operation_timeout=%ld s\n", seconds);
+        }
+    }
 
     // UDMA: set QP count before init and ensure comm_args is non-null.
     if (enable_udma && qp_count > 0) {

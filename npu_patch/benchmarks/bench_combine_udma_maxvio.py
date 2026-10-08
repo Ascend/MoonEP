@@ -1103,6 +1103,10 @@ def main():
                 ),
             }
             rows.append(case_row)
+            # Persist completed measurements before SHMEM resource teardown.
+            if rank == 0 and args.out:
+                write_csv(args.out, rows)
+                print(f"[result] checkpoint CSV={args.out}", flush=True)
             if rank == 0:
                 dedup_str = (
                     f"{remote_dedup_ratio:.3f}"
