@@ -247,7 +247,9 @@ constexpr uint32_t kAlignedFinalRouteBatch = 4U;
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 inline constexpr aclshmemx_udma_op_config_t kPayload{0U, 0U, 0U, ACLSHMEMX_UDMA_ODR_RO};
 inline constexpr aclshmemx_udma_op_config_t kCheckpoint{1U, 0U, 0U, ACLSHMEMX_UDMA_ODR_SO};
+inline constexpr aclshmemx_udma_op_config_t kDataCheckpointRo{1U, 0U, 0U, ACLSHMEMX_UDMA_ODR_RO};
 #endif
+
 template <typename T>
 __aicore__ inline LocalTensor<T> Ub(uint32_t bytes, uint32_t count) {
     LocalTensor<T> t;
@@ -375,9 +377,15 @@ struct Pipeline {
             for (uint32_t j = 0; j < count; ++j) {
                 if (j + 1U == count) {
                     aclshmemx_submit_t submit(state);
-                    aclshmemx_udma_qp_put_nbi<bf16_t, PIPE_MTE3, kCheckpoint>(
-                        targets[j], inputs[j], reinterpret_cast<__ubuf__ bf16_t*>(Wqe()),
-                        h, peer, qp, EVENT_ID0, submit);
+                    if (r == 128U && peer / 8U != rank / 8U) {
+                        aclshmemx_udma_qp_put_nbi<bf16_t, PIPE_MTE3, kDataCheckpointRo>(
+                            targets[j], inputs[j], reinterpret_cast<__ubuf__ bf16_t*>(Wqe()),
+                            h, peer, qp, EVENT_ID0, submit);
+                    } else {
+                        aclshmemx_udma_qp_put_nbi<bf16_t, PIPE_MTE3, kCheckpoint>(
+                            targets[j], inputs[j], reinterpret_cast<__ubuf__ bf16_t*>(Wqe()),
+                            h, peer, qp, EVENT_ID0, submit);
+                    }
                 } else {
                     aclshmemx_defer_t defer(state);
                     aclshmemx_udma_qp_put_nbi<bf16_t, PIPE_MTE3, kPayload>(
@@ -1456,17 +1464,23 @@ struct Pipeline {
         }
 
         if (pass == 0U) {
-            // At 256P, match the two-port per-peer DIRECT drain on QP0 as well.
-            // Other world sizes retain their original QP1-only per-peer drain.
-            // Low-level protective polling when SQ space runs low remains enabled.
-            if (r == 256U || ownerQp == 1U) Drain(source, ownerQp);
+            // At 128P, submit this peer's DIRECT, result, and SO-ready before
+            // reclaiming its CQ. Protective polling for SQ space stays enabled.
+            // Keep the existing DIRECT drain policy at all other world sizes.
+            if (r != 128U && (r == 256U || ownerQp == 1U)) {
+                Drain(source, ownerQp);
+            }
         } else {
             // Publish ready only for this QP, even if it has no payload.
             // Final waits for both QPs; never publish early on behalf of the other core.
             aclshmemx_submit_state_t state{};
             SendReady(p.final_ready, uint64_t(rank) * 2U + ownerQp,
                       source, ownerQp, state);
-            // Drain result/ready for both QPs at the end of Send128; queue-space protection is unchanged.
+            // Ready is ordered after this QP's DIRECT and reduced payload.
+            // Each sender core exclusively owns this peer/QP's completion queue.
+            if (r == 128U) {
+                Drain(source, ownerQp);
+            }
         }
     }
 
@@ -1481,6 +1495,8 @@ struct Pipeline {
                 SendSource128(source, pass, ownerQp, payloadChunkOrdinal);
             }
         }
+        // At 128P all nonlocal peer/QP queues were drained after their ready WQE.
+        if (r == 128U) return;
         // Complete result/ready here for both QPs. Outside 256P, this also
         // drains QP0 DIRECT; at 256P both QPs already drain DIRECT per peer.
         for (uint32_t phase = 0U; phase * kCombinePutSourceLanes < r; ++phase) {
