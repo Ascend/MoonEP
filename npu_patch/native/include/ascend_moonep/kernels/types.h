@@ -155,6 +155,11 @@ static_assert(sizeof(PlanningTilingData) == 80,
 namespace ascend_moonep {
 inline constexpr uint32_t kCombinePutCores = 64;
 inline constexpr uint32_t kCombinePutBatchRows = 64;
+// Capacity factor only: runtime pages are packed by actual contributor rows.
+inline constexpr uint32_t kCombineRingGroupsPerPage = 64;
+inline constexpr uint32_t kCombineRingDepth = 4;
+inline constexpr uint32_t kCombineRingStreams = 8;
+inline constexpr uint32_t kCombineRingMaxShards = 4;
 } // namespace ascend_moonep
 
 // ---- Communication workspace layout ----
@@ -173,17 +178,14 @@ namespace ascend_moonep {
 //
 // Source=original token owner/final destination; producer=expert-output holder;
 // ingress=server group reducer. The same rank can have all three roles.
-// Earlier payload/metadata offsets remain stable, but flag/extension offsets
-// differ from checkpoint f5fd3b0: host, Python and kernel MUST be installed together.
+// Workspace offsets are shared by Planning and Combine. Host, Python and
+// device kernels MUST be rebuilt and installed together after layout changes.
 struct CombinePutLayout {
     uint64_t final_hidden; // BF16[N,H], compact producer segments at each source.
                            // Local-server routes include suppressed members too.
-    uint64_t send_hidden;  // BF16[N,H], legacy payload arena. Aligned path reuses
-                           // its first N 64-byte slots as direct_send:
-                           // {tx loff, tx ordinal}; H>=32 keeps ABI unchanged.
-    uint64_t relay_hidden; // BF16[8*N,H], source-major contiguous contributor groups:
-                           // [representative,duplicate0,...]. Reducer overwrites
-                           // each group head with its BF16 sum; sender reads there.
+    uint64_t relay_hidden; // Phase pool: Planning staging, then BF16 input ring.
+                           // 8 streams * 4 pages * (64*K) rows; groups never cross pages.
+    uint64_t relay_result; // BF16[N,H], stable sums indexed by the original TX index.
     uint64_t weights;      // float[N], every original source route, no weight dedup.
 
     uint64_t reverse;     // Retired reverse-route records; offset reserved for ABI stability.
@@ -194,12 +196,12 @@ struct CombinePutLayout {
     uint64_t group_of_loff;// Retired group lookup arena; offset reserved.
     uint64_t tx_rows;      // N records in source/ordinal order:
                            // {loff,group,scratchHead(-1 for DIRECT),contributorCount}.
-                           // DIRECT count=1, no reducer/copy to send_hidden.
+                           // DIRECT count=1; send original hidden without server reduction.
     uint64_t source_counts;// R records:
                            // [0]=active result count, [1]=remote final segment base,
                            // [2]=local tx base, [3]=DIRECT count,
                            // [4]=scratch range start, [5]=scratch slot count,
-                           // [6]=direct_send compact range start.
+                            // [6]=ring page count, [7]=first logical ring page.
                            // Scratch slots INCLUDE contributor holes; <=N/source.
     uint64_t counts_send;  // Planner-local R records: {groupCount,groupPrefix} per source.
     uint64_t contributor; // 8*N records: word0 is {count:high32,txIndex:low32},
@@ -223,7 +225,7 @@ struct CombinePutLayout {
     uint64_t weight_ready;// R slots, producer -> complete all original route weights.
     uint64_t magic;       // 64 stable per-core SHMEM PUT-source flag slots.
     uint64_t relay_ranges;// 8*R records at producer: ingressLocal*R+source
-                           // -> {requestBegin,requestCount}.
+                            // -> {requestBegin,requestCount,receiverSourcePageCount}.
     uint64_t relay_ranges_send; // Planner-local 8*R stats records:
                            // {scratchCount,requestCount,scratchPrefix,requestPrefix}.
                            // After metadata completion, reused as R*512B final
@@ -235,23 +237,66 @@ struct CombinePutLayout {
                                 // Each output token owns {count, route[16]}; route is either
                                 // local hidden loff (bit31 set) or final_hidden row. N records
                                 // reserve for K=1 too; the active prefix is N/K records.
+    uint64_t ring_epoch;        // 8 receiver/peer invocation epochs.
+    uint64_t ring_ready;        // [stream,slot,producerLocal], 8*4*8 flags.
+    uint64_t ring_credit;       // [stream,slot], 8*4 reusable input-page credits.
+    uint64_t ring_done;         // [stream,slot,shard], 8*4*4 reducer completion flags.
+    uint64_t ring_ready_source; // [ingressLocal,stream,slot], 8*8*4 SO source flags.
+    uint64_t ring_result_ready; // Persistent logical-page ready flags, never ring-indexed.
     uint64_t bytes;       // Total bytes including all alignment/reserved arenas.
     uint32_t batches;     // ceil(N/64), worst per-source scratch batch capacity.
+    uint32_t ring_page_rows, ring_page_capacity;
 };
 
 MOONEP_PUT_INLINE uint64_t CombinePutAlign(uint64_t bytes) {
     return (bytes + 511U) & ~uint64_t(511U);
 }
-MOONEP_PUT_INLINE CombinePutLayout MakeCombinePutLayout(
+MOONEP_PUT_INLINE uint32_t CombineRingPageCapacity(uint32_t n, uint32_t ranks) {
+    // Each nonempty source can contribute a separate partial final page.
+    return static_cast<uint32_t>((uint64_t(n) + kCombineRingGroupsPerPage - 1U) /
+                                 kCombineRingGroupsPerPage + ranks);
+}
+MOONEP_PUT_INLINE uint64_t CombineRingLayoutFingerprint(uint32_t k) {
+    // Bit 40 distinguishes row-packed plans from legacy 64-group pages.
+    return (uint64_t(1U) << 40U) | (uint64_t(kCombineRingStreams) << 56U) |
+           (uint64_t(kCombineRingDepth) << 48U) |
+           (uint64_t(kCombineRingGroupsPerPage) << 32U) |
+           uint64_t(kCombineRingGroupsPerPage) * k;
+}
+MOONEP_PUT_INLINE uint64_t CombinePlanningStageBytes(
     uint32_t n, uint32_t h, uint32_t ranks) {
+    // Preserve the original rank/server staged eligibility. Buffer allocation
+    // precedes the plan's mode, so reserve the largest eligible mode's staging.
+    if (ranks > 128U) return 0U;
+    const uint64_t server = 32U + 8U * 8U, rank = 32U + 8U;
+    if (uint64_t(ranks) * server <= uint64_t(h) * 16U)
+        return uint64_t(ranks) * n * server;
+    if (uint64_t(ranks) * rank <= uint64_t(h) * 16U)
+        return uint64_t(ranks) * n * rank;
+    return 0U;
+}
+MOONEP_PUT_INLINE uint64_t CombineRingPublishBytes(uint32_t n, uint32_t ranks) {
+    const uint64_t legacy = uint64_t(n) * 8U * 64U;
+    const uint64_t mirror = CombinePutAlign(uint64_t(ranks) * 64U) +
+        CombinePutAlign(uint64_t(CombineRingPageCapacity(n, ranks)) * 64U);
+    return CombinePutAlign(legacy > mirror ? legacy : mirror);
+}
+MOONEP_PUT_INLINE CombinePutLayout MakeCombinePutLayout(
+    uint32_t n, uint32_t h, uint32_t ranks, uint32_t k = 16U) {
     CombinePutLayout p{};
     const uint64_t row_bytes = uint64_t(n) * h * 2U; // all N rows, not one row
     const uint64_t meta = uint64_t(n) * 64U;
     p.batches = (uint64_t(n) + 63U) / 64U;
+    p.ring_page_rows = kCombineRingGroupsPerPage * k;
+    p.ring_page_capacity = CombineRingPageCapacity(n, ranks);
     p.final_hidden = 0;
-    p.send_hidden = CombinePutAlign(row_bytes);
-    p.relay_hidden = p.send_hidden + CombinePutAlign(row_bytes);
-    p.weights = p.relay_hidden + CombinePutAlign(8U * row_bytes);
+    p.relay_hidden = CombinePutAlign(row_bytes);
+    const uint64_t ring_bytes = CombinePutAlign(uint64_t(kCombineRingStreams) *
+        kCombineRingDepth * p.ring_page_rows * h * 2U);
+    p.relay_result = p.relay_hidden + ring_bytes;
+    const uint64_t runtime_bytes = ring_bytes + CombinePutAlign(row_bytes);
+    const uint64_t stage_bytes = CombinePutAlign(CombinePlanningStageBytes(n, h, ranks));
+    p.weights = p.relay_hidden + (stage_bytes > runtime_bytes ? stage_bytes : runtime_bytes);
     p.reverse = p.weights + CombinePutAlign(uint64_t(n) * 4U);
     p.reverse_send = p.reverse + CombinePutAlign(meta);
     p.final_map = p.reverse_send + CombinePutAlign(meta);
@@ -262,7 +307,7 @@ MOONEP_PUT_INLINE CombinePutLayout MakeCombinePutLayout(
     p.contributor = p.counts_send + CombinePutAlign(uint64_t(ranks) * 64U);
     p.relay_send = p.contributor + CombinePutAlign(8U * meta);
     p.relay_publish = p.relay_send + CombinePutAlign(8U * meta);
-    p.relay_counts = p.relay_publish + CombinePutAlign(8U * meta);
+    p.relay_counts = p.relay_publish + CombineRingPublishBytes(n, ranks);
     p.relay_counts_send = p.relay_counts + 512U;
     p.relay_ready = p.relay_counts_send + 512U;
     p.reduce_ready = p.relay_ready + uint64_t(8U) * ranks * 512U;
@@ -274,7 +319,15 @@ MOONEP_PUT_INLINE CombinePutLayout MakeCombinePutLayout(
     p.source_input_ready = p.relay_ranges_send + CombinePutAlign(uint64_t(8U) * ranks * 64U);
     p.final_gate = p.source_input_ready + uint64_t(ranks) * 512U;
     p.final_routes = p.final_gate + 512U;
-    p.bytes = p.final_routes + CombinePutAlign(uint64_t(n) * 128U);
+    p.ring_epoch = p.final_routes + CombinePutAlign(uint64_t(n) * 128U);
+    p.ring_ready = p.ring_epoch + uint64_t(8U) * 512U;
+    p.ring_credit = p.ring_ready + uint64_t(kCombineRingStreams) * kCombineRingDepth * 8U * 512U;
+    p.ring_done = p.ring_credit + uint64_t(kCombineRingStreams) * kCombineRingDepth * 512U;
+    p.ring_ready_source = p.ring_done + uint64_t(kCombineRingStreams) *
+        kCombineRingDepth * kCombineRingMaxShards * 512U;
+    p.ring_result_ready = p.ring_ready_source + uint64_t(8U) *
+        kCombineRingStreams * kCombineRingDepth * 512U;
+    p.bytes = p.ring_result_ready + uint64_t(p.ring_page_capacity) * 512U;
     return p;
 }
 #undef MOONEP_PUT_INLINE
@@ -289,28 +342,34 @@ namespace ascend_moonep {
 #endif
 // Rank-local immutable snapshot. No payload, ready flags, magic or QP state.
 // Offsets are relative to this tensor, not the symmetric communication workspace.
-// v5: planner writes directly here. TX/contributor/relay records are packed;
-// scalar-written counts/ranges and final descriptors retain cacheline isolation.
-// Regenerate plans and deploy host/device together; v4 snapshots are incompatible.
-inline constexpr uint64_t kCombineExecutionPlanVersion = 0x4d45504300000005ULL;
+// v6: append immutable whole-group input pages and producer request mappings.
+// Existing TX/contributor/relay record strides are unchanged. Ready flags,
+// invocation epochs and ring credits remain in the communication workspace.
+// Regenerate plans and deploy host/device together; older snapshots are incompatible.
+inline constexpr uint64_t kCombineExecutionPlanVersion = 0x4d45504300000006ULL;
 inline constexpr uint32_t kCombinePlanTxBytes = 16U;
 inline constexpr uint32_t kCombinePlanContributorBytes = 16U;
 inline constexpr uint32_t kCombinePlanRelayBytes = 8U;
 struct CombineExecutionPlanLayout {
     uint64_t tx_rows, source_counts, contributor, relay_send, relay_ranges;
-    uint64_t final_routes, bytes;
+    uint64_t final_routes, ring_pages, relay_page_map, bytes;
 };
 MOONEP_PLAN_INLINE CombineExecutionPlanLayout MakeCombineExecutionPlanLayout(
     uint32_t n, uint32_t ranks) {
     CombineExecutionPlanLayout q{};
-    q.tx_rows = 512U; // Header: version, N,H,K,R,rank,server_dedup,reserved.
+    q.tx_rows = 512U; // Header: version,N,H,K,R,rank,server_dedup,ring fingerprint.
     q.source_counts = q.tx_rows + CombinePutAlign(uint64_t(n) * kCombinePlanTxBytes);
     q.contributor = q.source_counts + CombinePutAlign(uint64_t(ranks) * 64U);
     q.relay_send = q.contributor + CombinePutAlign(uint64_t(n) * 8U * kCombinePlanContributorBytes);
     q.relay_ranges = q.relay_send + CombinePutAlign(uint64_t(n) * 8U * kCombinePlanRelayBytes);
     q.final_routes = q.relay_ranges + CombinePutAlign(uint64_t(ranks) * 8U * 64U);
     // Weights read the existing dst directly; no dedicated weights table.
-    q.bytes = q.final_routes + CombinePutAlign(uint64_t(n) * 128U);
+    q.ring_pages = q.final_routes + CombinePutAlign(uint64_t(n) * 128U);
+    // Each 64B page begins {scratchBegin,scratchCount,groupCount,source}.
+    q.relay_page_map = q.ring_pages +
+        CombinePutAlign(uint64_t(CombineRingPageCapacity(n, ranks)) * 64U);
+    // Parallel to relay_send[8*N], each packed 8B entry is {sourcePageSeq,rowOffset}.
+    q.bytes = q.relay_page_map + CombinePutAlign(uint64_t(n) * 8U * 8U);
     return q;
 }
 #undef MOONEP_PLAN_INLINE

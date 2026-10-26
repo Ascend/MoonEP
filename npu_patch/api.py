@@ -22,7 +22,6 @@ import torch.distributed as dist
 
 from ._common import (
     BARRIER_SLOTS,
-    OP_WS_BYTES_DEFAULT,
     cross_rank_barrier,
     dispatch_sync_buffer_nbytes,
     record_streams,
@@ -30,10 +29,10 @@ from ._common import (
 from .buffer_c import (
     _OWNER_SOURCE_VA_ATTR,
     _SLOT_SOURCE_VA_ATTR,
-    create_sym_tensor_from_ptr,
     create_sym_tensor_from_source,
     create_vmm_physical,
-    map_to_sym_ptr,
+    create_vmm_arena,
+    translate_tensor,
 )
 from .planning import MoonEPCommPlan, allocate_planning_outputs
 from .ops import (
@@ -85,19 +84,6 @@ def _num_sms_dedup_from_env(max_sms: int) -> int:
             f"MOONEP_NUM_SMS_DEDUP must be in [1, {max_sms}], got {value}"
         )
     return value
-
-
-def _op_ws_bytes_from_env(default: int = OP_WS_BYTES_DEFAULT) -> int:
-    """Per-op symmetric workspace bytes (tunable for benchmarks).
-
-    v1 uses a single generous workspace per RMA-capable op; M4 tunes it down to
-    the kernels' actual scratch needs. No 2 MiB alignment is required on Ascend
-    (individual symmetric allocations are aligned by the allocator internally).
-    """
-    raw = os.environ.get("MOONEP_ASCEND_OP_WS_BYTES")
-    if raw is None or raw == "":
-        return default
-    return int(raw)
 
 
 def _log_context_buffer_size(ctx: dict) -> None:
@@ -237,39 +223,39 @@ def _create_context(
                       for name in ctx_udma_flags}
 
     hidden_buf, _, _ = create_vmm_physical([NvS, H], torch.bfloat16, device)
-    # Cross-rank (symmetric) dispatch metadata.
-    weights_buf, _, _ = create_vmm_physical([NvS], torch.int32, device)
-    barrier_buf, _, _ = create_vmm_physical(
-        [BARRIER_SLOTS], torch.int32, device)
-    vmm_chunks = {
-        'hidden_buf': hidden_buf._vmm_allocation,
-        'weights_buf': weights_buf._vmm_allocation,
-        'barrier_buf': barrier_buf._vmm_allocation,
-    }
+    vmm_chunks = {'hidden_buf': hidden_buf._vmm_allocation}
 
     # PUT workspace must be symmetric; MTE does not need these large arenas.
     if effective_udma['combine']:
         combine_workspace, _, _ = create_vmm_physical(
-            [combine_put_workspace_bytes(NvS, H, R)], torch.uint8, device)
+            [combine_put_workspace_bytes(NvS, H, R, K)], torch.uint8, device)
         vmm_chunks['combine_workspace'] = combine_workspace._vmm_allocation
     else:
         combine_workspace = torch.empty(0, dtype=torch.uint8, device=dev)
 
-    # Combine owns a separate grant/done cacheline pool.  Keeping this distinct
-    # from dispatch prevents the two protocols from sharing flag generations or
-    # becoming coupled through their unrelated layouts.
-    combine_sync_buffer, _, _ = create_vmm_physical(
-        [R * _COMBINE_SYNC_BYTES_PER_RANK + _COMBINE_LOCAL_AIV_SYNC_BYTES], torch.uint8, device)
+    # Small communication buffers share one physical VMM allocation. Each
+    # region has its own 512-byte-aligned, padded range; protocol flags never
+    # overlap. Payload buffers retain their independent allocations/page policy.
+    comm_views = create_vmm_arena([
+        ('weights_buf', [NvS], torch.int32),
+        ('barrier_buf', [BARRIER_SLOTS], torch.int32),
+        ('combine_sync_buffer',
+         [R * _COMBINE_SYNC_BYTES_PER_RANK + _COMBINE_LOCAL_AIV_SYNC_BYTES], torch.uint8),
+        ('dispatch_sync_buffer', [dispatch_sync_buffer_nbytes(R)], torch.uint8),
+        ('planning_symmetric_workspace', [planning_symmetric_bytes], torch.uint8),
+    ], device)
+    weights_buf = comm_views['weights_buf']
+    barrier_buf = comm_views['barrier_buf']
+    combine_sync_buffer = comm_views['combine_sync_buffer']
+    dispatch_sync_buffer = comm_views['dispatch_sync_buffer']
+    for name in ('weights_buf', 'barrier_buf', 'combine_sync_buffer', 'dispatch_sync_buffer'):
+        vmm_chunks[name] = comm_views[name]._vmm_allocation
     combine_sync_buffer.zero_()
-    vmm_chunks['combine_sync_buffer'] = combine_sync_buffer._vmm_allocation
 
     # Dispatch sync_buffer: Token control region followed by the four-round
     # local sync region for the 16 Token AIVs.
     # Weight aggregation uses the subsequent inbox, staging, and diagnostics regions.
-    dispatch_sync_buffer, _, _ = create_vmm_physical(
-        [dispatch_sync_buffer_nbytes(R)], torch.uint8, device)
     dispatch_sync_buffer.zero_()
-    vmm_chunks['dispatch_sync_buffer'] = dispatch_sync_buffer._vmm_allocation
     # Zero this rank's barrier words (writes through to the VMM source VA).
     barrier_buf.zero_()
 
@@ -280,17 +266,21 @@ def _create_context(
     # ================================================================
     # Kernel ops (ascend_deepep-style: created at Buffer init)
     # ================================================================
-    ws = _op_ws_bytes_from_env()
     kernels = {
-        'planning': PlanningOp(ws_bytes=planning_symmetric_bytes, num_sms=num_sms),
-        'dispatch': DispatchOp(ws_bytes=ws, num_sms=num_sms),
-        'combine': CombineOp(ws_bytes=ws, num_sms=num_sms),
+        'planning': PlanningOp(ws_bytes=planning_symmetric_bytes, num_sms=num_sms,
+                               ws_tensor=comm_views['planning_symmetric_workspace']),
+        # These ops use the context's communication tensors, never a generic
+        # op-owned scratch buffer. Avoid allocating two unused VMM ranges.
+        'dispatch': DispatchOp(ws_bytes=0, num_sms=num_sms),
+        'combine': CombineOp(ws_bytes=0, num_sms=num_sms),
         'prefetch': PrefetchOp(ws_bytes=0, num_sms=num_sms),
         'grad_reduce': GradReduceOp(ws_bytes=0, num_sms=num_sms),
     }
     os.environ['ASCEND_MOONEP_USE_UDMA'] = '1' if any(effective_udma.values()) else '0'
     for name, enabled in effective_udma.items():
         os.environ[f'ASCEND_MOONEP_{name.upper()}_USE_UDMA'] = '1' if enabled else '0'
+
+    vmm_allocations = tuple({a.source_va: a for a in vmm_chunks.values()}.values())
 
     ctx = {
         'rank': rank,
@@ -329,6 +319,7 @@ def _create_context(
         # collected by the framework for buffer-backed shmem init
         # (ShmemRuntime.init_with_buffer); Buffer.destroy reverses the VMM ops.
         'vmm_chunks': vmm_chunks,
+        'vmm_allocations': vmm_allocations,
         # One local allocation; C++ slices every 32-byte-aligned subregion.
         'planning_workspace': planning_workspace,
         # Local views (rebuilt over translated shmem addresses once
@@ -341,19 +332,9 @@ def _create_context(
         # Buffer-backed: translated by _ensure_shmem_views after
         # init_with_buffer.
         '_shmem_views_ready': False,
-        # Total VA bytes registered with buffer-backed init (actual 2 MiB-gran
-        # aligned sizes of the VMM chunks / op workspaces); used by the
-        # framework to budget descriptor size.
-        'shmem_footprint_bytes': (
-            sum(a.size for a in vmm_chunks.values())
-            + sum(
-                int(op._ws_tensor._vmm_allocation.size)
-                if op._ws_tensor is not None
-                and getattr(op._ws_tensor, '_vmm_allocation', None) is not None
-                else 0
-                for op in kernels.values()
-            )
-        ),
+        # Sum physical owners once, including the borrowed Planning workspace
+        # in the shared arena. Tensor views and peer mappings do not add HBM.
+        'shmem_footprint_bytes': sum(a.size for a in vmm_allocations),
     }
     _log_context_buffer_size(ctx)
     return ctx
@@ -504,10 +485,8 @@ class Buffer:
             allocation = ctx['vmm_chunks'].get(name)
             if allocation is None:
                 continue
-            sym = map_to_sym_ptr(allocation.source_va, name)
             src = ctx[name]
-            ctx[name] = create_sym_tensor_from_ptr(
-                sym, src.shape, src.dtype, src.device)
+            ctx[name] = translate_tensor(src, name)
         ctx['hidden_buf_local'] = ctx['hidden_buf'][:ctx['NvS']]
         ctx['weights_buf_local'] = ctx['weights_buf'][:ctx['NvS']]
         ctx['_shmem_views_ready'] = True
@@ -533,6 +512,11 @@ class Buffer:
             self._destroyed = True
             return
 
+        # Reject before mutating borrowed op state if SHMEM still owns the
+        # backing. A failed finalize must leave this Buffer entirely usable.
+        for allocation in ctx['vmm_allocations']:
+            allocation.ensure_releasable()
+
         # torch_npu.npu.synchronize() below already drains every stream on the
         # device, including the comm stream, so no separate comm-stream sync.
         torch_npu.npu.synchronize()
@@ -548,17 +532,8 @@ class Buffer:
         # Buffer does not shmem_finalize itself).
         for op in ctx['kernels'].values():
             op.destroy()
-        for name in (
-            'hidden_buf',
-            'combine_workspace',
-            'weights_buf',
-            'barrier_buf',
-            'combine_sync_buffer',
-            'dispatch_sync_buffer',
-        ):
-            allocation = ctx['vmm_chunks'].get(name)
-            if allocation is not None:
-                allocation.destroy()
+        for allocation in ctx['vmm_allocations']:
+            allocation.destroy()
         if uses_process_group:
             dist.barrier(group=group)
 
@@ -1009,10 +984,11 @@ class Buffer:
         return done
 
     def prepare_combine_plan(self, plan: MoonEPCommPlan):
-        """Collectively prepare manually built/cloned routes before UDMA combine.
+        """Collectively prepare manually built routes before UDMA combine.
 
         All ranks call after dst is ready. Ordinary dispatch planning does this
-        automatically. No preparation is hidden inside the combine timed loop.
+        automatically, and plan.clone() preserves those prepared tables locally.
+        No preparation is hidden inside the combine timed loop.
         """
         ctx = self._require_ctx()
         self._ensure_shmem_views()

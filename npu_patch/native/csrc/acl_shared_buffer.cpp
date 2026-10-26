@@ -341,10 +341,10 @@ aclrtPhysicalMemProp vmm_mem_prop(int64_t device_id) {
     aclrtPhysicalMemProp prop{};
     prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
     prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
-    // Keep the existing 1 GiB default; small expert projections can opt into
-    // 2 MiB huge pages before querying granularity and allocating VMM chunks.
+    // Default to 2 MiB huge pages to avoid 1 GiB allocation rounding.
+    // Set ASCEND_MOONEP_VMM_PAGE_SIZE=1g before VMM allocation to opt in.
     const char* page_size = std::getenv("ASCEND_MOONEP_VMM_PAGE_SIZE");
-    const std::string policy = page_size == nullptr ? "1g" : page_size;
+    const std::string policy = page_size == nullptr ? "2m" : page_size;
     TORCH_CHECK(policy == "1g" || policy == "2m",
                 "ASCEND_MOONEP_VMM_PAGE_SIZE must be 1g or 2m, got ", policy);
     prop.memAttr = policy == "2m" ? ACL_HBM_MEM_HUGE : ACL_HBM_MEM_HUGE1G;

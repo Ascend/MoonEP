@@ -37,8 +37,11 @@ class MoonEPCommPlan:
     dup_groups: torch.Tensor
     dup_loffs: torch.Tensor
     dup_counts: torch.Tensor
-    # Produced by PlanningOp for UDMA combine; clone() deliberately drops it.
+    # Produced by PlanningOp for UDMA combine; clone() copies its immutable tables.
     combine_execution_plan: object | None = field(default=None, repr=False, compare=False)
+    # Native routing writes do not advance Tensor._version. Track this plan only,
+    # so rebuilding a different plan does not invalidate independent snapshots.
+    _planning_generation: int = field(default=0, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         N = int(self.N)
@@ -74,9 +77,18 @@ class MoonEPCommPlan:
         return "server" if tuple(self.dup_counts.shape) == (self.R + 2,) else "rank"
 
     def clone(self) -> "MoonEPCommPlan":
-        """Deep-clone every plan tensor (mirrors ``moonep.planning``; the tests
-        snapshot plans with ``plan.clone()``)."""
-        return type(self)(
+        """Copy routing and any prepared combine tables locally, without communication.
+
+        The snapshot remains bound to the same Buffer and its reusable workspace;
+        overlapping combine calls on that workspace are still unsupported.
+        """
+        execution = self.combine_execution_plan
+        if execution is not None:
+            execution.validate(execution.owner_ctx, self)
+            import torch_npu
+            stream = torch_npu.npu.current_stream()
+            stream.wait_event(execution.ready)
+        snapshot = type(self)(
             dst=self.dst.clone(),
             experts_to_copy=self.experts_to_copy.clone(),
             zero_fill_ranges=self.zero_fill_ranges.clone(),
@@ -90,7 +102,29 @@ class MoonEPCommPlan:
             B=self.B,
             NvS=self.NvS,
             K=self.K,
+            _planning_generation=self._planning_generation,
         )
+        if execution is not None:
+            storage = execution.storage.clone()
+            ready = torch_npu.npu.Event()
+            ready.record(stream)
+            for plan in (self, snapshot):
+                for tensor in (plan.dst, plan.experts_to_copy, plan.zero_fill_ranges,
+                               plan.remote_stats, plan.dup_groups, plan.dup_loffs,
+                               plan.dup_counts):
+                    tensor.record_stream(stream)
+            execution.storage.record_stream(stream)
+            storage.record_stream(stream)
+            copied_execution = CombineExecutionPlan(
+                storage=storage, routing_id=id(snapshot), workspace=execution.workspace,
+                key=execution.key, route_stamps=tuple(map(_stamp, _routes(snapshot))),
+                storage_stamp=_stamp(storage), generation=snapshot._planning_generation,
+                ready=ready, owner_ctx=execution.owner_ctx,
+                prepare_begin=execution.prepare_begin, prepare_end=execution.prepare_end,
+                fused=execution.fused,
+            )
+            object.__setattr__(snapshot, 'combine_execution_plan', copied_execution)
+        return snapshot
 
 
 # ---- Immutable combine execution-plan ownership and validation ----
@@ -112,6 +146,16 @@ def _key(ctx):
     return tuple(int(ctx[name]) for name in ('S', 'H', 'K', 'R', 'rank'))
 
 
+def _execution_key(ctx):
+    # Keep the five native launch arguments stable. The local cached-plan key
+    # also binds the private ring ABI and workspace geometry.
+    from .combine import (COMBINE_RING_PLAN_ABI, COMBINE_RING_STREAMS,
+                          COMBINE_RING_DEPTH, COMBINE_RING_GROUPS_PER_PAGE)
+    return (*_key(ctx), COMBINE_RING_PLAN_ABI, COMBINE_RING_STREAMS,
+            COMBINE_RING_DEPTH, COMBINE_RING_GROUPS_PER_PAGE,
+            int(ctx['combine_workspace'].numel()))
+
+
 @dataclass
 class CombineExecutionPlan:
     storage: torch.Tensor
@@ -128,13 +172,13 @@ class CombineExecutionPlan:
     fused: bool = False
 
     def validate(self, ctx, plan):
-        if ctx is not self.owner_ctx or _key(ctx) != self.key:
+        if ctx is not self.owner_ctx or _execution_key(ctx) != self.key:
             raise ValueError('execution plan belongs to a different Buffer/topology/shape')
         if ctx['combine_workspace'].data_ptr() != self.workspace.data_ptr():
             raise ValueError('combine workspace changed; collectively prepare a new plan')
         if id(plan) != self.routing_id or tuple(map(_stamp, _routes(plan))) != self.route_stamps:
             raise ValueError('routing changed; all ranks must prepare a new execution plan')
-        if ctx.get('_combine_plan_generation', 0) != self.generation:
+        if plan._planning_generation != self.generation:
             raise ValueError('planning was rerun; all ranks must prepare a new execution plan')
         if _stamp(self.storage) != self.storage_stamp:
             raise ValueError('execution plan storage was modified')
@@ -190,9 +234,9 @@ def prepare_combine_plan(ctx, plan, *, storage=None, fused_timing=None):
     end.record(stream)
     for tensor in (storage, *tensors, ctx['combine_workspace']):
         tensor.record_stream(stream)
-    execution = CombineExecutionPlan(storage, id(plan), ctx['combine_workspace'], _key(ctx),
+    execution = CombineExecutionPlan(storage, id(plan), ctx['combine_workspace'], _execution_key(ctx),
         tuple(map(_stamp, tensors)), _stamp(storage),
-        ctx.get('_combine_plan_generation', 0), end, ctx, begin, end)
+        plan._planning_generation, end, ctx, begin, end)
     execution.fused = fused
     object.__setattr__(plan, 'combine_execution_plan', execution)
     return execution

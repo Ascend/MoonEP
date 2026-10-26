@@ -19,6 +19,7 @@ Difference from the Python-package version: RAII -- the deleter runs
 from __future__ import annotations
 
 import math
+import operator
 
 import torch
 
@@ -297,13 +298,17 @@ class VmmAllocation:
         """Alias used by the arena descriptor (same as ``mem_handle``)."""
         return self.mem_handle
 
-    def destroy(self) -> None:
-        if self._destroyed:
-            return
-        if self._registered and _SHMEM_BACKING_LOCKED:
+    def ensure_releasable(self) -> None:
+        """Check teardown eligibility without changing owner or handle state."""
+        if not self._destroyed and self._registered and _SHMEM_BACKING_LOCKED:
             raise RuntimeError(
                 "cannot release VMM descriptor backing before a successful "
                 "collective shmem finalize")
+
+    def destroy(self) -> None:
+        if self._destroyed:
+            return
+        self.ensure_releasable()
         acl_vmm_free_source(self.source_va, self.mem_handle)
         self._destroyed = True
 
@@ -465,6 +470,78 @@ def create_vmm_physical(shape, dtype: torch.dtype, device: int):
     return tensor, handle, shareable
 
 
+def create_vmm_arena(specs, device: int) -> dict[str, torch.Tensor]:
+    """Pack named ``(name, shape, dtype)`` chunks into one VMM descriptor.
+
+    Each chunk starts on a 512-byte boundary and reserves its own padded
+    512-byte span, so full-cacheline accesses cannot reach the next chunk.
+    Tensor shapes still expose only their logical elements. All returned
+    tensors hold the same allocation owner; the caller destroys that owner
+    once, after collective SHMEM finalize, just like ``create_vmm_physical``.
+    All ranks must provide the same ordered specs before SHMEM initialization.
+    """
+    if _SHMEM_BACKING_LOCKED:
+        raise RuntimeError(
+            "cannot register a symmetric descriptor after buffer-backed "
+            "shmem initialization; it would not belong to the active heap")
+    layout = []
+    names = set()
+    cursor = 0
+    for name, shape, dtype in specs:
+        if not isinstance(name, str) or not name or name in names:
+            raise ValueError("arena chunk names must be unique non-empty strings")
+        shape = tuple(operator.index(dim) for dim in shape)
+        if any(dim < 0 for dim in shape):
+            raise ValueError(f"{name}: shape dims must be non-negative")
+        if dtype not in _ELEM_SIZE:
+            raise ValueError(f"{name}: unsupported arena dtype {dtype}")
+        nbytes = _numel(shape) * _ELEM_SIZE[dtype]
+        if nbytes <= 0:
+            raise ValueError(f"{name}: arena chunk must have at least one element")
+        offset = _align_up(cursor, 512)
+        layout.append((name, shape, dtype, offset, nbytes))
+        cursor = offset + _align_up(nbytes, 512)
+        names.add(name)
+    if not layout:
+        raise ValueError("arena requires at least one chunk")
+
+    device_id = int(device)
+    _require_current_device(device_id)
+    access_device_id = local_physical_id(device_id)
+    gran = int(acl_vmm_granularity(device_id))
+    if gran <= 0:
+        raise RuntimeError("VMM allocation granularity must be positive")
+    alloc_size = _align_up(cursor, gran)
+    va, handle, shareable, size, fabric_bytes = acl_vmm_alloc_source(
+        alloc_size, device_id, access_device_id)
+    allocation = None
+    try:
+        allocation = VmmAllocation(
+            va, handle, shareable, size, fabric_handle_bytes=fabric_bytes,
+            device_id=device_id)
+        if allocation.size < cursor:
+            raise RuntimeError("VMM arena backing is smaller than its padded chunks")
+        views = {}
+        for name, shape, dtype, offset, nbytes in layout:
+            tensor = create_sym_tensor_from_ptr(
+                allocation.source_va + offset, shape, dtype,
+                torch.device(f"npu:{device_id}"))
+            tensor._vmm_allocation = allocation
+            tensor._vmm_offset_bytes = offset
+            tensor._vmm_view_bytes = nbytes
+            views[name] = tensor
+        # Publish once, only after every view has been constructed. A registry
+        # sealed while allocation/view creation ran rejects this transaction.
+        register_symmetric_descriptor(allocation)
+    except Exception:
+        if allocation is not None:
+            allocation.destroy()
+        else:
+            acl_vmm_free_source(va, handle)
+        raise
+    return views
+
+
 def map_to_sym_ptr(va, name: str) -> int:
     """Translate a registered local VA to its local shmem symmetric address
     (PR-653 ``get_buffer_ptr``).
@@ -472,12 +549,60 @@ def map_to_sym_ptr(va, name: str) -> int:
     Requires an initialized buffer-backed symmetric heap
     (``shmem_init_with_buffer``) and a registered ``va``; raises otherwise.
     """
-    sym = int(acl_shmem_get_buffer_ptr(int(va)))
+    va = int(va)
+    allocation = next(
+        (item for item in _VMM_REGISTRY
+         if not getattr(item, '_destroyed', False)
+         and int(item.source_va) <= va < int(item.source_va) + int(item.size)),
+        None,
+    )
+    base = int(allocation.source_va) if allocation is not None else va
+    # SHMEM need only recognize the descriptor base. Packed chunks may start
+    # inside that descriptor, so translate the base and preserve their offset.
+    sym = int(acl_shmem_get_buffer_ptr(base))
     if sym == 0:
         raise RuntimeError(
             f"{name}: VA 0x{int(va):x} is not registered in the buffer-backed "
             f"shmem heap; call shmem_init_with_buffer with its descriptor first")
-    return sym
+    return sym + (va - base)
+
+
+def translate_tensor(source_tensor: torch.Tensor,
+                     name: str = "translate_tensor") -> torch.Tensor:
+    """Translate a source tensor using its registered owner base and offset.
+
+    Packed interior addresses are not descriptors themselves. Only the owner
+    base is submitted to SHMEM; its translated address then receives the
+    checked byte offset. The returned non-owning view retains the allocation
+    owner and chunk bounds. This helper accepts source views, not views already
+    translated to symmetric addresses.
+    """
+    allocation = getattr(source_tensor, "_vmm_allocation", None)
+    if allocation is None:
+        # Preserve the existing plain-source-tensor translation path.
+        return create_sym_tensor_from_ptr(
+            map_to_sym_ptr(source_tensor.data_ptr(), name),
+            source_tensor.shape, source_tensor.dtype, source_tensor.device)
+    if allocation._destroyed or not allocation._registered:
+        raise RuntimeError(f"{name}: VMM owner is not an active registered allocation")
+    if not source_tensor.is_contiguous():
+        raise RuntimeError(f"{name}: VMM source tensor must be contiguous")
+    if source_tensor.device != torch.device(f"npu:{allocation.device_id}"):
+        raise RuntimeError(f"{name}: source tensor device does not match its VMM owner")
+    pointer_offset = int(source_tensor.data_ptr()) - int(allocation.source_va)
+    offset = int(getattr(source_tensor, "_vmm_offset_bytes", pointer_offset))
+    nbytes = _chunk_nbytes(source_tensor.shape, source_tensor.dtype)
+    view_bytes = int(getattr(source_tensor, "_vmm_view_bytes", nbytes))
+    if (offset < 0 or pointer_offset != offset or view_bytes < nbytes
+            or offset + view_bytes > int(allocation.size)):
+        raise RuntimeError(f"{name}: source tensor exceeds its VMM chunk bounds")
+    sym = map_to_sym_ptr(allocation.source_va, name)
+    tensor = create_sym_tensor_from_ptr(
+        sym + offset, source_tensor.shape, source_tensor.dtype, source_tensor.device)
+    tensor._vmm_allocation = allocation
+    tensor._vmm_offset_bytes = offset
+    tensor._vmm_view_bytes = view_bytes
+    return tensor
 
 
 # Local source-VA attribute names agreed with the framework side (correspond
@@ -738,6 +863,4 @@ def sym_tensor(source_tensor: torch.Tensor) -> torch.Tensor:
     buffer-backed heap; the returned tensor's ``data_ptr()`` is the local
     symmetric base (the local part of the unified symmetric slots).
     """
-    return create_sym_tensor_from_ptr(
-        map_to_sym_ptr(source_tensor.data_ptr(), 'sym_tensor'),
-        source_tensor.shape, source_tensor.dtype, source_tensor.device)
+    return translate_tensor(source_tensor, 'sym_tensor')

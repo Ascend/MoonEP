@@ -4227,7 +4227,11 @@ struct CombinePlanBuilder {
     // Each source owns N TX rows, N contributors and Width()*N relay requests.
     // This removes the count-only route pass, without changing any output order.
     __aicore__ bool UseStagedPlan() const {
-        return r <= 128U && uint64_t(r) * (32U + 8U * Width()) <= uint64_t(h) * 16U;
+        const bool staged = r <= 128U &&
+            uint64_t(r) * (32U + 8U * Width()) <= uint64_t(h) * 16U;
+        if (staged && uint64_t(r) * n * (32U + 8U * Width()) > p.weights - p.relay_hidden)
+            aclshmemi_kernel_abort("combine planning phase pool too small rank=%u\n", rank);
+        return staged;
     }
     __aicore__ uint64_t StagedTable(uint32_t kind, uint32_t source,
                                    uint32_t lane = 0U) const {
@@ -4290,6 +4294,20 @@ struct CombinePlanBuilder {
         const uint64_t stride = uint64_t(coreCount) * 512U;
         for (uint64_t off = p.relay_ready + uint64_t(core) * 512U; off < end;) {
             const uint64_t left = (end - 1U - off) / stride + 1U;
+            const uint32_t count = left < 1024U ? static_cast<uint32_t>(left) : 1024U;
+            GlobalTensor<int32_t> gm;
+            gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(ws + off));
+            DataCopyExtParams cp{static_cast<uint16_t>(count), 8U, 0U,
+                                 static_cast<uint32_t>(stride - 8U), 0U};
+            DataCopyPad(gm, zero, cp);
+            off += uint64_t(count) * stride;
+        }
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        // Ring state is mutable workspace, never part of a cloned plan. Only
+        // clear the first uint64 in each independent 512B flag/source slot.
+        for (uint64_t off = p.ring_epoch + uint64_t(core) * 512U; off < p.bytes;) {
+            const uint64_t left = (p.bytes - 1U - off) / stride + 1U;
             const uint32_t count = left < 1024U ? static_cast<uint32_t>(left) : 1024U;
             GlobalTensor<int32_t> gm;
             gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(ws + off));
@@ -5034,6 +5052,242 @@ struct CombinePlanBuilder {
         DataSyncBarrier<MemDsbT::DDR>();
         aclshmemi_sync_core<true>();
     }
+    // Final metadata is immutable now. Retired workspace contributor records
+    // publish {sourcePageSeq,rowOffset} at 64B spacing; each source owns a
+    // disjoint scratch interval, so no cacheline RMW can touch another writer.
+    __aicore__ void PublishRingScratchMap(uint32_t first, uint32_t count,
+                                        uint32_t page) {
+        constexpr uint32_t rowsPerBatch = 128U;
+        auto values = Ub<uint32_t>(8192U, rowsPerBatch * 8U);
+        for (uint32_t begin = 0U; begin < count; begin += rowsPerBatch) {
+            const uint32_t size = count - begin < rowsPerBatch ? count - begin : rowsPerBatch;
+            for (uint32_t j = 0U; j < size; ++j) {
+                // DataCopyPad reads one padded 32B UB block for each 8B record.
+                values.SetValue(j * 8U, page);
+                values.SetValue(j * 8U + 1U, begin + j);
+            }
+            SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+            GlobalTensor<uint32_t> gm;
+            gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(
+                ws + p.contributor + uint64_t(first + begin) * 64U));
+            DataCopyExtParams cp{static_cast<uint16_t>(size), 8U, 0U, 56U, 0U};
+            DataCopyPad(gm, values, cp);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        }
+    }
+    __aicore__ void StoreRingPage(uint32_t index, uint32_t source,
+                                 uint32_t first, uint32_t slots, uint32_t groups) {
+        auto values = Ub<uint32_t>(4096U, 16U);
+        for (uint32_t j = 0U; j < 16U; ++j) values.SetValue(j, 0U);
+        values.SetValue(0U, first); values.SetValue(1U, slots);
+        values.SetValue(2U, groups); values.SetValue(3U, source);
+        SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        Store(reinterpret_cast<__gm__ uint32_t*>(plan + q.ring_pages + uint64_t(index) * 64U),
+              values, 16U);
+        const uint64_t mirror = p.relay_publish + CombinePutAlign(uint64_t(r) * 64U);
+        Store(reinterpret_cast<__gm__ uint32_t*>(ws + mirror + uint64_t(index) * 64U),
+              values, 16U);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    }
+    // Count whole-group row-packed pages in parallel before the source prefix.
+    // A full non-tail page contains >=64 groups (each group has <=K rows),
+    // so the existing ceil(N/64)+R descriptor/ready capacity remains sufficient.
+    __aicore__ void CountRingSourcePages() {
+        auto rows = Ub<uint32_t>(0U, 64U * 4U);
+        for (uint32_t source = core; source < r; source += coreCount) {
+            auto sc = Meta(p.source_counts, source); Flush(sc);
+            if (sc[0] < 0 || sc[3] < 0 || sc[3] > sc[0] || sc[4] < 0 || sc[5] < 0 ||
+                uint64_t(sc[4]) + uint32_t(sc[5]) > 8ULL * n || uint32_t(sc[5]) > n)
+                aclshmemi_kernel_abort("combine ring invalid count range rank=%u source=%u\n", rank, source);
+            const uint32_t begin = static_cast<uint32_t>(sc[4]);
+            const uint32_t count = static_cast<uint32_t>(sc[5]);
+            uint32_t cursor = 0U, loadedBegin = 0U, loadedCount = 0U;
+            uint32_t pageRows = 0U, pages = 0U, groups = 0U;
+            while (cursor < count) {
+                if (cursor >= loadedBegin + loadedCount) {
+                    loadedBegin = cursor;
+                    loadedCount = count - cursor < 64U ? count - cursor : 64U;
+                    SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                    WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                    Load(rows, reinterpret_cast<__gm__ uint32_t*>(plan + q.contributor) +
+                               uint64_t(begin + cursor) * 4U, loadedCount * 4U);
+                    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                }
+                const uint32_t members = rows.GetValue((cursor - loadedBegin) * 4U + 1U);
+                if (members < 2U || members > k || members > count - cursor)
+                    aclshmemi_kernel_abort("combine ring invalid count group rank=%u source=%u\n", rank, source);
+                if (pageRows && pageRows + members > p.ring_page_rows) {
+                    ++pages; pageRows = 0U;
+                }
+                pageRows += members; cursor += members; ++groups;
+            }
+            if (pageRows) ++pages;
+            if (groups != uint32_t(sc[0] - sc[3]) || (LocalSource(source) && (groups || count)))
+                aclshmemi_kernel_abort("combine ring count groups mismatch rank=%u source=%u\n", rank, source);
+            sc[6] = pages; Flush(sc);
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemi_sync_core<true>();
+    }
+    __aicore__ void BuildRingPagePrefix() {
+        if (core == 0U) {
+            uint64_t pages = 0U, groups = 0U;
+            for (uint32_t source = 0U; source < r; ++source) {
+                auto sc = Meta(p.source_counts, source); Flush(sc);
+                if (sc[0] < 0 || sc[3] < 0 || sc[3] > sc[0])
+                    aclshmemi_kernel_abort("combine ring invalid result counts rank=%u source=%u\n", rank, source);
+                const uint32_t heads = static_cast<uint32_t>(sc[0] - sc[3]);
+                if (LocalSource(source) && (heads != 0U || sc[5] != 0))
+                    aclshmemi_kernel_abort("combine ring local source has scratch rank=%u source=%u\n", rank, source);
+                if (sc[6] < 0)
+                    aclshmemi_kernel_abort("combine ring invalid page count rank=%u source=%u\n", rank, source);
+                const uint32_t count = static_cast<uint32_t>(sc[6]);
+                if (pages + count > p.ring_page_capacity || groups + heads > n)
+                    aclshmemi_kernel_abort("combine ring page capacity rank=%u source=%u\n", rank, source);
+                sc[6] = count; sc[7] = static_cast<uint32_t>(pages);
+                for (uint32_t word = 8U; word < 16U; ++word) sc[word] = 0;
+                Flush(sc); pages += count; groups += heads;
+            }
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemi_sync_core<true>();
+    }
+    __aicore__ void BuildRingLocalPages() {
+        auto rows = Ub<uint32_t>(0U, 64U * 4U);
+        for (uint32_t source = core; source < r; source += coreCount) {
+            auto sc = Meta(p.source_counts, source); Flush(sc);
+            const uint32_t scratchBegin = static_cast<uint32_t>(sc[4]);
+            const uint32_t scratchCount = static_cast<uint32_t>(sc[5]);
+            const uint32_t expectedGroups = static_cast<uint32_t>(sc[0] - sc[3]);
+            const uint32_t pageCount = static_cast<uint32_t>(sc[6]);
+            const uint32_t pageBase = static_cast<uint32_t>(sc[7]);
+            if (uint64_t(scratchBegin) + scratchCount > 8ULL * n || scratchCount > n)
+                aclshmemi_kernel_abort("combine ring invalid scratch range rank=%u source=%u\n", rank, source);
+            uint32_t cursor = 0U, groupCount = 0U, page = 0U;
+            uint32_t first = 0U, pageGroups = 0U, loadedBegin = 0U, loadedCount = 0U;
+            while (cursor < scratchCount) {
+                if (cursor >= loadedBegin + loadedCount) {
+                    loadedBegin = cursor;
+                    loadedCount = scratchCount - cursor < 64U ? scratchCount - cursor : 64U;
+                    SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                    WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                    Load(rows, reinterpret_cast<__gm__ uint32_t*>(plan + q.contributor) +
+                               uint64_t(scratchBegin + cursor) * 4U, loadedCount * 4U);
+                    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                }
+                const uint32_t off = (cursor - loadedBegin) * 4U;
+                const uint32_t tx = rows.GetValue(off), members = rows.GetValue(off + 1U);
+                if (members < 2U || members > k || members > scratchCount - cursor ||
+                    tx < static_cast<uint32_t>(sc[2]) || uint64_t(tx) >= uint64_t(sc[2]) + sc[0])
+                    aclshmemi_kernel_abort("combine ring invalid contributor group rank=%u source=%u\n", rank, source);
+                // Close before the next whole group would overflow the input page.
+                if (pageGroups && cursor - first + members > p.ring_page_rows) {
+                    if (page >= pageCount)
+                        aclshmemi_kernel_abort("combine ring page count overflow rank=%u source=%u\n", rank, source);
+                    StoreRingPage(pageBase + page, source, scratchBegin + first,
+                                  cursor - first, pageGroups);
+                    PublishRingScratchMap(scratchBegin + first, cursor - first, page);
+                    ++page; first = cursor; pageGroups = 0U;
+                }
+                cursor += members; ++groupCount; ++pageGroups;
+                if (cursor == scratchCount) {
+                    if (page >= pageCount || cursor - first > p.ring_page_rows)
+                        aclshmemi_kernel_abort("combine ring oversized page rank=%u source=%u\n", rank, source);
+                    StoreRingPage(pageBase + page, source, scratchBegin + first,
+                                  cursor - first, pageGroups);
+                    PublishRingScratchMap(scratchBegin + first, cursor - first, page);
+                    ++page; first = cursor; pageGroups = 0U;
+                }
+            }
+            if (groupCount != expectedGroups || page != pageCount)
+                aclshmemi_kernel_abort("combine ring group/page count mismatch rank=%u source=%u\n", rank, source);
+            // Mirror the complete cacheline so peer producers can consume the
+            // new page count and the old scratch bounds without remote plan access.
+            Copy(reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_publish + uint64_t(source) * 64U),
+                 reinterpret_cast<__gm__ uint32_t*>(sc), 16U);
+        }
+    }
+    __aicore__ void BuildRingRelayMaps() {
+        for (uint32_t task = core; task < Width() * r; task += coreCount) {
+            const uint32_t lane = task / r, source = task % r;
+            const uint32_t peer = server ? rank / 8U * 8U + lane : rank;
+            auto mirror = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(ws + p.relay_publish, peer));
+            auto scratch = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(ws + p.contributor, peer));
+            auto summary = Ub<uint32_t>(0U, 16U);
+            SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            Load(summary, reinterpret_cast<__gm__ uint32_t*>(mirror + uint64_t(source) * 64U), 16U);
+            SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            const uint32_t scratchBegin = summary.GetValue(4U), scratchCount = summary.GetValue(5U);
+            const uint32_t pageCount = summary.GetValue(6U), pageBase = summary.GetValue(7U);
+            if (uint64_t(pageBase) + pageCount > p.ring_page_capacity ||
+                uint64_t(scratchBegin) + scratchCount > 8ULL * n)
+                aclshmemi_kernel_abort("combine ring invalid peer summary rank=%u peer=%u source=%u\n", rank, peer, source);
+            auto range = Meta(p.relay_ranges, uint64_t(lane) * r + source); Flush(range);
+            const uint32_t first = static_cast<uint32_t>(range[0]);
+            const uint32_t count = static_cast<uint32_t>(range[1]);
+            if (uint64_t(first) + count > n)
+                aclshmemi_kernel_abort("combine ring invalid relay range rank=%u source=%u\n", rank, source);
+            range[2] = pageCount; Flush(range);
+            auto requests = Ub<uint32_t>(1024U, 64U * 2U);
+            auto output = Ub<uint32_t>(8192U, 64U * 2U);
+            for (uint32_t begin = 0U; begin < count; begin += 64U) {
+                const uint32_t size = count - begin < 64U ? count - begin : 64U;
+                const uint64_t ordinal = uint64_t(lane) * n + first + begin;
+                SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                Load(requests, reinterpret_cast<__gm__ uint32_t*>(plan + q.relay_send) + ordinal * 2U,
+                     size * 2U);
+                SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                for (uint32_t j = 0U; j < size; ++j) {
+                    const uint32_t slot = requests.GetValue(j * 2U + 1U);
+                    if (slot < scratchBegin || uint64_t(slot) >= uint64_t(scratchBegin) + scratchCount)
+                        aclshmemi_kernel_abort("combine ring relay scratch mismatch rank=%u source=%u\n", rank, source);
+                    // A padded 32B UB destination per 8B mapping. All loads
+                    // retire before these banks are compacted or reused.
+                    Load(Ub<uint32_t>(4096U + j * 32U, 2U),
+                         reinterpret_cast<__gm__ uint32_t*>(scratch + uint64_t(slot) * 64U), 2U);
+                }
+                SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                for (uint32_t j = 0U; j < size; ++j) {
+                    auto mapping = Ub<uint32_t>(4096U + j * 32U, 2U);
+                    const uint32_t page = mapping.GetValue(0U), row = mapping.GetValue(1U);
+                    if (page >= pageCount || row >= p.ring_page_rows)
+                        aclshmemi_kernel_abort("combine ring invalid relay page mapping rank=%u source=%u\n", rank, source);
+                    output.SetValue(j * 2U, page); output.SetValue(j * 2U + 1U, row);
+                }
+                SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+                WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+                Store(reinterpret_cast<__gm__ uint32_t*>(plan + q.relay_page_map) + ordinal * 2U,
+                      output, size * 2U);
+                SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            }
+        }
+    }
+    __aicore__ void BuildRingPages() {
+        // All three old metadata paths join here, after final-route readers
+        // retire. No route re-scan or modification of the original record ABI.
+        CountRingSourcePages();
+        BuildRingPagePrefix();
+        BuildRingLocalPages();
+        PipeBarrier<PIPE_ALL>();
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemx_sync_vec_all(); // publish temporary maps on every ingress
+        BuildRingRelayMaps();
+        PipeBarrier<PIPE_ALL>();
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemx_sync_vec_all(); // peer reads retire before temporary arena reuse
+    }
     __aicore__ void RecordPlanningStages(const uint64_t* elapsed, uint32_t path) {
         // Eight per-core intervals, reduced into reserved plan header bytes
         // 128..415. Plan layout/version and all payload tables are unchanged.
@@ -5083,7 +5337,8 @@ struct CombinePlanBuilder {
             auto header = reinterpret_cast<__gm__ uint64_t*>(plan);
             header[0] = kCombineExecutionPlanVersion;
             header[1] = n; header[2] = h; header[3] = k;
-            header[4] = r; header[5] = rank; header[6] = server; header[7] = 0;
+            header[4] = r; header[5] = rank; header[6] = server;
+            header[7] = CombineRingLayoutFingerprint(k);
             Flush(header);
         }
         DataSyncBarrier<MemDsbT::DDR>();
@@ -5108,7 +5363,7 @@ __aicore__ __attribute__((noinline)) void RunCombinePlanning(
         reinterpret_cast<const __gm__ int32_t*>(groups),
         reinterpret_cast<const __gm__ int32_t*>(dups),
         reinterpret_cast<const __gm__ int32_t*>(counts),
-        ascend_moonep::MakeCombinePutLayout(t.S * t.K, t.H, t.R),
+        ascend_moonep::MakeCombinePutLayout(t.S * t.K, t.H, t.R, t.K),
         t.S * t.K, t.H, t.K, t.R, t.rank, static_cast<uint32_t>(GetBlockIdx()), t.server_dedup != 0U,
         reinterpret_cast<__gm__ uint8_t*>(plan), ascend_moonep::MakeCombineExecutionPlanLayout(t.S * t.K, t.R)};
     x.coreCount = tiling.block_dim;
@@ -5134,6 +5389,7 @@ __aicore__ __attribute__((noinline)) void RunCombinePlanning(
     else x.BuildCombineMetadata();
     now = GetSystemCycle(); elapsed[5] = now - previous; previous = now;
     x.FinishPlan();
+    x.BuildRingPages();
     now = GetSystemCycle(); elapsed[6] = now - previous; previous = now;
     x.PublishPlan();
     now = GetSystemCycle(); elapsed[7] = now - previous;

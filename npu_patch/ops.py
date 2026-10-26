@@ -97,8 +97,9 @@ class PlanningOp(KernelOp):
         if workspace is None:
             raise RuntimeError("PlanningOp requires a symmetric workspace")
         # Custom NPU writes do not bump Tensor._version; invalidate prepared plans
-        # explicitly whenever the supported planner rebuilds routing.
+        # explicitly whenever the supported planner rebuilds this plan's routing.
         ctx['_combine_plan_generation'] = ctx.get('_combine_plan_generation', 0) + 1
+        object.__setattr__(plan, '_planning_generation', ctx['_combine_plan_generation'])
         object.__setattr__(plan, 'combine_execution_plan', None)
         ctx.pop('_planning_timing_events', None)
         if ctx.get('_planning_timing_enabled', False):

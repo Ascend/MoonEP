@@ -82,7 +82,7 @@ _ELEM_SIZE = {
 # Barrier signal words per rank (dedicated symmetric ``barrier_buf`` chunk).
 BARRIER_SLOTS = 3
 # Default per-op symmetric workspace for the RMA-capable ops (dispatch/combine).
-OP_WS_BYTES_DEFAULT = 16 * 1024 * 1024
+OP_WS_BYTES_DEFAULT = 0
 
 
 def planning_symmetric_workspace_nbytes(E: int, NvS: int, R: int) -> int:
@@ -154,7 +154,8 @@ def compute_shmem_mem_size(
         dispatch_sync_buffer                 : Token control + local Token AIV sync
       RMA op workspaces:
         Planning exact communication workspace
-        dispatch + combine: 2 * op_ws_bytes
+        Dispatch/Combine have no generic op-owned scratch. Nonzero
+        op_ws_bytes adds a caller-requested budgeting allowance only.
       Grad-reduce buffers [B, H, H']   fp32 : num_reduce_buffers * B * H * H' * 4
       Prefetch weight slots [B, H, H'] bf16 : num_prefetch_slots * B * H * H' * 2
       owner_weight_bytes: caller-supplied extra (e.g. single-owner weight tensors

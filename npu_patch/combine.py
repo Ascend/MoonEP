@@ -21,6 +21,12 @@ if TYPE_CHECKING:
 # Combine only; does not change num_sms or launch core counts for dispatch/planning.
 COMBINE_PUT_CORES = 64
 COMBINE_PUT_SOURCE_LANES = 16
+COMBINE_RING_STREAMS = 8
+COMBINE_RING_DEPTH = 4
+COMBINE_RING_GROUPS_PER_PAGE = 64
+COMBINE_RING_PLAN_ABI = 6
+
+
 def combine_put_roles(ranks: int) -> list:
     """Core ownership in the production kernel: relay/reduce/sender/final-only."""
     if ranks >= 128:
@@ -28,21 +34,47 @@ def combine_put_roles(ranks: int) -> list:
     return [0] * 8 + [1] * 32 + [2] * 24
 
 
-def combine_put_workspace_bytes(n: int, h: int, ranks: int) -> int:
+def combine_ring_geometry(n: int, h: int, ranks: int, topk: int = 16) -> dict:
+    """Bounded relay geometry; no user-provided row-capacity override.
+
+    Each page holds up to 64 * topk contributor rows, packed as complete groups.
+    Small groups can allow more than 64 groups to fit in one page.
+    Planning may borrow the same phase arena before any payload becomes live.
+    Reserve for either dedup mode because a Buffer may prepare both kinds.
+    """
+    if min(n, h, ranks, topk) <= 0 or topk > 16:
+        raise ValueError("n/h/ranks must be positive and topk must be in [1,16]")
+    align = lambda value: (value + 511) & ~511
+    page_rows = COMBINE_RING_GROUPS_PER_PAGE * topk
+    input_rows = COMBINE_RING_STREAMS * COMBINE_RING_DEPTH * page_rows
+    input_bytes = align(input_rows * h * 2)
+    result_bytes = align(n * h * 2)
+    staging = max((ranks * n * (32 + 8 * width)
+                   for width in (1, 8)
+                   if ranks <= 128 and ranks * (32 + 8 * width) <= h * 16),
+                  default=0)
+    return dict(page_rows=page_rows, input_rows=input_rows,
+                input_bytes=input_bytes, result_bytes=result_bytes,
+                planning_stage_bytes=staging,
+                phase_bytes=align(max(staging, input_bytes + result_bytes)),
+                max_pages=(n + 63) // 64 + ranks)
+
+
+def combine_put_workspace_bytes(n: int, h: int, ranks: int, topk: int = 16) -> int:
     # Total symmetric workspace bytes per rank; N=n=S*K, H=h, R=ranks.
     # Matches the order and capacities in MakeCombinePutLayout in
     # include/ascend_moonep/kernels/types.h; reserves maximum slots regardless of deduplication or weights.
-    if min(n, h, ranks) <= 0:
-        raise ValueError("n, h and ranks must be positive")
+    ring = combine_ring_geometry(n, h, ranks, topk)
     align = lambda value: (value + 511) & ~511
     batches = (n + 63) // 64
     return (
-        # BF16 data: final_hidden[N,H], send_hidden[N,H], relay_hidden[8*N,H].
-        2 * align(n * h * 2) + align(8 * n * h * 2)
+        # Final return data plus phase-exclusive Planning / input-ring+result arena.
+        align(n * h * 2) + ring['phase_bytes']
         # Float weights[N]; N entries each for reverse/reverse_send/final_map/group_of_loff/tx_rows.
         + align(n * 4) + 5 * align(n * 64)
         # R entries each for source_counts/counts_send; 8*N each for contributor/relay_send/relay_publish.
-        + 2 * align(ranks * 64) + 3 * align(8 * n * 64)
+        + 2 * align(ranks * 64) + 2 * align(8 * n * 64)
+        + max(align(8 * n * 64), align(ranks * 64) + align(ring['max_pages'] * 64))
         # Two reserved count tables; source/reduce/final ready have 8*R/R*B/2*R slots, respectively.
         + 1024 + (8 * ranks + ranks * batches + 2 * ranks) * 512
         # R weight_ready slots and 64 core-private magic source slots; 512 bytes per slot, first 8 used.
@@ -52,6 +84,14 @@ def combine_put_workspace_bytes(n: int, h: int, ranks: int) -> int:
         + 512
         # N independent 128-byte final descriptors; N/K are active, N covers K=1.
         + align(n * 128)
+        # Per-stream epoch, producer-ready, credits, reducer-done, stable
+        # PUT-source tickets, and persistent logical-page result readiness.
+        + (COMBINE_RING_STREAMS
+           + COMBINE_RING_STREAMS * COMBINE_RING_DEPTH * 8
+           + COMBINE_RING_STREAMS * COMBINE_RING_DEPTH
+           + COMBINE_RING_STREAMS * COMBINE_RING_DEPTH * 4
+           + 8 * COMBINE_RING_STREAMS * COMBINE_RING_DEPTH
+           + ring['max_pages']) * 512
     )
 
 
@@ -197,7 +237,7 @@ def _check_combine_inputs(
         _check_tensor(
             ctx["combine_workspace"],
             "ctx.combine_workspace",
-            (combine_put_workspace_bytes(NvS, H, plan.R),),
+            (combine_put_workspace_bytes(NvS, H, plan.R, plan.K),),
             torch.uint8,
             output_sh.device,
         )

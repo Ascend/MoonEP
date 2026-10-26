@@ -198,7 +198,7 @@ void MoonEPUdmaCombine(
                 "PUT combine workspace payload size overflows uint64_t");
     const uint64_t required_workspace_bytes = MakeCombinePutLayout(
         static_cast<uint32_t>(NvS), static_cast<uint32_t>(H),
-        static_cast<uint32_t>(R)).bytes;
+        static_cast<uint32_t>(R), static_cast<uint32_t>(K)).bytes;
     const uint64_t local_workspace_bytes =
         static_cast<uint64_t>(local_workspace.numel()) *
         static_cast<uint64_t>(local_workspace.element_size());

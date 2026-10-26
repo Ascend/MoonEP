@@ -630,7 +630,7 @@ torch::Tensor AllocateCombinePlan(
                 "server planning route exceeds packed capacity");
     TORCH_CHECK(dups.scalar_type() == torch::kInt32 && dups.dim() == 1 &&
                 dups.numel() == (server ? 8 * n : n), "invalid dup member capacity");
-    const auto p = MakeCombinePutLayout(n, H, R);
+    const auto p = MakeCombinePutLayout(n, H, R, K);
     TORCH_CHECK(workspace.scalar_type() == torch::kUInt8 && workspace.dim() == 1 &&
                 uint64_t(workspace.numel()) >= p.bytes, "combine planning workspace too small");
     for (const auto& tensor : {dst, groups, dups, counts})

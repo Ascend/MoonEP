@@ -385,7 +385,10 @@ def _run_e2e_urma():
         cu_sync_cpu = cu_sync.clone()
         assert isinstance(plan_sync, MoonEPCommPlan)
         plan_snapshot = plan_sync.clone()
-        assert plan_snapshot.combine_execution_plan is None
+        assert plan_snapshot.combine_execution_plan is not None
+        assert plan_snapshot.combine_execution_plan is not plan_sync.combine_execution_plan
+        assert plan_snapshot.combine_execution_plan.storage.data_ptr() != \
+            plan_sync.combine_execution_plan.storage.data_ptr()
         buffer.prefetch_weight(plan=plan_snapshot, **sync_prefetch_args)
         torch.npu.synchronize()
         assert_prefetched(sync_prefetch_meta, plan_snapshot.experts_to_copy[rank])
@@ -481,9 +484,8 @@ def _run_e2e_urma():
         h_for_combine, w_for_combine, _, _ = buffer.dispatch(
             hidden, weights, topk, tpe,
         )
-        # Clones keep routing data but drop context-owned execution metadata.
-        # Every fresh PlanningOp invalidates previous prepared generations.
-        buffer.prepare_combine_plan(plan_snapshot)
+        # The clone owns its combine tables; fresh planning on other plans does
+        # not invalidate this routing snapshot or require collective preparation.
         out_sync, _, _ = buffer.combine(
             plan=plan_snapshot, hidden_nvsh=h_for_combine, inter_rank_sync=True,
         )
@@ -493,7 +495,6 @@ def _run_e2e_urma():
         h_for_combine, w_for_combine, _, _ = buffer.dispatch(
             hidden, weights, topk, tpe,
         )
-        buffer.prepare_combine_plan(plan_snapshot)
         out_with_weights, gathered_weights, _ = buffer.combine(
             plan=plan_snapshot,
             hidden_nvsh=h_for_combine,
@@ -543,7 +544,6 @@ def _run_e2e_urma():
         h_for_combine, _, _, _ = buffer.dispatch(
             hidden, weights, topk, tpe,
         )
-        buffer.prepare_combine_plan(plan_snapshot)
         out_grad_sync, _, _ = buffer.combine(
             plan=plan_snapshot,
             hidden_nvsh=h_for_combine,
@@ -560,7 +560,6 @@ def _run_e2e_urma():
         h_for_combine, _, _, _ = buffer.dispatch(
             hidden, weights, topk, tpe,
         )
-        buffer.prepare_combine_plan(plan_snapshot)
         out_async, _, _combine_ev = buffer.combine(
             plan=plan_snapshot,
             hidden_nvsh=h_for_combine,
