@@ -258,7 +258,7 @@ function(ascend_moonep_add_kernel_library TARGET)
     set_target_properties(${TARGET}
         PROPERTIES
             UNITY_BUILD ON
-            UNITY_BUILD_BATCH_SIZE 16 # split into multiple .so if the operator count grows later
+            UNITY_BUILD_BATCH_SIZE 16 # at most 16 source files per unity translation unit
     )
     target_compile_options(${TARGET}
         PRIVATE
@@ -271,6 +271,7 @@ function(ascend_moonep_add_kernel_library TARGET)
     target_compile_definitions(${TARGET}
         PRIVATE
             L2_CACHE_HINT
+            "$<$<BOOL:${ASCEND_MOONEP_SIMT}>:USE_SIMT>"
             ${FFTS_COMPILE_DEFINITION}
     )
     target_include_directories(${TARGET}
@@ -284,7 +285,7 @@ function(ascend_moonep_add_kernel_library TARGET)
             "${SHMEM_HOME_PATH}/shmem/include"
             "${SHMEM_HOME_PATH}/shmem/src"
             "${SHMEM_HOME_PATH}/shmem/src/device"
-            "${SHMEM_HOME_PATH}/shmem/src/device_simt"
+            "$<$<BOOL:${ASCEND_MOONEP_SIMT}>:${SHMEM_HOME_PATH}/shmem/src/device_simt>"
             "${SHMEM_HOME_PATH}/memfabric_hybrid/include/smem/host"
             "${SHMEM_HOME_PATH}/memfabric_hybrid/include/smem/device"
             ${ASCEND_CANN_INCLUDE_CANDIDATES}

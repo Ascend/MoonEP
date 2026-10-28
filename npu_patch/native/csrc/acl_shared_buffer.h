@@ -65,24 +65,23 @@ void acl_vmm_release(int64_t va);
 void acl_vmm_map(int64_t va, int64_t size, int64_t handle, int64_t offset);
 void acl_vmm_unmap(int64_t va);
 void acl_vmm_set_access(int64_t va, int64_t size, int64_t device_id);
-int64_t acl_vmm_export_shareable(int64_t handle);
-int64_t acl_vmm_import_shareable(int64_t shareable, int64_t device_id);
-// Export a Fabric V2 shareable handle (Ascend950: caller-supplied; shmem does not export).
-// Returns the raw 64 bytes of aclrtMemFabricHandle.
+// Export a Fabric V2 shareable handle (A3/A5: caller-supplied; shmem does not export).
+// Returns the raw bytes of aclrtMemFabricHandle.
 std::string acl_vmm_export_fabric(int64_t handle);
 // High-level transaction: malloc -> reserve -> map -> set_access -> export
 // (any failure rolls back unmap -> release -> free).
-// Returns (source_va, mem_handle, shareable_handle, size, fabric_bytes):
-//   - Ascend950 (Fabric): shareable_handle=0 (no V1 export); fabric_bytes is the
-//     64B Fabric handle (shmem init_with_buffers uses it directly, no re-export);
-//   - 910/legacy: shareable_handle is V1; fabric_bytes is empty.
+// Returns (source_va, mem_handle, size, fabric_bytes):
+//   - A3/A5: fabric_bytes is the Fabric V2 handle (shmem init_with_buffers uses
+//     it directly, no re-export);
+//   - A2: fabric_bytes is empty; shmem performs the single V2 DEFAULT export on
+//     mem_handle.
 // The two id spaces are NOT equal under the ASCEND_RT_VISIBLE_DEVICES mask
 // (measured on Ascend950):
 //   - device_id       : process-visible device index 0..N-1 (granularity/malloc/map);
 //   - access_device_id: desc.location.id for aclrtMemSetAccess, the PHYSICAL card
 //                       id (= mask entries, e.g. 4/5 in "4,5"); -1 = same as device_id.
 // A wrong space yields 107001 (allocation side) or 507899 (set_access side).
-std::tuple<int64_t, int64_t, int64_t, int64_t, std::string> acl_vmm_alloc_source(
+std::tuple<int64_t, int64_t, int64_t, std::string> acl_vmm_alloc_source(
     int64_t size, int64_t device_id, int64_t access_device_id = -1);
 void acl_vmm_free_source(int64_t va, int64_t handle);
 

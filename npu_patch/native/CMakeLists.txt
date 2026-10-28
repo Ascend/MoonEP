@@ -37,15 +37,67 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-set(ASCEND_MOONEP_BISHENG_ARCH "a2" CACHE STRING "Target architecture: a2 or a5")
-set_property(CACHE ASCEND_MOONEP_BISHENG_ARCH PROPERTY STRINGS a2 a5)
-if(ASCEND_MOONEP_BISHENG_ARCH STREQUAL "a5")
-    set(ASCEND_MOONEP_CATLASS_ARCH 3510)
-elseif(ASCEND_MOONEP_BISHENG_ARCH STREQUAL "a2")
+set(ASCEND_MOONEP_SOC_TYPE "Ascend950" CACHE STRING "Target SoC: Ascend910B, Ascend910_93, or Ascend950")
+set_property(CACHE ASCEND_MOONEP_SOC_TYPE PROPERTY STRINGS Ascend910B Ascend910_93 Ascend950)
+if(ASCEND_MOONEP_SOC_TYPE STREQUAL "Ascend910B")
+    set(ASCEND_MOONEP_BISHENG_ARCH a2)
+    set(ASCEND_MOONEP_PRODUCT_DEFINITION ASCEND_MOONEP_ARCH_A2=1)
+    set(ASCEND_MOONEP_NPU_DEFINITION ASCEND_MOONEP_ARCH_2201=1)
     set(ASCEND_MOONEP_CATLASS_ARCH 2201)
+    set(ASCEND_MOONEP_SIMT OFF)
+    set(ASCEND_MOONEP_UDMA OFF)
+elseif(ASCEND_MOONEP_SOC_TYPE STREQUAL "Ascend910_93")
+    set(ASCEND_MOONEP_BISHENG_ARCH a2)
+    set(ASCEND_MOONEP_PRODUCT_DEFINITION ASCEND_MOONEP_ARCH_A3=1)
+    set(ASCEND_MOONEP_NPU_DEFINITION ASCEND_MOONEP_ARCH_2201=1)
+    set(ASCEND_MOONEP_CATLASS_ARCH 2201)
+    set(ASCEND_MOONEP_SIMT OFF)
+    set(ASCEND_MOONEP_UDMA OFF)
+elseif(ASCEND_MOONEP_SOC_TYPE STREQUAL "Ascend950")
+    set(ASCEND_MOONEP_BISHENG_ARCH a5)
+    set(ASCEND_MOONEP_PRODUCT_DEFINITION ASCEND_MOONEP_ARCH_A5=1)
+    set(ASCEND_MOONEP_NPU_DEFINITION ASCEND_MOONEP_ARCH_3510=1)
+    set(ASCEND_MOONEP_CATLASS_ARCH 3510)
+    set(ASCEND_MOONEP_SIMT ON)
+    set(ASCEND_MOONEP_UDMA ON)
 else()
-    message(FATAL_ERROR "Unsupported ASCEND_MOONEP_BISHENG_ARCH=${ASCEND_MOONEP_BISHENG_ARCH}")
+    message(FATAL_ERROR
+        "ASCEND_MOONEP_SOC_TYPE must be one of: Ascend910B, Ascend910_93, Ascend950; "
+        "got '${ASCEND_MOONEP_SOC_TYPE}'")
 endif()
+
+set(ASCEND_MOONEP_ARCH_DEFINITIONS
+    ${ASCEND_MOONEP_PRODUCT_DEFINITION}
+    ${ASCEND_MOONEP_NPU_DEFINITION})
+# Expose UDMA kernel support to the host wrappers.
+if(ASCEND_MOONEP_UDMA)
+    list(APPEND ASCEND_MOONEP_ARCH_DEFINITIONS ASCEND_MOONEP_UDMA=1)
+endif()
+
+# Compile UDMA kernels only when UDMA support is enabled.
+if(ASCEND_MOONEP_UDMA)
+    set(ASCEND_MOONEP_UDMA_KERNEL_SOURCES
+        kernels/moonep_combine_udma.cpp
+        kernels/moonep_dispatch_udma.cpp
+        kernels/moonep_grad_reduce_udma.cpp
+        kernels/prefetch_udma.cpp)
+else()
+    set(ASCEND_MOONEP_UDMA_KERNEL_SOURCES "")
+endif()
+
+# The planning kernel has one backend per instruction-set family, selected at
+# build time; the two backends export the same planning_kernel_do symbol, so
+# exactly one may be compiled into a target.
+if(ASCEND_MOONEP_SIMT)
+    set(ASCEND_MOONEP_PLANNING_KERNEL_SOURCE kernels/planning_simt.cpp)
+else()
+    set(ASCEND_MOONEP_PLANNING_KERNEL_SOURCE kernels/planning_aicore.cpp)
+endif()
+
+message(STATUS
+    "ascend-moonep target: soc=${ASCEND_MOONEP_SOC_TYPE}, "
+    "bisheng_arch=${ASCEND_MOONEP_BISHENG_ARCH}, npu_arch=${ASCEND_MOONEP_CATLASS_ARCH}, "
+    "simt=${ASCEND_MOONEP_SIMT}")
 
 # SHMEM is managed as a submodule and built into 3rdparty/shmem/install by default.
 set(ASCEND_MOONEP_SHMEM_SOURCE_DIR "${PROJECT_SOURCE_DIR}/../3rdparty/shmem" CACHE PATH "SHMEM source directory")
@@ -71,7 +123,7 @@ endif()
 if(NOT EXISTS "${SHMEM_HOME_PATH}/shmem/include/shmem.h")
     message(FATAL_ERROR
         "SHMEM installation not found under ${SHMEM_HOME_PATH}. "
-        "Run npu_patch/scripts/build_a5.sh first.")
+        "Run the matching npu_patch/scripts/build_<soc>.sh first.")
 endif()
 
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
@@ -82,19 +134,18 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 include("${CMAKE_SOURCE_DIR}/cmake/AscendMoonEPKernel.cmake")
 
 # All device kernels and their host launch wrappers are linked into one library.
+# The UDMA/URMA kernels require the SIMT backend (3510 / A5); they must be
+# excluded from non-SIMT (A2/A3, 2201) builds since they have no arch guard.
 ascend_moonep_add_kernel_library(
     ascend_moonep_kernels
     SOURCES
         kernels/barrier_bench.cpp
         kernels/moonep_combine.cpp
-        kernels/moonep_combine_udma.cpp
         kernels/moonep_dispatch.cpp
-        kernels/moonep_dispatch_udma.cpp
         kernels/moonep_grad_reduce.cpp
-        kernels/moonep_grad_reduce_udma.cpp
-        kernels/planning.cpp
+        ${ASCEND_MOONEP_PLANNING_KERNEL_SOURCE}
         kernels/prefetch.cpp
-        kernels/prefetch_udma.cpp
+        ${ASCEND_MOONEP_UDMA_KERNEL_SOURCES}
     INCLUDES
         include
         kernels
@@ -102,7 +153,7 @@ ascend_moonep_add_kernel_library(
         ../3rdparty/catlass
     COMPILE_DEFINITIONS
         CATLASS_ARCH=${ASCEND_MOONEP_CATLASS_ARCH}
-        USE_SIMT
+        ${ASCEND_MOONEP_ARCH_DEFINITIONS}
 )
 
 message(STATUS "ascend-moonep kernel library: ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libascend_moonep_kernels.so")

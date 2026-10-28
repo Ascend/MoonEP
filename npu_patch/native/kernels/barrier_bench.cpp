@@ -1,3 +1,4 @@
+#include "kernel_operator.h"
 #include "shmem.h"
 
 #include "ascend_moonep/kernels/launch.h"

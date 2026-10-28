@@ -91,6 +91,7 @@ void LaunchMoonEPDispatchUdmaKernel(
     torch::Tensor sync_buffer,
     const ascend_moonep::MoonEPDispatchTilingData& tiling,
     uint64_t magic) {
+#if defined(ASCEND_MOONEP_UDMA)
     aclrtStream stream = GetCurrentAclStream();
     moonep_dispatch_udma_kernel_do(
         stream,
@@ -106,6 +107,14 @@ void LaunchMoonEPDispatchUdmaKernel(
         reinterpret_cast<uint8_t*>(
             const_cast<ascend_moonep::MoonEPDispatchTilingData*>(&tiling)),
         magic);
+#else
+    (void)hidden_sh; (void)route_weights; (void)dst; (void)dup_groups;
+    (void)dup_loffs; (void)dup_counts; (void)hidden_buf;
+    (void)route_weights_buf; (void)sync_buffer; (void)tiling; (void)magic;
+    TORCH_CHECK(false,
+        "dispatch UDMA kernel support is not enabled in this build; "
+        "A2/A3 do not provide the UDMA dispatch kernel");
+#endif
 }
 
 void LaunchMoonEPDispatchUdmaProfileKernel(
@@ -121,6 +130,7 @@ void LaunchMoonEPDispatchUdmaProfileKernel(
     torch::Tensor profile_cycles,
     const ascend_moonep::MoonEPDispatchTilingData& tiling,
     uint64_t magic) {
+#if defined(ASCEND_MOONEP_UDMA)
     aclrtStream stream = GetCurrentAclStream();
     moonep_dispatch_udma_profile_kernel_do(
         stream,
@@ -137,6 +147,15 @@ void LaunchMoonEPDispatchUdmaProfileKernel(
         reinterpret_cast<uint8_t*>(
             const_cast<ascend_moonep::MoonEPDispatchTilingData*>(&tiling)),
         magic);
+#else
+    (void)hidden_sh; (void)route_weights; (void)dst; (void)dup_groups;
+    (void)dup_loffs; (void)dup_counts; (void)hidden_buf;
+    (void)route_weights_buf; (void)sync_buffer; (void)profile_cycles;
+    (void)tiling; (void)magic;
+    TORCH_CHECK(false,
+        "dispatch profile UDMA kernel support is not enabled in this build; "
+        "A2/A3 do not provide the UDMA dispatch kernel");
+#endif
 }
 
 void LaunchPlanningKernel(
@@ -202,6 +221,7 @@ void LaunchMoonEPUdmaCombineKernel(
     const ascend_moonep::MoonEPUdmaCombineTilingData& tiling,
     void* local_workspace,
     uint64_t invocation_magic) {
+#if defined(ASCEND_MOONEP_UDMA)
     TORCH_CHECK(local_workspace != nullptr, "local_workspace must not be null");
     TORCH_CHECK(bandwidth_scratch != nullptr,
                 "bandwidth_scratch must not be null");
@@ -223,4 +243,13 @@ void LaunchMoonEPUdmaCombineKernel(
         reinterpret_cast<uint8_t*>(
             const_cast<ascend_moonep::MoonEPUdmaCombineTilingData*>(&tiling)),
         invocation_magic);
+#else
+    (void)hidden_nvsh; (void)route_weights_nvs; (void)sync_buffer; (void)dst;
+    (void)dup_groups; (void)dup_loffs; (void)dup_counts; (void)output_sh;
+    (void)output_sk; (void)bandwidth_scratch; (void)tiling;
+    (void)local_workspace; (void)invocation_magic;
+    TORCH_CHECK(false,
+        "combine UDMA kernel support is not enabled in this build; "
+        "A2/A3 do not provide the UDMA combine kernel");
+#endif
 }

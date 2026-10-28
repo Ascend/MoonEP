@@ -113,6 +113,7 @@ void GradReduce(
         "epn must be positive");
     CheckInt32(epn, "epn");
     if (use_udma) {
+#if defined(ASCEND_MOONEP_UDMA)
         torch::Tensor workspace = torch::empty(512 * 1024 * (blocks * 2), expert_grads.options());
         const int ret = moonep_shmem_grad_reduce_udma(
             stream,
@@ -128,6 +129,11 @@ void GradReduce(
             static_cast<int32_t>(rank),
             static_cast<int32_t>(blocks));
         TORCH_CHECK(ret == 0, "grad_reduce kernel failed with ACL error: ", ret);
+#else
+        TORCH_CHECK(false,
+            "grad_reduce UDMA kernel support is not enabled in this build; "
+            "A2/A3 do not provide the UDMA grad_reduce kernel");
+#endif
     } else {
         const int ret = moonep_shmem_grad_reduce(
             stream,

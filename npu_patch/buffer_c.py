@@ -269,22 +269,20 @@ class VmmAllocation:
                                (registered once)
       - ``mem_handle``       : raw ``aclrtMallocPhysical`` handle (aka
                                ``owned_handle``)
-      - ``shareable_handle`` : legacy V1 shareable handle exported for the
-                               descriptor
-      - ``fabric_handle``    : Fabric V2 handle (None on the legacy-V1 path)
+      - ``fabric_handle``    : Fabric V2 handle pre-exported on A3/A5 (empty on
+                               the A2 path, where SHMEM does the V2 DEFAULT export)
       - ``size``             : size in bytes
     ``destroy()`` releases in dependency order: unmap -> release ->
     free_physical (the VMM inverse operations, not ``aclshmem_free``).
     """
 
-    def __init__(self, source_va, mem_handle, shareable_handle, size,
+    def __init__(self, source_va, mem_handle, size,
                  fabric_handle_bytes=b"", device_id=0):
         self.source_va = int(source_va)
         self.mem_handle = mem_handle
-        self.shareable_handle = int(shareable_handle) if shareable_handle else None
-        # Raw bytes of the 64B aclrtMemFabricHandle (Ascend950); shmem
+        # Raw bytes of the aclrtMemFabricHandle (A3/A5); shmem
         # init_with_buffers consumes it directly without re-exporting. Empty
-        # on 910/legacy.
+        # on A2 (SHMEM exports V2 DEFAULT on mem_handle).
         self.fabric_handle_bytes = bytes(fabric_handle_bytes or b"")
         self.size = int(size)
         self.device_id = int(device_id)
@@ -412,8 +410,9 @@ def create_vmm_physical(shape, dtype: torch.dtype, device: int):
     """Allocate a CANN VMM physical chunk and wrap its source_va as an NPU
     tensor.
 
-    Returns ``(tensor, mem_handle, shareable_va)``; ``tensor.data_ptr()`` is
-    the registered source VA. CANN VMM physical allocations must be aligned to
+    Returns ``(tensor, mem_handle, fabric_bytes)``; ``tensor.data_ptr()`` is
+    the registered source VA. The third item is the Fabric V2 handle bytes on
+    A3/A5 and empty on A2. CANN VMM physical allocations must be aligned to
     the allocation granularity (2MiB), so the actual allocation is rounded up
     to gran (the extra padding is only spare physical/symmetric VA; the tensor
     still covers only the requested shape). Allocation also:
@@ -443,12 +442,12 @@ def create_vmm_physical(shape, dtype: torch.dtype, device: int):
     access_device_id = local_physical_id(device_id)
     gran = int(acl_vmm_granularity(device_id))
     alloc_size = ((nbytes + gran - 1) // gran) * gran
-    # On Ascend950 fabric_bytes is non-empty (acl_vmm_alloc_source exports
-    # Fabric V2 internally).
-    va, handle, shareable, size, fabric_bytes = acl_vmm_alloc_source(
+    # On A3/A5 fabric_bytes is non-empty (acl_vmm_alloc_source exports Fabric V2
+    # internally); on A2 it is empty (SHMEM does the V2 DEFAULT export).
+    va, handle, size, fabric_bytes = acl_vmm_alloc_source(
         alloc_size, device_id, access_device_id)
     allocation = VmmAllocation(
-        va, handle, shareable, size, fabric_handle_bytes=fabric_bytes,
+        va, handle, size, fabric_handle_bytes=fabric_bytes,
         device_id=device_id)
     try:
         tensor = create_sym_tensor_from_ptr(
@@ -461,7 +460,7 @@ def create_vmm_physical(shape, dtype: torch.dtype, device: int):
         # SHMEM, so release its source mapping/handle transactionally.
         allocation.destroy()
         raise
-    return tensor, handle, shareable
+    return tensor, handle, fabric_bytes
 
 
 def map_to_sym_ptr(va, name: str) -> int:

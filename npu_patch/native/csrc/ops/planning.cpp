@@ -5,7 +5,9 @@
 #include <limits>
 
 #include "ascend_moonep/kernels/types.h"
+#include "ascend_moonep/kernels/arch_config.h"
 #include "csrc/launcher.h"
+#include "shmem.h"
 
 namespace {
 
@@ -31,7 +33,7 @@ constexpr int64_t kSourceDupPackLargeChunkGroups = 128;
 constexpr int64_t kSourceDupPackXLargeChunkGroups = 256;
 constexpr int64_t kOwnerReduceMaxExperts = 64;
 constexpr int64_t kOwnerReduceTotalBytes = kUbAlignBytes;
-constexpr uint64_t kPlanningUbSizeBytes = 216 * 1024;
+constexpr uint64_t kPlanningUbSizeBytes = ascend_moonep::kPlanningUbSizeBytes;
 constexpr int64_t kCursorWorkerScratchRowElems = kAlignElems;
 
 struct WorkspaceSlice {
@@ -316,7 +318,18 @@ PlanningWorkspaceLayout MakePlanningWorkspaceLayout(
         prebuilt_group_off + prebuilt_tile_slots * prebuilt_group_stride;
     const int64_t source_dup_key_workspace_elems =
         prebuilt_loff_off + prebuilt_tile_slots * prebuilt_loff_stride;
+#if defined(ASCEND_MOONEP_ARCH_A5)
     const int64_t dup_key_workspace_elems = source_dup_key_workspace_elems;
+#else
+    const int64_t alloc_staging_elems = epn % kAlignElems == 0
+        ? 0
+        : CheckedMul(
+              CheckedMul(world_size, world_size, "alloc staging rank table"),
+              AlignUp(epn, kAlignElems),
+              "alloc staging workspace");
+    const int64_t dup_key_workspace_elems =
+        std::max(source_dup_key_workspace_elems, alloc_staging_elems);
+#endif
 
     PlanningWorkspaceLayout layout{};
     int64_t cursor = 0;
@@ -548,6 +561,9 @@ void Planning(
     auto dup_workspace = SliceWorkspace(local_workspace, layout.dup_workspace);
     auto dup_key_workspace = SliceWorkspace(local_workspace, layout.dup_key_workspace);
 
+    // SHMEM initializes FFTS where required; A5 legitimately returns zero.
+    const uint64_t ffts_addr = shmemx_get_ffts_config();
+
     LaunchPlanningKernel(
         topk_idx,
         dst,
@@ -568,7 +584,7 @@ void Planning(
         dup_key_workspace,
         tiling,
         reinterpret_cast<void*>(static_cast<uintptr_t>(symmetric_workspace_addr)),
-        0);
+        ffts_addr);
 }
 
 }  // namespace ascend_moonep::ops

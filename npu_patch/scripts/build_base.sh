@@ -3,6 +3,7 @@
 #
 # Per-SoC wrapper scripts only pass -soc_type in; partial builds are not supported:
 #   bash npu_patch/scripts/build_a5.sh [CANN_SET_ENV]        # Ascend950 / A5
+#   bash npu_patch/scripts/build_a3.sh [CANN_SET_ENV]        # Ascend910_93 / A3
 #   bash npu_patch/scripts/build_base.sh -soc_type Ascend950 [CANN_SET_ENV]
 #
 # Steps:
@@ -14,7 +15,7 @@
 #   6. pip install -e . (compiles the npu_patch._C NPU extension)
 #
 # Environment:
-#   BUILD_DIR                          cmake build dir (default: build_ascend_a5)
+#   BUILD_DIR                          cmake build dir (default: build_ascend_<a2|a3|a5>)
 #   SHMEM_HOME_PATH                    reuse a prebuilt cann/shmem install
 #   FORCE_SHMEM=1                      rebuild cann/shmem even when an install exists
 #   ASCEND_MOONEP_RUNTIME_INCLUDE_DIR  override the CANN runtime header directory
@@ -32,12 +33,13 @@ usage() {
     cat <<'EOF'
 Usage: bash npu_patch/scripts/build_base.sh -soc_type <SoC> [CANN_SET_ENV]
 
-  -soc_type {Ascend950}   target SoC (this branch builds A5/Ascend950 only)
+  -soc_type {Ascend910B|Ascend910_93|Ascend950}   target SoC (typically Ascend950)
   CANN_SET_ENV            optional path to the CANN set_env.sh; when omitted it
                           is auto-discovered under /usr/local/Ascend/*/set_env.sh
 
 Examples:
   bash npu_patch/scripts/build_base.sh -soc_type Ascend950
+  bash npu_patch/scripts/build_base.sh -soc_type Ascend910_93
   bash npu_patch/scripts/build_a5.sh /usr/local/Ascend/ascend-toolkit/set_env.sh
   FORCE_SHMEM=1 BUILD_DIR=/tmp/b_a5 bash npu_patch/scripts/build_a5.sh
 EOF
@@ -78,6 +80,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${SOC_TYPE}" in
+    Ascend910B)
+        ARCH=a2
+        BUILD_DIR=${BUILD_DIR:-"${ROOT_DIR}/build_ascend_a2"}
+        ;;
+    Ascend910_93)
+        # A3 uses the same non-SIMT Bisheng backend as A2; the product
+        # distinction is carried by the explicit ASCEND_MOONEP_ARCH_A3 macro.
+        ARCH=a2
+        BUILD_DIR=${BUILD_DIR:-"${ROOT_DIR}/build_ascend_a3"}
+        ;;
     Ascend950)
         ARCH=a5
         BUILD_DIR=${BUILD_DIR:-"${ROOT_DIR}/build_ascend_a5"}
@@ -89,7 +101,7 @@ case "${SOC_TYPE}" in
         ;;
     *)
         echo "[ERROR] Unsupported -soc_type: ${SOC_TYPE}"
-        echo "        This branch (A5 support) only builds Ascend950."
+        echo "        Supported values: Ascend910B, Ascend910_93, Ascend950"
         exit 1
         ;;
 esac
@@ -151,7 +163,7 @@ else
 fi
 echo "[INFO] SHMEM_HOME_PATH: ${SHMEM_HOME_PATH}"
 
-# 4/5. Configure + build the A5 kernel library.
+# 4/5. Configure + build the kernel library.
 echo "[INFO] cmake -S ${NATIVE_DIR} -B ${BUILD_DIR} (${SOC_TYPE})"
 # Each SoC gets its own build dir (the cmake cache pins arch/SIMT; reusing it
 # across SoCs fails silently). Also remove the legacy shared build_ascend dir.
@@ -160,7 +172,7 @@ CMAKE_ARGS=(
     -S "${NATIVE_DIR}"
     -B "${BUILD_DIR}"
     -DCMAKE_CXX_COMPILER="${ASCEND_HOME_PATH}/tools/bisheng_compiler/bin/bisheng"
-    -DASCEND_MOONEP_BISHENG_ARCH="${ARCH}"
+    -DASCEND_MOONEP_SOC_TYPE="${SOC_TYPE}"
     -DSHMEM_HOME_PATH="${SHMEM_HOME_PATH}"
 )
 if [[ -n "${ASCEND_MOONEP_RUNTIME_INCLUDE_DIR:-}" ]]; then
@@ -182,6 +194,17 @@ echo "[INFO] pip install -e npu_patch (NPU backend)"
 export MOONEP_BUILD_BACKEND=npu
 export ASCEND_MOONEP_KERNEL_LIB_DIR="${LIB_TARGET}"
 export SHMEM_HOME_PATH
+# Export backend and UDMA support separately for the host extension build.
+# Only the current A5 build ships UDMA kernels.
+if [[ "${ARCH}" == "a5" ]]; then
+    export ASCEND_MOONEP_SIMT=1
+    export ASCEND_MOONEP_UDMA=1
+else
+    export ASCEND_MOONEP_SIMT=0
+    export ASCEND_MOONEP_UDMA=0
+fi
+# Product architecture for acl_shared_buffer.cpp's VMM export macro.
+export ASCEND_MOONEP_PRODUCT="${SOC_TYPE}"
 pushd "${ROOT_DIR}/npu_patch" >/dev/null
 python -m pip install -e . --no-build-isolation --no-deps
 popd >/dev/null

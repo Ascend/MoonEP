@@ -2,7 +2,7 @@
 # MoonEP-Ascend operator benchmark launcher (torchrun wrapper).
 #
 # Two deployment forms:
-#   single node, 8 cards  NODES=1 NPROC=8
+#   single node, auto-detected cards (A3: 16, A5: 8)
 #   2 nodes, 16 cards     NODES=2 NPROC=8 (run once per node; MASTER_ADDR points to rank0)
 #
 # Build first: bash npu_patch/scripts/build_a5.sh
@@ -18,7 +18,7 @@
 #   NODE_RANK   --node-rank, 0..NODES-1               (default: 0)
 #   MASTER_ADDR rank-0 node IP (required when NODES>1)(default: 127.0.0.1)
 #   MASTER_PORT --master-port                         (default: 29500)
-#   DEVICES     ASCEND_RT_VISIBLE_DEVICES             (default: 0-7)
+#   DEVICES     ASCEND_RT_VISIBLE_DEVICES             (default: all torch-visible NPUs)
 #   BENCH_ARGS  extra args passed to the bench script (or pass as $2)
 #   SHMEM_IP_PORT  shmem DEFAULT-bootstrap ip_port URL ("tcp://<ip>:<port>");
 #                  when set, appends "--ip-port $SHMEM_IP_PORT" to the bench script
@@ -26,7 +26,7 @@
 #                  MASTER_ADDR/MASTER_PORT, port +1)
 #
 # Examples:
-#   # single node, 8 cards, default sweep (ubmem)
+#   # single node, auto-detected cards, default sweep (ubmem)
 #   bash npu_patch/benchmarks/run_bench.sh
 #   # pick a script
 #   bash npu_patch/benchmarks/run_bench.sh bench_prefetch.py
@@ -82,7 +82,10 @@ NODES="${NODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
-DEVICES="${DEVICES:-0,1,2,3,4,5,6,7}"
+DEVICES="${DEVICES:-${ASCEND_RT_VISIBLE_DEVICES:-}}"
+if [ -z "$DEVICES" ]; then
+    DEVICES="$(python -c 'import torch, torch_npu; print(",".join(map(str, range(torch.npu.device_count()))))')"
+fi
 
 # --nproc-per-node defaults to the number of visible devices so that a
 # non-0-starting mask (e.g. DEVICES=4,5,6,7 == 4 cards) launches exactly 4

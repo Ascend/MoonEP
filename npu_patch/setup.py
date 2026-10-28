@@ -149,10 +149,24 @@ def _npu_extension():
         os.path.join("native", "csrc", "ops", "grad_reduce.cpp"),
         os.path.join("native", "csrc", "shmem_instance.cpp"),
     ]
+    # Pass the build script's UDMA flag to the C++ extension.
+    define_macros = []
+    if os.environ.get("ASCEND_MOONEP_UDMA", "0").strip() == "1":
+        define_macros.append(("ASCEND_MOONEP_UDMA", "1"))
+    # Product architecture macro for acl_shared_buffer.cpp's VMM export path
+    # (A2 -> SHMEM does V2 DEFAULT; A3/A5 -> pre-export Fabric V2). build_base.sh
+    # exports ASCEND_MOONEP_PRODUCT with the -soc_type value.
+    _product = os.environ.get("ASCEND_MOONEP_PRODUCT", "").strip()
+    if _product == "Ascend910B":
+        define_macros.append(("ASCEND_MOONEP_ARCH_A2", "1"))
+    elif _product == "Ascend910_93":
+        define_macros.append(("ASCEND_MOONEP_ARCH_A3", "1"))
+    elif _product == "Ascend950":
+        define_macros.append(("ASCEND_MOONEP_ARCH_A5", "1"))
     return CppExtension(
         name="npu_patch._C",
         sources=sources,
-        define_macros=[],
+        define_macros=define_macros,
         include_dirs=include_dirs,
         library_dirs=library_dirs,
         libraries=["ascend_moonep_kernels", "torch_npu", "ascendcl", "runtime", "shmem", "dl"],

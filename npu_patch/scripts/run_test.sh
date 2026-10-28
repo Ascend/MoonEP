@@ -88,7 +88,7 @@ case "${SOC_TYPE}" in
 esac
 
 # urma/udma ops are A5(SIMT)-only: dispatch_udma uses __simt_vf__ +
-# simt_api/device_sync_functions.h; A2/A3 do not define ASCEND_MOONEP_HAS_SIMT.
+# simt_api/device_sync_functions.h; A2/A3 do not define ASCEND_MOONEP_UDMA.
 if [ "$USE_URMA" = 1 ] && [ "$SOC_TYPE" != "Ascend950" ]; then
     echo "[ERROR] --use_urma supports only Ascend950(A5): udma ops require SIMT,"
     echo "        which A2/A3 (${SOC_TYPE}) lacks; do not run urma on A3."

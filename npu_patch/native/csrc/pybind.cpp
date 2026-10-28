@@ -86,28 +86,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("acl_vmm_set_access", &ascend_moonep::acl_vmm_set_access,
           arg("va"), arg("size"), arg("device_id"),
           "Set read/write access on a mapped VA range");
-    m.def("acl_vmm_export_shareable", &ascend_moonep::acl_vmm_export_shareable,
-          arg("handle"), "Export a physical handle to a legacy V1 shareable handle");
-    m.def("acl_vmm_import_shareable", &ascend_moonep::acl_vmm_import_shareable,
-          arg("shareable"), arg("device_id"),
-          "Import a shareable handle into a local physical handle");
     m.def("acl_vmm_export_fabric",
           [](int64_t handle) {
               return py::bytes(ascend_moonep::acl_vmm_export_fabric(handle));
           },
           arg("handle"),
-          "Export a physical handle to a Fabric V2 shareable handle (64 raw bytes)");
+          "Export a physical handle to a Fabric V2 shareable handle (raw bytes)");
     // High-level transaction: malloc -> reserve -> map -> set_access -> export.
-    // Returns (source_va, mem_handle, shareable_handle, size, fabric_bytes).
+    // Returns (source_va, mem_handle, size, fabric_bytes).
     m.def("acl_vmm_alloc_source",
           [](int64_t size, int64_t device_id, int64_t access_device_id) {
-              auto [va, handle, shareable, sz, fabric] =
+              auto [va, handle, sz, fabric] =
                   ascend_moonep::acl_vmm_alloc_source(
                       size, device_id, access_device_id);
-              return py::make_tuple(va, handle, shareable, sz, py::bytes(fabric));
+              return py::make_tuple(va, handle, sz, py::bytes(fabric));
           },
           arg("size"), arg("device_id"), arg("access_device_id") = -1,
-          "Allocate a VMM source (source_va + mem handle + shareable + fabric "
+          "Allocate a VMM source (source_va + mem handle + optional V2 Fabric "
           "bytes); device_id is the process-visible index, access_device_id is "
           "the physical card id for aclrtMemSetAccess (-1 = same as device_id)");
     m.def("acl_vmm_free_source", &ascend_moonep::acl_vmm_free_source,

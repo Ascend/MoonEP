@@ -18,6 +18,43 @@ def _decode_maps_path(value: str) -> str:
     return _MAPS_ESCAPE.sub(lambda match: chr(int(match.group(1), 8)), value)
 
 
+def _is_overlay_device_alias(path: Path, stat_device: int) -> bool:
+    """Return whether ``path`` is on an overlay mount represented by stat_device.
+
+    Linux may report the backing filesystem device in ``/proc/self/maps`` while
+    ``stat(2)`` reports the container's overlay virtual device.  The inode is
+    still stable across both views.  This helper only recognizes that specific
+    mount topology; it does not relax inode validation.
+    """
+    try:
+        resolved = path.resolve(strict=True)
+        lines = Path("/proc/self/mountinfo").read_text(
+            encoding="utf-8", errors="surrogateescape"
+        ).splitlines()
+    except OSError:
+        return False
+
+    device = f"{os.major(stat_device)}:{os.minor(stat_device)}"
+    best_match = (-1, False)
+
+    for line in lines:
+        left, separator, right = line.partition(" - ")
+        fields = left.split()
+        fs_fields = right.split()
+        if not separator or len(fields) < 5 or not fs_fields:
+            continue
+        if fields[2] != device:
+            continue
+
+        mount_point = Path(_decode_maps_path(fields[4]))
+        if resolved.is_relative_to(mount_point):
+            length = len(str(mount_point))
+            if length > best_match[0]:
+                best_match = (length, fs_fields[0] == "overlay")
+
+    return best_match[1]
+
+
 def _sha256_file(path: Path, expected_identity: tuple[int, int]) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -92,7 +129,13 @@ def audit_loaded_shmem_library(
             raise RuntimeError(
                 f"cannot resolve loaded libshmem mapping identity: {mapped_path}") from exc
 
-        if maps_device_number != stat_result.st_dev or maps_inode != stat_result.st_ino:
+        inode_matches = maps_inode == stat_result.st_ino
+        device_matches = maps_device_number == stat_result.st_dev
+        overlay_alias = (
+            inode_matches and not device_matches and
+            _is_overlay_device_alias(realpath, stat_result.st_dev)
+        )
+        if not inode_matches or (not device_matches and not overlay_alias):
             raise RuntimeError(
                 "loaded libshmem mapping metadata changed during audit: "
                 f"{mapped_path} maps dev/inode={maps_device}/{maps_inode}, "
@@ -106,6 +149,7 @@ def audit_loaded_shmem_library(
             "device_major": int(os.major(stat_result.st_dev)),
             "device_minor": int(os.minor(stat_result.st_dev)),
             "inode": int(stat_result.st_ino),
+            "overlay_device_alias": bool(overlay_alias),
         })
 
     if len(identities) != 1:

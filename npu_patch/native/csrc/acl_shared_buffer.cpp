@@ -422,27 +422,6 @@ void acl_vmm_set_access(int64_t va, int64_t size, int64_t device_id) {
                 ") failed with ", rc);
 }
 
-int64_t acl_vmm_export_shareable(int64_t handle) {
-    uint64_t shareable = 0;
-    const aclError rc = aclrtMemExportToShareableHandle(
-        reinterpret_cast<aclrtDrvMemHandle>(handle),
-        ACL_MEM_HANDLE_TYPE_NONE,
-        ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION, &shareable);
-    TORCH_CHECK(rc == ACL_SUCCESS,
-                "aclrtMemExportToShareableHandle failed with ", rc);
-    return static_cast<int64_t>(shareable);
-}
-
-int64_t acl_vmm_import_shareable(int64_t shareable, int64_t device_id) {
-    aclrtDrvMemHandle handle = nullptr;
-    const aclError rc = aclrtMemImportFromShareableHandle(
-        static_cast<uint64_t>(shareable), static_cast<int32_t>(device_id),
-        &handle);
-    TORCH_CHECK(rc == ACL_SUCCESS && handle != nullptr,
-                "aclrtMemImportFromShareableHandle failed with ", rc);
-    return reinterpret_cast<int64_t>(handle);
-}
-
 std::string acl_vmm_export_fabric(int64_t handle) {
     aclrtMemFabricHandle fabric{};
     const aclError rc = aclrtMemExportToShareableHandleV2(
@@ -454,21 +433,18 @@ std::string acl_vmm_export_fabric(int64_t handle) {
     return std::string(reinterpret_cast<const char*>(&fabric), sizeof(fabric));
 }
 
-std::tuple<int64_t, int64_t, int64_t, int64_t, std::string> acl_vmm_alloc_source(
+std::tuple<int64_t, int64_t, int64_t, std::string> acl_vmm_alloc_source(
     int64_t size, int64_t device_id, int64_t access_device_id) {
     const int64_t gran = acl_vmm_granularity(device_id);
     TORCH_CHECK(size > 0 && size % gran == 0,
                 "vmm source size must be a positive multiple of granularity ",
                 gran, ", got ", size);
-    // Ascend950 (Fabric): a physical handle can be exported only once. If
-    // buffer-backed shmem init receives a fabric_handle in the descriptor it
-    // does NOT re-export (see shmem ExportUserBufferHeap: with
-    // has_fabric_handle the passed value is used directly), so export the
-    // Fabric V2 handle here for init_with_buffers and skip legacy V1. Only
-    // 910/legacy exports the V1 shareable (for the framework legacy arena).
-    const char* soc = aclrtGetSocName();
-    const bool fabric_soc = soc != nullptr &&
-        std::string(soc).find("950") != std::string::npos;
+    // A physical handle can be exported only once. A3/A5 export a Fabric V2
+    // handle here and hand it to init_with_buffers, which consumes it directly
+    // without re-exporting (see shmem ExportUserBufferHeap: has_fabric_handle
+    // uses the passed value). A2 does not pre-export; SHMEM performs the single
+    // V2 DEFAULT export on mem_handle. Architecture is a compile-time macro,
+    // not a runtime SoC-name probe.
     int64_t handle = 0;
     int64_t va = 0;
     bool mapped = false;
@@ -483,12 +459,14 @@ std::tuple<int64_t, int64_t, int64_t, int64_t, std::string> acl_vmm_alloc_source
         // passes.
         acl_vmm_set_access(
             va, size, access_device_id < 0 ? device_id : access_device_id);
-        if (fabric_soc) {
-            std::string fabric = acl_vmm_export_fabric(handle);
-            return {va, handle, 0, size, std::move(fabric)};
-        }
-        const int64_t shareable = acl_vmm_export_shareable(handle);
-        return {va, handle, shareable, size, std::string()};
+#if defined(ASCEND_MOONEP_ARCH_A3) || defined(ASCEND_MOONEP_ARCH_A5)
+        std::string fabric = acl_vmm_export_fabric(handle);
+        return {va, handle, size, std::move(fabric)};
+#elif defined(ASCEND_MOONEP_ARCH_A2)
+        return {va, handle, size, std::string()};
+#else
+#error "Unsupported ASCEND_MOONEP architecture"
+#endif
     } catch (...) {
         if (mapped) {
             try { acl_vmm_unmap(va); } catch (...) {}
@@ -604,8 +582,11 @@ static int init_with_buffers_impl(
     ensure_acl_ready(device_id);
 
     aclshmemx_init_attr_t attr;  // option_attr keeps default member initializers (incl. version)
+    // set_attr_uniqueid_args stores &uid in attr.comm_args without copying it.
+    // Keep the UID alive through the native initialization below.
+    aclshmemx_uniqueid_t uid{};
+    aclshmemx_uniqueid_t default_uid{};
     if (bootstrap_flags == ACLSHMEMX_INIT_WITH_UNIQUEID) {
-        aclshmemx_uniqueid_t uid;
         std::memcpy(&uid, uid_bytes.data(), sizeof(uid));
         int rc = aclshmemx_set_attr_uniqueid_args(
             my_pe, n_pes, tail_bytes, &uid, &attr);
@@ -632,7 +613,6 @@ static int init_with_buffers_impl(
                     " (qp_count=", qp_count, ")");
         // UDMA requires comm_args to be a valid pointer (even for DEFAULT bootstrap).
         if (attr.comm_args == nullptr) {
-            aclshmemx_uniqueid_t default_uid{};
             attr.comm_args = &default_uid;
         }
     }

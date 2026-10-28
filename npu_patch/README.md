@@ -7,8 +7,10 @@
 workspace 管理；AscendC kernel 经预编译的 `ascend_moonep_kernels`（native
 CMake）暴露 C ABI launcher，再由 PyTorch C++ extension `npu_patch._C` 调用。
 
-当前构建目标仅面向 **Ascend950 / A5**：UDRMA/UDMA（URMA）通信依赖 A5 的
-对称内存 RMA 能力（SIMT），故不支持 A2/A3 等其它芯片。
+构建目标覆盖 **Ascend950 / A5**（NPU 3510，SIMT）与
+**Ascend910_93 / A3**（NPU 2201，非 SIMT）。URMA/UDMA（URMA）通信依赖 A5
+的对称内存 RMA 能力（SIMT），仅 A5 可用；A3 自动走 MTE（ubmem）路径，
+不可使用 `--use_urma`。
 
 ## 目录结构
 
@@ -29,10 +31,14 @@ npu_patch/
 ├── native/                       # CMakeLists、AscendC/Bisheng kernel、C++ host csrc
 │   ├── csrc/ops/                 # 每个 Python 侧算子的参数校验、输出分配、tiling 构造
 │   ├── kernels/                  # AscendC kernel launcher 与 kernel（含 *_udma 变体）
+│   │   ├── planning_common.h     # planning 各家族共享的常量 / UB 布局 / arch 无关 helper
+│   │   ├── planning_simt.cpp     # planning A5（SIMT）后端
+│   │   └── planning_aicore.cpp   # planning A3（非 SIMT）后端
 │   └── include/ascend_moonep/kernels/
 ├── scripts/
 │   ├── build_base.sh             # 唯一构建实现（CANN 发现 / shmem / kernel 库 / pip install）
 │   ├── build_a5.sh               # Ascend950/A5 薄封装
+│   ├── build_a3.sh               # Ascend910_93/A3 薄封装
 │   └── run_test.sh               # 测试驱动（含 BUILD=1 重建）
 ├── benchmarks/                   # MoonEP benchmark 集（--engine {ubmem,urma}）
 └── lib/                          # 随包分发的 kernel / shmem .so（构建产物）
@@ -66,17 +72,27 @@ npu_patch/3rdparty/catlass  https://gitcode.com/cann/catlass.git
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ```
 
-一键构建（Ascend950 / A5）：
+一键构建（按目标 SoC 选择封装脚本）：
 
 ```bash
+# Ascend950 / A5
 bash npu_patch/scripts/build_a5.sh [CANN_SET_ENV]
+# Ascend910_93 / A3
+bash npu_patch/scripts/build_a3.sh [CANN_SET_ENV]
 ```
 
 或显式指定 SoC：
 
 ```bash
 bash npu_patch/scripts/build_base.sh -soc_type Ascend950 [CANN_SET_ENV]
+bash npu_patch/scripts/build_base.sh -soc_type Ascend910_93 [CANN_SET_ENV]
 ```
+
+> `-soc_type` 使用 `Ascend910_93` / `Ascend950`。A3 使用
+> 非 SIMT Bisheng 后端（`planning_aicore.cpp` 等），产品架构由
+> `ASCEND_MOONEP_ARCH_A3` 宏标识；A5 走 SIMT 后端（`planning_simt.cpp` 与
+> 各 `*_udma.cpp`）。每个 SoC 有独立 build 目录（`build_ascend_<a3|a5>`），
+> 切换 SoC 不会复用旧缓存。
 
 `build_base.sh` 是构建逻辑的**唯一实现**，依次：
 
@@ -96,14 +112,25 @@ bash npu_patch/scripts/build_base.sh -soc_type Ascend950 [CANN_SET_ENV]
 ## 运行测试
 
 统一入口是 `npu_patch/scripts/run_test.sh`（仓库根目录执行即可），按引擎拆分
-**ubmem（MTE/AscendC，默认）** 与 **urma（URMA/UDMA，仅 A5/Ascend950）**：
+**ubmem（MTE/AscendC，默认）** 与 **urma（URMA/UDMA，仅 A5/Ascend950）**，
+目标 SoC 用 `--soc_type` 指定（默认 `Ascend950`）：
 
 ```bash
-# ubmem / MTE 引擎（默认）
+# ubmem / MTE 引擎（默认，A5）
 bash npu_patch/scripts/run_test.sh
-# urma 引擎
+# urma 引擎（仅 A5）
 bash npu_patch/scripts/run_test.sh --use_urma
+
+# A3（Ascend910_93）：仅 mte 引擎，不要加 --use_urma
+bash npu_patch/scripts/run_test.sh --soc_type Ascend910_93
+# 改过 csrc/kernels 后强制重编再测：
+BUILD=1 bash npu_patch/scripts/run_test.sh --soc_type Ascend910_93
 ```
+
+> **A3 不可加 `--use_urma`**：URMA/UDMA 算子依赖 SIMT，A3 没有，
+> `run_test.sh` 检测到非 A5 + `--use_urma` 会直接报错退出。A3 上唯一有效的
+> 引擎是 mte（默认，不加开关）。卡数可用 `NPROC` / `RANK_N` 覆盖（默认取
+> `ASCEND_RT_VISIBLE_DEVICES` 的可见卡数，未设置时按 8）。
 
 `run_test.sh` 覆盖三类测试：
 
@@ -391,9 +418,12 @@ prefetch”实现放在同一组 routing/计时下对比（`--libs moonep all2al
 先构建，再运行：
 
 ```bash
+# Ascend910_93 / A3
+bash npu_patch/scripts/build_a3.sh
+# Ascend950 / A5（按硬件选择对应构建脚本）
 bash npu_patch/scripts/build_a5.sh
 
-# 单机 8 卡，默认脚本 + 默认引擎（ubmem）
+# 单机自动识别卡数（A3 为 16，A5 为 8），默认脚本 + 默认引擎（ubmem）
 bash npu_patch/benchmarks/run_bench.sh
 # 指定脚本
 bash npu_patch/benchmarks/run_bench.sh bench_prefetch.py

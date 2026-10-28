@@ -97,9 +97,16 @@ torch::Tensor LaunchPrefetch(
 
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     aclshmemx_barrier_all_on_stream(stream);
+#if defined(ASCEND_MOONEP_UDMA)
     auto kernel = use_udma
         ? prefetch_weight_kernel_udma_do
         : prefetch_weight_kernel_do;
+#else
+    TORCH_CHECK(!use_udma,
+        "prefetch UDMA kernel support is not enabled in this build; "
+        "A2/A3 do not provide the UDMA prefetch kernel");
+    auto kernel = prefetch_weight_kernel_do;
+#endif
     kernel(
         stream,
         static_cast<uint8_t*>(remote_expert.data_ptr()),
