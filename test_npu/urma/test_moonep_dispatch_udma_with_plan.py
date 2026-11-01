@@ -536,6 +536,7 @@ def run_rank(local_rank: int, args) -> None:
             explicitly_destroy=True,
             rank=rank if args.bootstrap == "ipport" else None,
             use_udma_dispatch=True,
+            dedup_mode=args.dedup_mode,
         )
         # UDMA enablement: created_qp_count = active_qp_count if <4, else 6
         created_qp_count = args.active_qp_count if args.active_qp_count < 4 else 6
@@ -572,7 +573,7 @@ def run_rank(local_rank: int, args) -> None:
             topk_all = make_planning_topk(args)
             reference = planning_reference(topk_all, E, B, num_output_slots(args), rank, args.dedup_mode)
             expected = expected_from_raw_dst(reference.raw_dst, rank, args)
-            plan, cu_seqlens = allocate_planning_outputs(ctx, dedup_mode=args.dedup_mode)
+            plan, cu_seqlens = allocate_planning_outputs(ctx)
             topk_npu = topk_all[rank].reshape(-1).to(device=device)
             tpe_npu = reference.tokens_per_expert[rank].to(device=device)
             ShmemRuntime.barrier()

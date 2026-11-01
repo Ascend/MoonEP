@@ -77,7 +77,7 @@ DEFAULT_CASES = [
 ]
 
 
-def make_symmetric_experts(rank, R, E, H, Hp, B):
+def make_symmetric_experts(rank, R, E, H, Hp, B, page_size=None):
     """Allocate the per-rank [epn + B, H, Hp] VMM chunk registered with the
     buffer-backed init. Returns the source tensor (``data_ptr`` = source VA);
     kernel args are mapped to local symmetric tensors via ``map_to_sym_ptr``
@@ -89,7 +89,7 @@ def make_symmetric_experts(rank, R, E, H, Hp, B):
     epn = (E + R - 1) // R
     return create_vmm_physical(
         [epn + B, H, Hp], torch.bfloat16,
-        torch.npu.current_device())[0]
+        torch.npu.current_device(), page_size=page_size)[0]
 
 
 def prefetch_plan(R, B, epn, counts, dev):
@@ -141,7 +141,8 @@ def bench_case(case, args, rank, group, R):
     assert all(0 <= c < R for c in counts), \
         f"{case['label']}: each count must be in [0, R)"
 
-    keepalive = make_symmetric_experts(rank, R, E, H, Hp, B)
+    keepalive = make_symmetric_experts(rank, R, E, H, Hp, B,
+                                       page_size=args.vmm_page_size)
     local_expert = keepalive[:epn]
     prefetch_src = keepalive[epn:]
     local_expert.zero_()

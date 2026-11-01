@@ -449,7 +449,7 @@ torch::Tensor Planning(
     int64_t core_num,
     int64_t rank,
     int64_t world_size,
-    bool use_udma, torch::Tensor combine_workspace, int64_t hidden_size) {
+    bool server_dedup, bool use_udma, torch::Tensor combine_workspace, int64_t hidden_size) {
     (void)use_udma;
     CheckNpuInt32(topk_idx, "topk_idx");
     CheckNpuInt32(dst, "dst");
@@ -495,7 +495,10 @@ torch::Tensor Planning(
             std::numeric_limits<int32_t>::max(),
         "planning requires world_size * num_experts to fit int32 indexing");
     // Detect the protocol from the counts length; rank mode still lets legacy callers reserve NvS larger than S*K.
-    const bool server_dedup = dup_counts.dim() == 1 && dup_counts.numel() == world_size + 2;
+    const bool counts_server_dedup = dup_counts.dim() == 1 && dup_counts.numel() == world_size + 2;
+    TORCH_CHECK(server_dedup == counts_server_dedup,
+                "planning dedup mode must match the plan tables: plan has ",
+                counts_server_dedup ? "server" : "rank", " dedup tables");
     TORCH_CHECK(!server_dedup || world_size % kPlanningRanksPerServer == 0,
                 "server planning requires world_size divisible by 8");
     TORCH_CHECK(num_max_tokens_per_rank >= route_count && (!server_dedup || num_max_tokens_per_rank == route_count),
@@ -555,7 +558,10 @@ torch::Tensor Planning(
             static_cast<int64_t>(kPlanningUbSizeBytes)));
     tiling.server_dedup = server_dedup ? 1U : 0U;
     torch::Tensor combine_plan;
-    if (combine_workspace.defined()) {
+    TORCH_CHECK(server_dedup || !combine_workspace.defined(),
+                "the legacy rank-level planner does not produce a combine "
+                "execution plan; construct the Buffer with dedup_mode='server'");
+    if (server_dedup && combine_workspace.defined()) {
         combine_plan = AllocateCombinePlan(combine_workspace, dst, dup_groups,
             dup_loffs, dup_counts, num_tokens, hidden_size, num_topk, world_size, rank);
         tiling.combine_mode = 1U;
@@ -575,27 +581,34 @@ torch::Tensor Planning(
     auto dup_workspace = SliceWorkspace(local_workspace, layout.dup_workspace);
     auto dup_key_workspace = SliceWorkspace(local_workspace, layout.dup_key_workspace);
 
-    LaunchPlanningKernel(
-        topk_idx,
-        dst,
-        cu_seqlens,
-        experts_to_copy,
-        dup_groups,
-        dup_loffs,
-        dup_counts,
-        tpe_all,
-        tpe_prefix,
-        balance,
-        z,
-        alloc,
-        alloc_cumsum,
-        expert_offsets,
-        core_expert_counts,
-        dup_workspace,
-        dup_key_workspace,
-        tiling,
-        reinterpret_cast<void*>(static_cast<uintptr_t>(symmetric_workspace_addr)),
-        0);
+    const auto launch_planning = [&](auto launcher) {
+        launcher(
+            topk_idx,
+            dst,
+            cu_seqlens,
+            experts_to_copy,
+            dup_groups,
+            dup_loffs,
+            dup_counts,
+            tpe_all,
+            tpe_prefix,
+            balance,
+            z,
+            alloc,
+            alloc_cumsum,
+            expert_offsets,
+            core_expert_counts,
+            dup_workspace,
+            dup_key_workspace,
+            tiling,
+            reinterpret_cast<void*>(static_cast<uintptr_t>(symmetric_workspace_addr)),
+            0);
+    };
+    if (server_dedup) {
+        launch_planning(LaunchPlanningServerDedupKernel);
+    } else {
+        launch_planning(LaunchPlanningLegacyKernel);
+    }
     return combine_plan;
 }
 

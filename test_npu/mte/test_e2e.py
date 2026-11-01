@@ -51,6 +51,10 @@ from moonep.buffer import (
     release_owned,
 )
 
+# The smoke-test shapes are tiny (Hp=512 -> epn*row=2 MiB), so the [E+B]
+# projection needs 2 MiB VMM pages even if the caller exports 1g.
+os.environ.setdefault("ASCEND_MOONEP_VMM_PAGE_SIZE", "2m")
+
 
 def make_inputs(rank, S, H, K, E, seed=0):
     dev = "npu"

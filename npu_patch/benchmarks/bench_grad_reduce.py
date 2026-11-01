@@ -130,9 +130,11 @@ def bench_case(case, args, rank, group, R, local_rank):
     # Buffer-backed only: allocate/register VMM chunks; after init_with_buffer
     # they become the local symmetric tensors the kernel expects (symmetric base).
     expert_grads_src, _, _ = create_vmm_physical(
-        [E, H, Hp], torch.float32, local_rank)
+        [E, H, Hp], torch.float32, local_rank,
+        page_size=args.vmm_page_size)
     reduce_buffers_src, _, _ = create_vmm_physical(
-        [B, H, Hp], torch.float32, local_rank)
+        [B, H, Hp], torch.float32, local_rank,
+        page_size=args.vmm_page_size)
     expert_grads_src.zero_()
     reduce_buffers_src.zero_()
     torch.npu.synchronize()

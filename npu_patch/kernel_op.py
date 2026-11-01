@@ -29,12 +29,17 @@ class KernelOp:
     symmetric workspace; they must never assume a cross-rank contiguous VA.
     """
 
-    def __init__(self, ws_bytes: int = 0, num_sms: int = 32, *,
+    def __init__(self, ws_bytes: int = 0, num_sms: int = 32,
+                 page_size: str | None = None, *,
                  ws_tensor: torch.Tensor | None = None):
         # No 2 MiB alignment requirement on Ascend: any positive size is OK
         # (VMM granularity alignment is handled by create_vmm_physical).
+        # ``page_size`` selects the workspace's huge-page policy: op
+        # workspaces are MiB-scale, so "2m" avoids a full GiB of symmetric
+        # heap per op (None keeps the process default).
         self._num_sms = num_sms
         self._ws_bytes = ws_bytes
+        self._page_size = page_size
         self._ws_tensor = None
         self._ws = None
         self._ws_translated_tensor = None
@@ -74,7 +79,8 @@ class KernelOp:
         elif ws_bytes > 0:
             # VMM physical allocation; symmetric address resolved lazily in sym_workspace().
             self._ws_tensor, _, _ = create_vmm_physical(
-                [ws_bytes], torch.uint8, torch.npu.current_device())
+                [ws_bytes], torch.uint8, torch.npu.current_device(),
+                page_size=page_size)
             self._ws_allocation = getattr(self._ws_tensor, '_vmm_allocation', None)
             self._owns_workspace = True
         # Collective: all ranks allocate the same workspaces in the same order.

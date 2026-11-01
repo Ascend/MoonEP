@@ -607,6 +607,10 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void moonep_dispa
     GM_ADDR route_weights_buf_gm, // SHMEM fp32 [NvS]
     ascend_moonep::MoonEPDispatchTilingData tiling)
 {
+    // Entry rendezvous: peers' inputs and previous readers are done before
+    // any scatter put overwrites the receive windows.
+    aclshmemx_barrier_all_vec();
+
     uint32_t S = tiling.S;
     uint32_t H = tiling.H;
     uint32_t K = tiling.K;
@@ -633,8 +637,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void moonep_dispa
         with_weights != 0,
         core_idx, kMoonEPAivNum);
 
-    // Completes the scatter RMA updates and synchronizes all vector cores on
-    // every rank before the local duplicate expansion reads the receive buffer.
+    aclshmem_quiet();
     aclshmemx_barrier_all_vec();
 
     __gm__ bf16_t* hbuf = reinterpret_cast<__gm__ bf16_t*>(hidden_buf_gm);

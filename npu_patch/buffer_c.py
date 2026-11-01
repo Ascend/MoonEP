@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 import operator
+import os
 
 import torch
 
@@ -53,6 +54,109 @@ _ELEM_SIZE = {
     torch.int64: 8,
     torch.uint8: 1,
 }
+
+# Per-allocation huge-page policies accepted by ``create_vmm_physical``.
+# ACL rounds every physical allocation up to its page granularity, so a 1 GiB
+# page makes even a 12-byte barrier buffer occupy a full GiB of the symmetric
+# heap; metadata/scratch chunks should use ``VMM_PAGE_SIZE_2M``.
+VMM_PAGE_SIZE_1G = "1g"
+VMM_PAGE_SIZE_2M = "2m"
+VMM_PAGE_SIZE_DEFAULT = "default"
+_VMM_PAGE_SIZES = frozenset((VMM_PAGE_SIZE_1G, VMM_PAGE_SIZE_2M))
+
+# Allocation scopes of the process-wide page-size default. MoonEP's own
+# dispatch/combine chunks (``Buffer``) and the training framework's parameters
+# (the ``moonep.buffer.create_full_*`` pools: expert weights / grads / reduce
+# carriers) are priced and tuned independently, so each scope owns an env
+# variable:
+#   - ``moonep``    -> ``ASCEND_MOONEP_VMM_PAGE_SIZE``;
+#   - ``framework`` -> ``ASCEND_MOONEP_FRAMEWORK_VMM_PAGE_SIZE``, falling back
+#                      to the moonep variable so a single
+#                      ``ASCEND_MOONEP_VMM_PAGE_SIZE`` still governs the whole
+#                      process (previous behaviour).
+VMM_SCOPE_MOONEP = "moonep"
+VMM_SCOPE_FRAMEWORK = "framework"
+_VMM_SCOPE_ENVS = {
+    VMM_SCOPE_MOONEP: "ASCEND_MOONEP_VMM_PAGE_SIZE",
+    VMM_SCOPE_FRAMEWORK: "ASCEND_MOONEP_FRAMEWORK_VMM_PAGE_SIZE",
+}
+
+
+def normalize_vmm_page_size(page_size: str | None) -> str:
+    """Normalize a per-allocation page-size request.
+
+    ``None`` / ``""`` / ``"default"`` keep the scope default
+    (``ASCEND_MOONEP_VMM_PAGE_SIZE`` / ``ASCEND_MOONEP_FRAMEWORK_VMM_PAGE_SIZE``,
+    else 2 MiB); ``"1g"`` / ``"2m"`` override it for this allocation only.
+    Validation is duplicated natively so a bad value fails before any ACL call,
+    but doing it here keeps the error independent of the extension build.
+    """
+    if page_size is None:
+        return VMM_PAGE_SIZE_DEFAULT
+    if not isinstance(page_size, str):
+        raise TypeError(
+            f"page_size must be a str or None, got {type(page_size).__name__}")
+    value = page_size.strip().lower()
+    if value in ("", VMM_PAGE_SIZE_DEFAULT):
+        return VMM_PAGE_SIZE_DEFAULT
+    if value not in _VMM_PAGE_SIZES:
+        raise ValueError(
+            f"page_size must be '1g', '2m' or 'default', got {page_size!r}")
+    return value
+
+
+def env_vmm_page_size(scope: str = VMM_SCOPE_MOONEP) -> str:
+    """Return the huge-page policy configured for one allocation scope.
+
+    ``""`` means the scope's variable is unset, leaving the caller's default in
+    charge (``resolve_vmm_page_size`` chains the ``framework`` scope to the
+    ``moonep`` variable). Values are validated here so a typo fails on the host
+    side with the variable's name instead of an opaque ACL error.
+    """
+    if scope not in _VMM_SCOPE_ENVS:
+        raise ValueError(
+            f"unknown VMM allocation scope {scope!r}; expected one of "
+            f"{sorted(_VMM_SCOPE_ENVS)}")
+    env_name = _VMM_SCOPE_ENVS[scope]
+    raw = os.environ.get(env_name, "").strip().lower()
+    if not raw:
+        return ""
+    if raw not in _VMM_PAGE_SIZES:
+        raise ValueError(f"{env_name} must be '1g' or '2m', got {raw!r}")
+    return raw
+
+
+def resolve_vmm_page_size(page_size: str | None = None, *,
+                          scope: str = VMM_SCOPE_MOONEP,
+                          default: str | None = None) -> str:
+    """Resolve one allocation's concrete huge-page policy (``"1g"`` / ``"2m"``).
+
+    Precedence:
+
+      1. an explicit per-allocation request (``page_size="1g"`` / ``"2m"``);
+      2. the scope's environment variable (the ``framework`` scope checks
+         ``ASCEND_MOONEP_FRAMEWORK_VMM_PAGE_SIZE`` first, then
+         ``ASCEND_MOONEP_VMM_PAGE_SIZE``);
+      3. ``default`` (2 MiB when omitted).
+
+    Resolving on the Python side (instead of letting the native layer read
+    ``ASCEND_MOONEP_VMM_PAGE_SIZE``) keeps the two scopes explicit and makes the
+    effective policy visible to the caller: ``Buffer`` records it and prices its
+    HBM footprint with it.
+    """
+    requested = normalize_vmm_page_size(page_size)
+    if requested != VMM_PAGE_SIZE_DEFAULT:
+        return requested
+    if scope == VMM_SCOPE_FRAMEWORK:
+        configured = env_vmm_page_size(VMM_SCOPE_FRAMEWORK)
+        if configured:
+            return configured
+    configured = env_vmm_page_size(VMM_SCOPE_MOONEP)
+    if configured:
+        return configured
+    fallback = normalize_vmm_page_size(default)
+    return VMM_PAGE_SIZE_2M if fallback == VMM_PAGE_SIZE_DEFAULT else fallback
+
 
 # Caller-owned descriptor backing is pinned from successful buffer-backed init
 # until successful collective finalize.  A failed finalize keeps this latch set
@@ -274,13 +378,17 @@ class VmmAllocation:
       - ``shareable_handle`` : legacy V1 shareable handle exported for the
                                descriptor
       - ``fabric_handle``    : Fabric V2 handle (None on the legacy-V1 path)
-      - ``size``             : size in bytes
+      - ``size``             : gran-aligned size in bytes
+      - ``page_size``        : resolved huge-page policy (``"1g"`` / ``"2m"``)
+      - ``granularity``      : ACL minimum allocation granularity used for this
+                               allocation (2 MiB or 1 GiB)
     ``destroy()`` releases in dependency order: unmap -> release ->
     free_physical (the VMM inverse operations, not ``aclshmem_free``).
     """
 
     def __init__(self, source_va, mem_handle, shareable_handle, size,
-                 fabric_handle_bytes=b"", device_id=0):
+                 fabric_handle_bytes=b"", device_id=0, page_size="2m",
+                 granularity=0):
         self.source_va = int(source_va)
         self.mem_handle = mem_handle
         self.shareable_handle = int(shareable_handle) if shareable_handle else None
@@ -290,6 +398,11 @@ class VmmAllocation:
         self.fabric_handle_bytes = bytes(fabric_handle_bytes or b"")
         self.size = int(size)
         self.device_id = int(device_id)
+        # Resolved per-allocation huge-page policy and the ACL granularity it
+        # yielded (consumed by symmetric_descriptors() ordering and by
+        # create_full_projection_tensor()'s VA alignment).
+        self.page_size = str(page_size)
+        self.granularity = int(granularity)
         self._destroyed = False
         self._registered = False
 
@@ -338,13 +451,23 @@ def symmetric_descriptors():
     0 with empty fabric_bytes means VA-only (shmem reserves the mapping handle
     from addr); non-empty fabric_bytes is consumed directly by shmem (no
     re-export). Already ``destroy()``-ed allocations are skipped.
+
+    Descriptor order defines the symmetric heap layout, and ACLSHMEM checks
+    every descriptor's cumulative ``segment_offset`` against *that* buffer's
+    granularity (``validate_buffer_mapping`` in shmem_init.cpp). With mixed
+    page sizes the larger pages must therefore come first: 1 GiB-sized
+    prefixes keep every 1 GiB descriptor aligned, while 2 MiB descriptors that
+    follow start at an offset that is both a 1 GiB and a 2 MiB multiple.
+    The sort is stable, so allocations with the same granularity keep their
+    creation order (and all-1g heaps keep the previous layout).
     """
+    live = [a for a in _VMM_REGISTRY if not getattr(a, '_destroyed', False)]
+    live.sort(key=lambda a: -int(getattr(a, 'granularity', 0)))
     return tuple(
         (a.source_va, a.size,
          int(a.mem_handle) if a.mem_handle else 0,
          a.fabric_handle_bytes)
-        for a in _VMM_REGISTRY
-        if not getattr(a, '_destroyed', False)
+        for a in live
     )
 
 
@@ -414,20 +537,33 @@ def create_sym_tensor_from_ptr(ptr, shape, dtype: torch.dtype, device,
         metadata, storage)
 
 
-def create_vmm_physical(shape, dtype: torch.dtype, device: int):
+def create_vmm_physical(shape, dtype: torch.dtype, device: int,
+                        page_size: str | None = None):
     """Allocate a CANN VMM physical chunk and wrap its source_va as an NPU
     tensor.
 
     Returns ``(tensor, mem_handle, shareable_va)``; ``tensor.data_ptr()`` is
     the registered source VA. CANN VMM physical allocations must be aligned to
-    the allocation granularity (2MiB), so the actual allocation is rounded up
-    to gran (the extra padding is only spare physical/symmetric VA; the tensor
-    still covers only the requested shape). Allocation also:
+    the allocation granularity, so the actual allocation is rounded up to gran
+    (the extra padding is only spare physical/symmetric VA; the tensor still
+    covers only the requested shape). Allocation also:
       - builds a ``VmmAllocation`` attached as ``tensor._vmm_allocation``
         (destroy/GC release via the VMM inverse ops, not aclshmem_free);
       - registers it in the global descriptor registry
         (``register_symmetric_descriptor``) for the framework to collect and
         run a single ``shmem_init_with_buffer``.
+
+    ``page_size`` selects this allocation's huge-page policy:
+      - ``None`` / ``"default"``: the moonep-scope process default
+        (``ASCEND_MOONEP_VMM_PAGE_SIZE``, else 2 MiB);
+      - ``"1g"``: 1 GiB HBM huge pages, the ACL default;
+      - ``"2m"``: 2 MiB HBM huge pages, the process default. ACL rounds to this
+        granularity, so a small metadata/scratch chunk costs 2 MiB instead of a
+        full GiB of the symmetric heap. Mixing policies is fine (each descriptor
+        carries its own property), but see ``symmetric_descriptors()`` for the
+        ordering rule that keeps cumulative offsets aligned.
+    Framework-owned parameters resolve through ``VMM_SCOPE_FRAMEWORK`` instead
+    (``ASCEND_MOONEP_FRAMEWORK_VMM_PAGE_SIZE``); see ``resolve_vmm_page_size``.
 
     ``device`` is the current logical device id (the visible 0..N-1 index from
     the torch.npu / ``aclrtSetDevice`` viewpoint) and must equal
@@ -447,15 +583,18 @@ def create_vmm_physical(shape, dtype: torch.dtype, device: int):
     # Alloc uses the visible index; set_access uses the physical card id
     # (see docstring).
     access_device_id = local_physical_id(device_id)
-    gran = int(acl_vmm_granularity(device_id))
+    # Resolve once so the granularity, physical handle and recorded policy of
+    # this allocation are guaranteed to agree even if the env changes later.
+    policy = resolve_vmm_page_size(page_size)
+    gran = int(acl_vmm_granularity(device_id, policy))
     alloc_size = ((nbytes + gran - 1) // gran) * gran
     # On Ascend950 fabric_bytes is non-empty (acl_vmm_alloc_source exports
     # Fabric V2 internally).
     va, handle, shareable, size, fabric_bytes = acl_vmm_alloc_source(
-        alloc_size, device_id, access_device_id)
+        alloc_size, device_id, access_device_id, policy)
     allocation = VmmAllocation(
         va, handle, shareable, size, fabric_handle_bytes=fabric_bytes,
-        device_id=device_id)
+        device_id=device_id, page_size=policy, granularity=gran)
     try:
         tensor = create_sym_tensor_from_ptr(
             va, list(shape), dtype, torch.device(f"npu:{device_id}"))
@@ -470,7 +609,8 @@ def create_vmm_physical(shape, dtype: torch.dtype, device: int):
     return tensor, handle, shareable
 
 
-def create_vmm_arena(specs, device: int) -> dict[str, torch.Tensor]:
+def create_vmm_arena(specs, device: int,
+                     page_size: str | None = None) -> dict[str, torch.Tensor]:
     """Pack named ``(name, shape, dtype)`` chunks into one VMM descriptor.
 
     Each chunk starts on a 512-byte boundary and reserves its own padded
@@ -479,6 +619,11 @@ def create_vmm_arena(specs, device: int) -> dict[str, torch.Tensor]:
     tensors hold the same allocation owner; the caller destroys that owner
     once, after collective SHMEM finalize, just like ``create_vmm_physical``.
     All ranks must provide the same ordered specs before SHMEM initialization.
+
+    ``page_size`` applies to the single descriptor backing the whole arena
+    (``None`` / ``"default"`` keeps the moonep-scope process default). Arenas
+    pack KiB..MiB-scale metadata, so ``"2m"`` is the usual choice: one 1 GiB chunk
+    per small region would dominate the symmetric heap.
     """
     if _SHMEM_BACKING_LOCKED:
         raise RuntimeError(
@@ -508,17 +653,20 @@ def create_vmm_arena(specs, device: int) -> dict[str, torch.Tensor]:
     device_id = int(device)
     _require_current_device(device_id)
     access_device_id = local_physical_id(device_id)
-    gran = int(acl_vmm_granularity(device_id))
+    # Resolve once so the granularity, physical handle and recorded policy of
+    # the arena descriptor are guaranteed to agree.
+    policy = resolve_vmm_page_size(page_size)
+    gran = int(acl_vmm_granularity(device_id, policy))
     if gran <= 0:
         raise RuntimeError("VMM allocation granularity must be positive")
     alloc_size = _align_up(cursor, gran)
     va, handle, shareable, size, fabric_bytes = acl_vmm_alloc_source(
-        alloc_size, device_id, access_device_id)
+        alloc_size, device_id, access_device_id, policy)
     allocation = None
     try:
         allocation = VmmAllocation(
             va, handle, shareable, size, fabric_handle_bytes=fabric_bytes,
-            device_id=device_id)
+            device_id=device_id, page_size=policy, granularity=gran)
         if allocation.size < cursor:
             raise RuntimeError("VMM arena backing is smaller than its padded chunks")
         views = {}
@@ -744,13 +892,21 @@ def create_full_projection_tensor(home, slot, E, B, rank, device):
     H, Hp = int(home.shape[1]), int(home.shape[2])
     row = H * Hp * int(home.element_size())
     _require_current_device(int(device))
-    gran = int(acl_vmm_granularity(int(device)))
     epn = int(home.shape[0])
     home_alloc = getattr(home, '_vmm_allocation', None)
     slot_alloc = getattr(slot, '_vmm_allocation', None)
     if home_alloc is None or slot_alloc is None:
         raise ValueError(
             "home/slot must be VMM chunks (create_vmm_physical)")
+    # Map each segment at a VA that satisfies *its own* page granularity; a
+    # shared step must satisfy both when home/slot use different page sizes.
+    home_gran = int(getattr(home_alloc, 'granularity', 0))
+    slot_gran = int(getattr(slot_alloc, 'granularity', 0))
+    if home_gran > 0 and slot_gran > 0:
+        gran = _lcm(home_gran, slot_gran)
+    else:
+        # Legacy VmmAllocation without the recorded granularity.
+        gran = int(acl_vmm_granularity(int(device)))
     home_size = int(home_alloc.size)
     slot_size = int(slot_alloc.size)
     step = _lcm(gran, row)
@@ -763,8 +919,9 @@ def create_full_projection_tensor(home, slot, E, B, rank, device):
     if slot_start + B > E + B:
         raise ValueError(
             f"config not representable as a [E+B] row-aligned projection: "
-            f"lcm(gran,row)/row = {step // row} forces slot_start={slot_start} "
-            f"> E={E}; choose H*Hp so that lcm(2MiB, H*Hp*elemsize) <= E*row")
+            f"lcm(gran={gran},row)/row = {step // row} forces "
+            f"slot_start={slot_start} > E={E}; choose H*Hp so that "
+            f"lcm(gran, H*Hp*elemsize) <= E*row")
     # The reserved VA covers only the two actually mapped segments
     # (``ALIGN_UP(a)+ALIGN_UP(b)`` may exceed ``ALIGN_UP((E+B)*row)``; do not
     # estimate from the logical total size).
@@ -808,8 +965,11 @@ def shmem_init_with_buffer(descriptors, my_pe: int, n_pes: int, uid_bytes,
 
     ``descriptors`` is a list of ``(addr, size, mem_handle, fabric_handle)``,
     one per registered VMM buffer (see ``symmetric_descriptors()``). All ranks
-    pass the same descriptor count/sizes. ``uid_bytes`` is rank0's
-    ``acl_shmem_get_unique_id()`` UID broadcast via dist. Non-zero
+    pass the same descriptor count/sizes; with mixed page sizes the list must
+    be ordered largest-granularity first (``symmetric_descriptors()`` does this
+    automatically) because ACLSHMEM validates each cumulative
+    ``segment_offset`` against that buffer's own granularity. ``uid_bytes`` is
+    rank0's ``acl_shmem_get_unique_id()`` UID broadcast via dist. Non-zero
     ``tail_bytes`` makes shmem keep a private malloc heap (usable by
     ``aclshmem_malloc``).
     """
@@ -840,7 +1000,8 @@ def shmem_init_with_buffer(descriptors, my_pe: int, n_pes: int, uid_bytes,
         raise RuntimeError(f"acl_shmem_init_with_buffers failed with {rc}")
 
 
-def alloc_sym_chunk(shape, dtype: torch.dtype, device: int) -> torch.Tensor:
+def alloc_sym_chunk(shape, dtype: torch.dtype, device: int,
+                    page_size: str | None = None) -> torch.Tensor:
     """Allocate a VMM chunk registered for buffer-backed init and return the
     source tensor.
 
@@ -851,8 +1012,9 @@ def alloc_sym_chunk(shape, dtype: torch.dtype, device: int) -> torch.Tensor:
 
     ``device`` is the current logical device id (same as
     ``create_vmm_physical``; must equal ``torch.npu.current_device()``).
+    ``page_size`` is forwarded to ``create_vmm_physical``.
     """
-    return create_vmm_physical(shape, dtype, device)[0]
+    return create_vmm_physical(shape, dtype, device, page_size=page_size)[0]
 
 
 def sym_tensor(source_tensor: torch.Tensor) -> torch.Tensor:

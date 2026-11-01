@@ -43,7 +43,16 @@ import torch_npu
 import torch.distributed as dist
 
 from _bench_common import (
-    add_engine_args,
+    add_common_bench_arg,
+    add_dedup_mode_arg,
+    add_ip_port_arg,
+    add_maxvios_arg,
+    add_no_dist_arg,
+    add_no_weights_arg,
+    add_num_sms_arg,
+    add_out_arg,
+    add_plot_arg,
+    add_shape_args,
     apply_engine,
     generate_topk_routing,
     setup,
@@ -246,7 +255,8 @@ class DispatchRunner:
     """Own the Buffer, plan, and fixed dispatch inputs for one benchmark."""
 
     def __init__(self, group, R, S, K, E, H, num_sms, local_rank, with_weights,
-                 rank=None, use_udma=False, dedup_mode="rank"):
+                 rank=None, use_udma=False, dedup_mode="rank",
+                 vmm_page_size="default"):
         self.group = group
         self.rank = rank if rank is not None else dist.get_rank(group=group)
         self.R = R
@@ -266,9 +276,11 @@ class DispatchRunner:
             use_udma=use_udma,
             explicitly_destroy=True,
             rank=rank,
+            dedup_mode=dedup_mode,
+            vmm_page_size=vmm_page_size,
         )
         self.ctx = self.buffer._require_ctx()
-        self.plan, self.cu_seqlens = allocate_planning_outputs(self.ctx, dedup_mode=dedup_mode)
+        self.plan, self.cu_seqlens = allocate_planning_outputs(self.ctx)
 
         dev = f"npu:{local_rank}"
         generator = torch.Generator(device=dev).manual_seed(7777 + self.rank)
@@ -428,49 +440,18 @@ def setup_no_dist():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    add_engine_args(parser)
-    parser.add_argument(
-        "--out",
-        default="bench_dispatch_maxvio_results.csv",
-        help="CSV output path on rank 0 (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--plot",
-        default=None,
-        help="Optional latency figure path on rank 0",
-    )
-    parser.add_argument(
-        "--maxvios",
-        default="0.2,1,10,20",
-        help="Comma-separated target MaxVio values (default: %(default)s)",
-    )
-    parser.add_argument("--tokens", type=int, default=8192)
-    parser.add_argument("--experts", type=int, default=384)
-    parser.add_argument("--hidden", type=int, default=7168)
-    parser.add_argument("--topk", type=int, default=8)
-    parser.add_argument("--num-sms", type=int, default=32)
-    parser.add_argument("--dedup-mode", choices=("rank", "server"), default="rank")
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--kernel-timing", action="store_true", help="collect AIV stage cycles per MaxVio case")
-    parser.add_argument(
-        "--no-weights",
-        action="store_true",
-        help="Benchmark hidden-only dispatch instead of forward dispatch",
-    )
-    parser.add_argument(
-        "--ip-port",
-        default=None,
-        help=(
-            "SHMEM DEFAULT-bootstrap endpoint. Multi-node runs derive it from "
-            "MASTER_ADDR and MASTER_PORT (+1) when omitted"
-        ),
-    )
-    parser.add_argument(
-        "--no-dist",
-        action="store_true",
-        help="Use torchrun only as a process launcher; SHMEM bootstrap and CPU TCPStore statistics",
-    )
+    add_common_bench_arg(parser)
+    add_num_sms_arg(parser, default=32)
+    add_out_arg(parser, default="bench_dispatch_maxvio_results.csv")
+    add_plot_arg(parser)
+    add_maxvios_arg(parser)
+    add_shape_args(parser, tokens=8192, experts=384, hidden=7168, topk=8)
+    add_dedup_mode_arg(parser)
+    parser.add_argument("--kernel-timing", action="store_true",
+                        help="collect AIV stage cycles per MaxVio case")
+    add_no_weights_arg(parser, op="dispatch")
+    add_ip_port_arg(parser)
+    add_no_dist_arg(parser)
     args = parser.parse_args()
 
     if args.no_dist:
@@ -511,6 +492,7 @@ def main():
         rank=rank if args.no_dist else None,
         use_udma=use_udma,
         dedup_mode=args.dedup_mode,
+        vmm_page_size=args.vmm_page_size,
     )
     if not ShmemRuntime.is_initialized():
         if args.no_dist:

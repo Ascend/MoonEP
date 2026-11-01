@@ -97,6 +97,12 @@ If the CANN/HCCL build behind torch_npu does not implement uneven splits, the
 first all-to-all raises; run ``--libs all2all`` alone to check the collective in
 isolation.
 
+``--dedup-mode {rank,server}`` applies to the MoonEP runner only (the baseline has
+no dedup): the domain is fixed at Buffer construction, ``server`` needs
+``--engine urma`` and allocates the multi-GiB symmetric PUT combine workspace. At
+EP=8 one server covers the whole world, so R>8 is what exercises cross-server
+traffic.
+
 EP group = whole world (R == world_size). Single- and multi-node both work
 (R = nnodes x nproc):
 
@@ -124,14 +130,23 @@ EP group = whole world (R == world_size). Single- and multi-node both work
 import argparse
 import csv
 import os
+import time
 
 import torch
 import torch_npu
 import torch.distributed as dist
 
 from _bench_common import (
-    add_engine_args,
+    add_common_bench_arg,
+    add_dedup_mode_arg,
+    add_ip_port_arg,
+    add_maxvios_arg,
+    add_num_sms_arg,
+    add_out_arg,
+    add_plot_arg,
+    add_shape_args,
     apply_engine,
+    log_init,
     setup,
     time_kernel,
 )
@@ -150,10 +165,10 @@ from npu_patch.launchers import (
     launch_dispatch,
     launch_planning,
 )
-from npu_patch.planning import allocate_planning_outputs
+from npu_patch.planning import RANKS_PER_SERVER, allocate_planning_outputs
 
 
-def make_symmetric_experts(device_id, R, E, H, Hp, B):
+def make_symmetric_experts(device_id, R, E, H, Hp, B, page_size=None):
     """Allocate a per-rank ``[epn + B, H, Hp]`` VMM chunk registered with the
     buffer-backed init. Identical to bench_vs.py (same test_prefetch.py
     pattern): rows ``[0:epn)`` are this rank's home experts and
@@ -164,7 +179,7 @@ def make_symmetric_experts(device_id, R, E, H, Hp, B):
     """
     epn = (E + R - 1) // R
     return create_vmm_physical([epn + B, H, Hp], torch.bfloat16,
-                               device_id)[0]
+                               device_id, page_size=page_size)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +236,8 @@ class MoonEPRunner:
     NAME = 'moonep'
 
     def __init__(self, group, R, S, K, E, H, num_sms, local_rank,
-                 use_udma=False, hp=3072):
+                 use_udma=False, hp=3072, dedup_mode='rank',
+                 vmm_page_size='default'):
         self.group = group
         self.num_sms = num_sms
         self.rank = dist.get_rank(group)
@@ -229,8 +245,11 @@ class MoonEPRunner:
         self.local_rank = local_rank
         self.use_udma = use_udma
         self.hp = hp
+        self.dedup_mode = dedup_mode
         self.buffer = Buffer(S, H, K, E, R, num_sms=num_sms, group=group,
-                             use_udma=use_udma, explicitly_destroy=True)
+                             use_udma=use_udma, dedup_mode=dedup_mode,
+                             explicitly_destroy=True,
+                             vmm_page_size=vmm_page_size)
         self.ctx = self.buffer._require_ctx()
         # Pre-allocate the plan + outputs once (test_planning.py pattern): the
         # timed ops reuse these instead of allocating per call.
@@ -252,7 +271,8 @@ class MoonEPRunner:
         self._weight_chunks = []
         for _ in range(3):
             self._weight_chunks.append(
-                make_symmetric_experts(local_rank, R, E, H, hp, self.B))
+                make_symmetric_experts(local_rank, R, E, H, hp, self.B,
+                                       page_size=vmm_page_size))
         self.remote_experts = []       # 3 logical [E, H, hp] home-weight views
         self.prefetch_buffers = []     # 3 local [B, H, hp] prefetch slots
         g = torch.Generator(device=dev).manual_seed(5000 + self.rank)
@@ -604,38 +624,18 @@ RUNNERS = {
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    add_engine_args(ap)
+    add_common_bench_arg(ap)
+    add_num_sms_arg(ap, default=32)
     ap.add_argument('--libs', nargs='+', default=['moonep', 'all2all'],
                     choices=list(RUNNERS),
                     help='Libraries to benchmark (default: both). "all2all" '
                          'alone needs neither the MoonEP Buffer nor the Ascend '
                          'shmem stack.')
-    ap.add_argument('--out', default='bench_vs_all2all_results.csv',
-                    help='CSV output path (rank 0). Default: %(default)s')
-    ap.add_argument('--plot', default=None,
-                    help='If set, save the grouped-bar figure to this path '
-                         '(rank 0 only).')
-    ap.add_argument('--maxvios', default='0.2,1,10,20',
-                    help='Comma-separated target MaxVio values; the lognormal '
-                         'sigma is reverse-solved for each (default: %(default)s)')
-    ap.add_argument('--experts', type=int, default=1024)
-    ap.add_argument('--hidden', type=int, default=3584)
-    ap.add_argument('--topk', type=int, default=16)
-    ap.add_argument('--hp', type=int, default=3072,
-                    help="Expert weight inner dim H' (MoE intermediate size) for "
-                         'the MoonEP prefetch op (default: %(default)s); the '
-                         'all2all baseline has no weights to prefetch.')
-    ap.add_argument('--num-sms', type=int, default=32,
-                    help='MoonEP op SM budget (the all2all baseline has none).')
-    ap.add_argument('--warmup', type=int, default=20)
-    ap.add_argument('--iters', type=int, default=50)
-    ap.add_argument('--ip-port', default=None,
-                    help='shmem DEFAULT-bootstrap ip_port URL for the '
-                         'buffer-backed shmem init ("tcp://<rank0_ip>:<port>" '
-                         'or "tcp6://[ipv6]:<port>"). Required for multi-node; '
-                         'when omitted in a multi-node launch it is derived '
-                         'from MASTER_ADDR/MASTER_PORT (port + 1). Single-node '
-                         'launches keep the UID bootstrap and ignore this.')
+    add_out_arg(ap, default='bench_vs_all2all_results.csv')
+    add_plot_arg(ap)
+    add_maxvios_arg(ap)
+    add_shape_args(ap, experts=1024, hidden=3584, topk=16, hp=3072)
+    add_ip_port_arg(ap)
     ap.add_argument('--cudagraph', action='store_true',
                     help='Capture the timed loops into an NPU graph instead of '
                          'the eager loop. Off by default: the all2all baseline '
@@ -645,6 +645,7 @@ def main():
                          'shows the collective is not capturable, so the two '
                          'libraries are never timed in different regimes.')
     ap.set_defaults(cudagraph=False)
+    add_dedup_mode_arg(ap)
     args = ap.parse_args()
 
     rank, world_size, local_rank = setup()
@@ -659,6 +660,16 @@ def main():
     assert R >= 1 and E % R == 0, (
         f'E ({E}) must be divisible by world_size (EP size) {R}')
     targets = [float(x) for x in args.maxvios.split(',')]
+    if args.dedup_mode == 'server':
+        # Server dedup needs the UDMA kernels and a complete 8-rank board.
+        if args.engine != 'urma':
+            ap.error('--dedup-mode server requires --engine urma')
+        if R % RANKS_PER_SERVER != 0:
+            ap.error(f'--dedup-mode server requires world_size divisible by '
+                     f'{RANKS_PER_SERVER}, got {R}')
+        if K < 2:
+            ap.error('--dedup-mode server requires K >= 2 to exercise the '
+                     'intra-server forwarding path')
 
     # Multi-node detection: under torchrun, WORLD_SIZE > LOCAL_WORLD_SIZE
     # (procs per node) means multi-node.
@@ -672,13 +683,27 @@ def main():
     if 'moonep' in args.libs:
         runners['moonep'] = MoonEPRunner(group, R, S, K, E, H, args.num_sms,
                                          local_rank, use_udma=use_udma,
-                                         hp=args.hp)
+                                         hp=args.hp,
+                                         dedup_mode=args.dedup_mode,
+                                         vmm_page_size=args.vmm_page_size)
     if 'all2all' in args.libs:
         runners['all2all'] = All2AllRunner(group, R, S, K, E, H,
                                            args.num_sms, local_rank)
 
     if 'moonep' in args.libs:
         if not ShmemRuntime.is_initialized():
+            _shmem_mode = ("ip_port"
+                           if (args.ip_port is not None or multi_node) else "buffer")
+            log_init(
+                "shmem",
+                "init start: mode=%s ip_port=%s enable_udma=%s engine=%s "
+                "libs=%s R=%d NvS=S*K=%d H=%d E=%d B=epn=%d"
+                % (_shmem_mode,
+                   args.ip_port or "<derived from MASTER_ADDR + port+1>",
+                   use_udma, args.engine, ','.join(args.libs), R, S * K, H, E,
+                   E // R),
+            )
+            _t_shmem = time.time()
             if args.ip_port is not None or multi_node:
                 # Multi-node: ip_port/DEFAULT bootstrap; when ip_port is omitted
                 # it is derived from MASTER_ADDR/MASTER_PORT (port + 1, see
@@ -689,7 +714,12 @@ def main():
             else:
                 ShmemRuntime.init_with_buffer(group=group,
                                               enable_udma=use_udma)
+            log_init("shmem", "init done in %.2fs" % (time.time() - _t_shmem))
+        else:
+            log_init("shmem", "already initialized, skipping bootstrap")
+        log_init("shmem", "prepare_shmem_views start")
         runners['moonep'].prepare_shmem_views()
+        log_init("shmem", "prepare_shmem_views done")
 
     cudagraph = args.cudagraph
     if cudagraph and 'all2all' in args.libs:
@@ -769,7 +799,9 @@ def main():
                     pf_us = 0.0
                 timings[lib] = dict(plan_us=plan_us, pf_us=pf_us, d_f=d_f,
                                     d_b=d_b, c_f=c_f, c_b=c_b)
-                rows.append(dict(lib=lib, ep=R, E=E, H=H, K=K, sigma=sigma,
+                rows.append(dict(lib=lib,
+                                 dedup=args.dedup_mode if lib == 'moonep' else '',
+                                 ep=R, E=E, H=H, K=K, sigma=sigma,
                                  target_maxvio=target, maxvio=maxvio,
                                  plan_us=plan_us, pf_us=pf_us,
                                  d_f_us=d_f, d_b_us=d_b, c_f_us=c_f, c_b_us=c_b,

@@ -105,7 +105,7 @@ class PlanningOp(KernelOp):
         if ctx.get('_planning_timing_enabled', False):
             from .planning import begin_base_planning_timing
             begin_base_planning_timing(ctx, plan)
-        fused = _env_use_udma('combine')
+        fused = server_dedup and _env_use_udma('combine')
         fused_timing = None
         if fused:
             from .planning import begin_fused_combine_plan
@@ -129,6 +129,7 @@ class PlanningOp(KernelOp):
             int(self.num_sms),
             rank,
             R,
+            server_dedup,
             combine_workspace=ctx['combine_workspace'] if fused else None,
             hidden_size=int(ctx['H']) if fused else 0,
         )
@@ -178,6 +179,7 @@ class DispatchOp(KernelOp):
             int(ctx["K"]),
             int(ctx["R"]),
             int(ctx["rank"]),
+            plan.dedup_mode == "server",
         )
 
     def compute_profile(self, ctx, hidden_sh, route_weights_sk, plan,
@@ -203,6 +205,7 @@ class DispatchOp(KernelOp):
             int(ctx["K"]),
             int(ctx["R"]),
             int(ctx["rank"]),
+            plan.dedup_mode == "server",
         )
 
 
@@ -215,12 +218,14 @@ class CombineOp(KernelOp):
       - reads remote rows from symmetric ``ctx['hidden_buf']`` via shmem_ptr
       - optional weight gather from ``ctx['weights_buf']`` into user-facing
         output_sk [S, K] fp32
-      - launcher selects native/UDMA from ASCEND_MOONEP_COMBINE_USE_UDMA
+      - launcher selects native / legacy-rank UDMA / server-dedup UDMA
+        from the environment and the plan's dedup mode
     """
 
     def compute(self, ctx, output_sh, plan, output_sk=None,
                 shmem_instance_id: int = 0):
-        if _env_use_udma('combine'):
+        server_dedup = plan.dedup_mode == "server"
+        if server_dedup and _env_use_udma('combine'):
             from .combine import launch_combine_prepared
             if plan.combine_execution_plan is None:
                 raise ValueError('UDMA combine requires PlanningOp to generate its execution plan first')
@@ -234,7 +239,7 @@ class CombineOp(KernelOp):
             ctx["hidden_buf"],
             weight_buf,
             ctx["combine_sync_buffer"],
-            ctx["combine_workspace"],
+            ctx.get("combine_workspace"),
             plan.dst,
             plan.dup_groups,
             plan.dup_loffs,
@@ -246,22 +251,26 @@ class CombineOp(KernelOp):
             int(ctx["K"]),
             int(ctx["R"]),
             int(ctx["rank"]),
+            server_dedup=server_dedup,
         )
 
 class PrefetchOp(KernelOp):
     """Corresponds to ``moonep.launch_prefetch``.
 
-    compute(ctx, weight_home, weight_slots, experts_to_copy, shmem_instance_id=0):
+    compute(ctx, weight_home, weight_slots, experts_to_copy, shmem_instance_id=0,
+            rank_barriers=True):
       - weight_home [E, H, H'] bf16 (source expert weights, rows on home ranks)
       - weight_slots [B, H, H'] bf16 (this rank's prefetch slots)
       - experts_to_copy [B] int32: global expert id to pull into slot b (-1 empty)
       - shmem_instance_id: shmem runtime instance to operate on (default 0; the
         shmem Python API currently supports a single instance).
+      - rank_barriers: issue the op-level entry/exit barriers (default True);
+        False means the caller provides them.
     Cross-rank: pull home rows via host get (v1) or device RMA.
     """
 
     def compute(self, ctx, weight_home, weight_slots, experts_to_copy,
-                shmem_instance_id: int = 0):
+                shmem_instance_id: int = 0, rank_barriers: bool = True):
         # Inputs: remote_expert = full_weight[:E], weight_slots[E:E+B], experts_to_copy
         # Output: full_weight[E:E+B]
         E = int(ctx["E"]); B = int(ctx["B"])
@@ -284,6 +293,7 @@ class PrefetchOp(KernelOp):
             weight_slots,
             experts_to_copy,
             self.num_sms,
+            rank_barriers=rank_barriers,
         )
 
 

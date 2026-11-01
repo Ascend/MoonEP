@@ -181,6 +181,7 @@ def run_rank(local_rank: int, args) -> None:
             args.R,
             rank,
             False,
+            False,
         )
         torch.npu.synchronize()
         ShmemRuntime.barrier()

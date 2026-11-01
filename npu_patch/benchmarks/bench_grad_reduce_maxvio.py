@@ -36,7 +36,14 @@ import torch_npu
 import torch.distributed as dist
 
 from _bench_common import (
-    add_engine_args,
+    add_common_bench_arg,
+    add_cudagraph_arg,
+    add_ip_port_arg,
+    add_maxvios_arg,
+    add_num_sms_arg,
+    add_out_arg,
+    add_plot_arg,
+    add_shape_args,
     apply_engine,
     setup,
     time_kernel,
@@ -145,7 +152,7 @@ class GradReduceRunner:
     NAME = 'moonep'
 
     def __init__(self, group, R, S, K, E, H, num_sms, local_rank, hp=2048,
-                 use_udma=False):
+                 use_udma=False, vmm_page_size='default'):
         self.group = group
         self.num_sms = num_sms
         self.rank = dist.get_rank(group)
@@ -160,7 +167,8 @@ class GradReduceRunner:
         # We need a minimal Buffer for the plan (experts_to_copy).
         # ShmemRuntime must already be initialized.
         self.buffer = Buffer(S, H, K, E, R, num_sms=num_sms, group=group,
-                             use_udma=use_udma, explicitly_destroy=True)
+                             use_udma=use_udma, explicitly_destroy=True,
+                             vmm_page_size=vmm_page_size)
         self.ctx = self.buffer._require_ctx()
         self.plan, self.cu_seqlens = allocate_planning_outputs(self.ctx)
 
@@ -169,9 +177,11 @@ class GradReduceRunner:
         #   expert_grads: [epn, H, Hp] fp32 — this rank's expert grads
         #   reduce_buffers: [B, H, Hp] fp32 — this rank's reduce buffer
         self.expert_grads_src = alloc_sym_chunk(
-            [self.epn, H, hp], torch.float32, local_rank)
+            [self.epn, H, hp], torch.float32, local_rank,
+            page_size=vmm_page_size)
         self.reduce_buffers_src = alloc_sym_chunk(
-            [self.B, H, hp], torch.float32, local_rank)
+            [self.B, H, hp], torch.float32, local_rank,
+            page_size=vmm_page_size)
 
         self.expert_grads_src.normal_()
         self.reduce_buffers_src.normal_()
@@ -225,34 +235,14 @@ class GradReduceRunner:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    add_engine_args(ap)
-    ap.add_argument('--out', default='bench_grad_reduce_maxvio_results.csv',
-                    help='CSV output path (rank 0). Default: %(default)s')
-    ap.add_argument('--plot', default=None,
-                    help='If set, save the figure to this path (rank 0 only).')
-    ap.add_argument('--maxvios', default='0.2,1,10,20',
-                    help='Comma-separated target MaxVio values; the lognormal '
-                         'sigma is reverse-solved for each (default: %(default)s)')
-    ap.add_argument('--experts', type=int, default=384)
-    ap.add_argument('--hidden', type=int, default=7168)
-    ap.add_argument('--topk', type=int, default=8)
-    ap.add_argument('--hp', type=int, default=2048,
-                    help='Expert weight inner dim H\' (MoE intermediate size) '
-                         'for the MoonEP prefetch op (default: %(default)s)')
-    ap.add_argument('--num-sms', type=int, default=32)
-    ap.add_argument('--warmup', type=int, default=20)
-    ap.add_argument('--iters', type=int, default=50)
-    ap.add_argument('--ip-port', default=None,
-                    help='shmem DEFAULT-bootstrap ip_port URL for the '
-                         'buffer-backed shmem init ("tcp://<rank0_ip>:<port>" '
-                         'or "tcp6://[ipv6]:<port>"). Required for multi-node; '
-                         'when omitted in a multi-node launch it is derived '
-                         'from MASTER_ADDR/MASTER_PORT (port + 1). Single-node '
-                         'launches keep the UID bootstrap and ignore this.')
-    ap.add_argument('--no-cudagraph', dest='cudagraph', action='store_false',
-                    help='Use the eager timing loop instead of CUDA-graph '
-                         'capture (CUDA-graph removes per-launch host overhead).')
-    ap.set_defaults(cudagraph=True)
+    add_common_bench_arg(ap)
+    add_num_sms_arg(ap, default=32)
+    add_out_arg(ap, default='bench_grad_reduce_maxvio_results.csv')
+    add_plot_arg(ap)
+    add_maxvios_arg(ap)
+    add_shape_args(ap, experts=384, hidden=7168, topk=8, hp=2048)
+    add_ip_port_arg(ap)
+    add_cudagraph_arg(ap)
     args = ap.parse_args()
 
     rank, world_size, local_rank = setup()
@@ -273,7 +263,8 @@ def main():
     multi_node = world_size > local_world_size
 
     runner = GradReduceRunner(group, R, S, K, E, H, args.num_sms, local_rank,
-                              hp=args.hp, use_udma=use_udma)
+                              hp=args.hp, use_udma=use_udma,
+                              vmm_page_size=args.vmm_page_size)
     if not ShmemRuntime.is_initialized():
         if args.ip_port is not None or multi_node:
             # Multi-node: ip_port/DEFAULT bootstrap. When ip_port is omitted it

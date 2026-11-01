@@ -68,7 +68,7 @@ def combine_put_workspace_bytes(n: int, h: int, ranks: int, topk: int = 16) -> i
     align = lambda value: (value + 511) & ~511
     batches = (n + 63) // 64
     return (
-        # Final return data plus phase-exclusive Planning / input-ring+result arena.
+# Final return data plus phase-exclusive Planning / input-ring+result arena.
         align(n * h * 2) + ring['phase_bytes']
         # Float weights[N]; N entries each for reverse/reverse_send/final_map/group_of_loff/tx_rows.
         + align(n * 4) + 5 * align(n * 64)
@@ -124,14 +124,18 @@ def _check_combine_inputs(
         raise TypeError("plan must be a MoonEPCommPlan")
 
     use_udma = _env_use_udma("combine")
+    # Server dedup consumes the Buffer's symmetric PUT workspace; the legacy
+    # rank-level kernel keeps its own rank-local gather workspace in the op.
+    server_dedup = plan.dedup_mode == "server"
     required_ctx_keys = [
         "rank", "R", "E", "B", "S", "H", "K", "NvS", "kernels",
     ]
     if use_udma:
         required_ctx_keys.extend((
             "hidden_buf_local", "weights_buf_local", "combine_sync_buffer",
-            "combine_workspace",
         ))
+        if server_dedup:
+            required_ctx_keys.append("combine_workspace")
     else:
         required_ctx_keys.extend(("hidden_buf", "weights_buf"))
     missing = [key for key in required_ctx_keys if key not in ctx]
@@ -234,13 +238,14 @@ def _check_combine_inputs(
         )
 
     if use_udma:
-        _check_tensor(
-            ctx["combine_workspace"],
-            "ctx.combine_workspace",
-            (combine_put_workspace_bytes(NvS, H, plan.R, plan.K),),
-            torch.uint8,
-            output_sh.device,
-        )
+        if server_dedup:
+            _check_tensor(
+                ctx["combine_workspace"],
+                "ctx.combine_workspace",
+                (combine_put_workspace_bytes(NvS, H, plan.R, plan.K),),
+                torch.uint8,
+                output_sh.device,
+            )
         sync_buffer = ctx["combine_sync_buffer"]
         if sync_buffer.dtype != torch.uint8 or not sync_buffer.is_contiguous():
             raise ValueError(

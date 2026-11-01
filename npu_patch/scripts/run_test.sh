@@ -5,6 +5,7 @@
 #   bash npu_patch/scripts/run_test.sh                       # mte/ubmem engine (default)
 #   bash npu_patch/scripts/run_test.sh --use_urma            # urma engine (A5/Ascend950 only)
 #   bash npu_patch/scripts/run_test.sh --soc_type Ascend910_93  # A3
+#   bash npu_patch/scripts/run_test.sh --prod                # op tests use the production 8-card shape
 #   BUILD=1 bash npu_patch/scripts/run_test.sh               # rebuild _C before running tests
 #   NPROC=4 RANK_N=4 bash npu_patch/scripts/run_test.sh      # set card count
 #   MOONEP_GROUP_SIZE=2 bash npu_patch/scripts/run_test.sh    # subgroup size for grouped e2e
@@ -14,6 +15,8 @@
 #   NPROC / RANK_N              ranks per node for torchrun / ranks for script-style tests;
 #                               default is the visible card count parsed from
 #                               ASCEND_RT_VISIBLE_DEVICES, falling back to 8 when unset.
+#   PROD=1                      Same as --prod: pass --prod-shape to the op tests
+#                               (R=8, S=4096, K=16, H=7168, E=896). Requires RANK_N=8.
 #   BUILD=1                     Rebuild the _C extension before tests (required after csrc/kernels changes).
 #   MOONEP_GROUP_SIZE           Cards per subgroup for grouped e2e, default 2; when NPROC is
 #                               below 2x this value the case is auto-skipped (not a failure).
@@ -31,7 +34,14 @@
 #        not use -k** (an empty -k selection makes pytest exit 5 -> false FAIL);
 #        it runs in its own section without -k.
 #   2) urma op tests (test_npu/urma): run only with --use_urma, A5 only.
+#      The dedup domain is covered explicitly: dispatch / joint / combine run with
+#      --dedup-mode rank and (when RANK_N % 8 == 0) server; the server dispatch
+#      case uses the real planner (--plan-source kernel --output-mode both); an
+#      extra small-shape --combine-engine udma case covers the rank-level UDMA
+#      combine kernel. test_e2e_urma.py is parametrized over rank|server.
 #   3) mte ubmem op tests (test_npu/mte): run by default (without --use_urma).
+#   --prod (or PROD=1) adds --prod-shape to every op test (production 8-card
+#   shape: S=4096, K=16, H=7168, E=896); it requires RANK_N=8.
 #
 # Notes:
 #   - shmem bootstrap is auto-selected by kernel_test_utils.init_shmem: single
@@ -62,10 +72,12 @@ cd "$REPO_ROOT"
 # Args / environment
 # ---------------------------------------------------------------------------
 USE_URMA=0
+PROD="${PROD:-0}"
 SOC_TYPE="${SOC_TYPE:-Ascend950}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --use_urma) USE_URMA=1; shift ;;
+        --prod) PROD=1; shift ;;
         --soc_type|-soc_type)
             if [[ $# -lt 2 ]]; then
                 echo "[ERROR] --soc_type requires a value, for example: --soc_type Ascend950"
@@ -74,7 +86,7 @@ while [[ $# -gt 0 ]]; do
             SOC_TYPE="$2"; shift 2 ;;
         *)
             echo "[ERROR] Unknown argument: $1"
-            echo "Usage: bash npu_patch/scripts/run_test.sh [--use_urma] [--soc_type {Ascend910B|Ascend910_93|Ascend950}]"
+            echo "Usage: bash npu_patch/scripts/run_test.sh [--use_urma] [--prod] [--soc_type {Ascend910B|Ascend910_93|Ascend950}]"
             exit 1 ;;
     esac
 done
@@ -124,6 +136,17 @@ RANK_N="${RANK_N:-$NPROC}"
 FAILED=0
 PASSED=0
 
+# Production 8-card shape for the op tests (S=4096, K=16, H=7168, E=896).
+# The mte planning test hard-requires --ep-size 8, so --prod is 8-card only.
+PROD_FLAG=()
+if [ "$PROD" = 1 ]; then
+    if [ "$RANK_N" -ne 8 ]; then
+        echo "[ERROR] --prod requires RANK_N=8 (production 8-card shape); got RANK_N=$RANK_N"
+        exit 1
+    fi
+    PROD_FLAG=(--prod-shape)
+fi
+
 # Engine selection: --use_urma -> urma, otherwise mte ubmem.
 ENGINE_KW="mte"
 [ "$USE_URMA" = 1 ] && ENGINE_KW="urma"
@@ -148,6 +171,7 @@ echo "  SOC_TYPE   = $SOC_TYPE"
 echo "  ENGINE     = $ENGINE_KW"
 echo "  NPROC      = $NPROC (torchrun)"
 echo "  RANK_N     = $RANK_N (script-style mp.spawn)"
+echo "  PROD_SHAPE = $PROD (op tests ${PROD_FLAG[*]:-use their default shapes})"
 echo "  ASCEND_RT_VISIBLE_DEVICES = ${ASCEND_RT_VISIBLE_DEVICES:-(unset, use all visible cards)}"
 
 # pytest files that need NPROC cards
@@ -191,6 +215,16 @@ run_cmd "test_buffer_c_api" \
 run_cmd "test_buffer_cpython_api" \
     torchrun --nproc_per_node="$NPROC" --master_port=29507 "$BUFFER_SCRIPT_CPYTHON"
 
+# Host-only check: per-allocation VMM page-size policy + mixed-granularity
+# descriptor ordering. No collective/device allocation, so run it once.
+run_cmd "test_buffer_vmm_page_size" \
+    python -m pytest -s test_npu/buffer_test/test_buffer_vmm_page_size.py
+
+# Host-only check: server-dedup env flags (ASCEND_MOONEP_DEDUP_MODE /
+# ASCEND_MOONEP_SERVER_DEDUP) and the qp_count=2 clamp for that domain.
+run_cmd "test_dedup_env_qp" \
+    python -m pytest -s test_npu/buffer_test/test_dedup_env_qp.py
+
 # ---------------------------------------------------------------------------
 # 3. Op tests: --use_urma runs urma; otherwise mte ubmem
 # ---------------------------------------------------------------------------
@@ -204,13 +238,43 @@ if [ "$USE_URMA" = 1 ]; then
     # uid -> init_with_buffer). CLI differences: combine_udma has no --ep-size;
     # dispatch_udma has no --B; dispatch_combine_udma_joint has no --mode/--B.
     # R is RANK_N for all.
-    run_cmd "test_moonep_combine_udma_with_plan (kernel)" \
-        python test_npu/urma/test_moonep_combine_udma_with_plan.py --mode kernel --R "$RANK_N" --S 8192 --K 8 --H 7168 --E 384 --plan-mode cyclic
-    run_cmd "test_moonep_dispatch_udma_with_plan (kernel)" \
-        python test_npu/urma/test_moonep_dispatch_udma_with_plan.py --mode kernel --R "$RANK_N" --S 8192 --K 8 --H 7168 --E 384 --plan-mode cyclic
-    run_cmd "test_dispatch_combine_udma_joint" \
-        python test_npu/urma/test_dispatch_combine_udma_joint.py --R "$RANK_N" --S 8192 --K 8 --H 7168 --E 384 --plan-mode cyclic
-    run_cmd "pytest test_npu/urma/test_e2e_urma.py (NPROC=$NPROC)" \
+    #
+    # Both dedup domains run every op test. "rank" is the Buffer default; the
+    # "server" domain groups 8 consecutive ranks, needs UDMA dispatch+combine,
+    # R % 8 == 0 and K >= 2, and uses a different duplicate-table ABI
+    # (8*NvS full addresses, R+2 counts with per-source prefixes), so a green
+    # rank run says nothing about it.
+    #
+    # The rank combine case defaults to the legacy MTE kernel (--combine-engine
+    # auto); the extra small-shape case below covers the frozen rank-level UDMA
+    # combine kernel (CombineUrma.compute_legacy) with rank tables. The server
+    # dispatch case runs the real planner (--plan-source kernel) and validates
+    # both the zero-copy and the copied outputs (--output-mode both).
+    run_cmd "test_moonep_combine_udma_with_plan (kernel, dedup=rank)" \
+        python test_npu/urma/test_moonep_combine_udma_with_plan.py --mode kernel --dedup-mode rank --R "$RANK_N" --S 8192 --K 8 --H 7168 --E 384 --plan-mode cyclic \
+        ${PROD_FLAG[@]+"${PROD_FLAG[@]}"}
+    run_cmd "test_moonep_combine_udma_with_plan (kernel, dedup=rank, combine=udma)" \
+        python test_npu/urma/test_moonep_combine_udma_with_plan.py --mode kernel --combine-engine udma --dedup-mode rank --R "$RANK_N" --S 256 --K 8 --H 1024 --E 384 --plan-mode cyclic
+    run_cmd "test_moonep_dispatch_udma_with_plan (kernel, dedup=rank)" \
+        python test_npu/urma/test_moonep_dispatch_udma_with_plan.py --mode kernel --dedup-mode rank --R "$RANK_N" --S 8192 --K 8 --H 7168 --E 384 --plan-mode cyclic \
+        ${PROD_FLAG[@]+"${PROD_FLAG[@]}"}
+    run_cmd "test_dispatch_combine_udma_joint (dedup=rank)" \
+        python test_npu/urma/test_dispatch_combine_udma_joint.py --dedup-mode rank --R "$RANK_N" --S 8192 --K 8 --H 7168 --E 384 --plan-mode cyclic \
+        ${PROD_FLAG[@]+"${PROD_FLAG[@]}"}
+    if [ $(( RANK_N % 8 )) -eq 0 ]; then
+        run_cmd "test_moonep_combine_udma_with_plan (kernel, dedup=server)" \
+            python test_npu/urma/test_moonep_combine_udma_with_plan.py --mode kernel --dedup-mode server --R "$RANK_N" --S 8192 --K 8 --H 7168 --E 384 --plan-mode cyclic \
+            ${PROD_FLAG[@]+"${PROD_FLAG[@]}"}
+        run_cmd "test_moonep_dispatch_udma_with_plan (kernel+planner, dedup=server, K=16)" \
+            python test_npu/urma/test_moonep_dispatch_udma_with_plan.py --mode kernel --plan-source kernel --dedup-mode server --R "$RANK_N" --S 8192 --K 16 --H 7168 --E 384 --plan-mode cyclic --output-mode both \
+            ${PROD_FLAG[@]+"${PROD_FLAG[@]}"}
+        run_cmd "test_dispatch_combine_udma_joint (dedup=server)" \
+            python test_npu/urma/test_dispatch_combine_udma_joint.py --dedup-mode server --R "$RANK_N" --S 8192 --K 8 --H 7168 --E 384 --plan-mode cyclic \
+            ${PROD_FLAG[@]+"${PROD_FLAG[@]}"}
+    else
+        log "skip server-dedup op tests: RANK_N=$RANK_N is not a multiple of 8"
+    fi
+    run_cmd "pytest test_npu/urma/test_e2e_urma.py (NPROC=$NPROC, dedup=rank|server)" \
         torchrun --nproc-per-node="$NPROC" -m pytest -s test_npu/urma/test_e2e_urma.py
 else
     run_cmd "pytest test_npu/mte/test_grad_reduce.py (NPROC=$NPROC)" \
@@ -219,13 +283,17 @@ else
         torchrun --nproc-per-node="$NPROC" -m pytest -s "$PYTEST_MTE_PREFETCH"
 
     run_cmd "test_planning" \
-        python test_npu/mte/test_planning.py --ep-size "$RANK_N"
+        python test_npu/mte/test_planning.py --ep-size "$RANK_N" \
+        ${PROD_FLAG[@]+"${PROD_FLAG[@]}"}
     run_cmd "test_moonep_combine" \
-        python test_npu/mte/test_moonep_combine.py --ep-size "$RANK_N"
+        python test_npu/mte/test_moonep_combine.py --ep-size "$RANK_N" \
+        ${PROD_FLAG[@]+"${PROD_FLAG[@]}"}
     run_cmd "test_moonep_dispatch_with_plan (kernel)" \
-        python test_npu/mte/test_moonep_dispatch_with_plan.py --mode kernel --R "$RANK_N" --S 64 --K 8 --H 128 --max-checks 8
+        python test_npu/mte/test_moonep_dispatch_with_plan.py --mode kernel --R "$RANK_N" --S 64 --K 8 --H 128 --max-checks 8 \
+        ${PROD_FLAG[@]+"${PROD_FLAG[@]}"}
     run_cmd "test_dispatch_combine_joint" \
-        python test_npu/mte/test_dispatch_combine_joint.py --R "$RANK_N" --S 16 --K 4 --H 128
+        python test_npu/mte/test_dispatch_combine_joint.py --R "$RANK_N" --S 16 --K 4 --H 128 \
+        ${PROD_FLAG[@]+"${PROD_FLAG[@]}"}
     run_cmd "pytest test_npu/mte/test_e2e.py (NPROC=$NPROC)" \
         torchrun --nproc-per-node="$NPROC" -m pytest -s test_npu/mte/test_e2e.py
 fi
@@ -251,5 +319,5 @@ if [ "$USE_URMA" = 0 ]; then
 fi
 
 log "Summary"
-echo "PASSED=$PASSED FAILED=$FAILED ENGINE=$ENGINE_KW SOC_TYPE=$SOC_TYPE NPROC=$NPROC"
+echo "PASSED=$PASSED FAILED=$FAILED ENGINE=$ENGINE_KW SOC_TYPE=$SOC_TYPE NPROC=$NPROC PROD=$PROD"
 [ "$FAILED" -eq 0 ]

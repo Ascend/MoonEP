@@ -29,12 +29,18 @@ from ._common import (
 from .buffer_c import (
     _OWNER_SOURCE_VA_ATTR,
     _SLOT_SOURCE_VA_ATTR,
+    VMM_PAGE_SIZE_1G,
+    VMM_PAGE_SIZE_2M,
+    VMM_PAGE_SIZE_DEFAULT,
+    VMM_SCOPE_MOONEP,
     create_sym_tensor_from_source,
     create_vmm_physical,
     create_vmm_arena,
+    normalize_vmm_page_size,
+    resolve_vmm_page_size,
     translate_tensor,
 )
-from .planning import MoonEPCommPlan, allocate_planning_outputs
+from .planning import RANKS_PER_SERVER, MoonEPCommPlan, allocate_planning_outputs
 from .ops import (
     CombineOp,
     DispatchOp,
@@ -44,7 +50,7 @@ from .ops import (
 )
 from .launchers import planning_workspace_sizes
 from .combine import combine_put_workspace_bytes
-from .shmem_runtime import ShmemRuntime
+from .shmem_runtime import ShmemRuntime, publish_dedup_env
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +92,108 @@ def _num_sms_dedup_from_env(max_sms: int) -> int:
     return value
 
 
+def _validate_dedup_config(
+    dedup_mode: str,
+    ranks_per_server: int,
+    R: int,
+    udma_supported: bool,
+) -> None:
+    """Validate the Buffer-level dedup domain.
+
+    The dedup domain is fixed once, at Buffer construction. Rank-level dedup is
+    the default and reproduces the local code path; server-level dedup groups
+    ``ranks_per_server`` consecutive ranks (8, the compiled kernel ABI) into one
+    board. Per-op UDMA requirements are intentionally *not* checked here: a
+    server plan can be used by Combine-only workloads (``use_udma=False`` with
+    ``combine_use_udma=True``), and dispatch/combine validate their own engine
+    at the call site.
+    """
+    if dedup_mode not in ("rank", "server"):
+        raise ValueError(
+            f"dedup_mode must be 'rank' or 'server', got {dedup_mode!r}")
+    if isinstance(ranks_per_server, bool) or not isinstance(ranks_per_server, int):
+        raise TypeError(
+            "ranks_per_server must be an int, got "
+            f"{type(ranks_per_server).__name__}")
+    if ranks_per_server <= 0:
+        raise ValueError(
+            f"ranks_per_server must be positive, got {ranks_per_server}")
+    if dedup_mode != "server":
+        return
+    if ranks_per_server != RANKS_PER_SERVER:
+        raise NotImplementedError(
+            "server dedup kernels are compiled for "
+            f"{RANKS_PER_SERVER} ranks/server; got ranks_per_server="
+            f"{ranks_per_server}. Changing this requires the kernel ABI to "
+            "carry the server size (tiling), which is out of scope here.")
+    if R <= 0 or R % ranks_per_server != 0:
+        raise ValueError(
+            f"server dedup requires num_ep_ranks divisible by "
+            f"{ranks_per_server}, got {R}")
+    if not udma_supported:
+        raise RuntimeError(
+            "server dedup requires the UDMA (Ascend 950) backend; this device "
+            "does not support it")
+
+
+def buffer_vmm_page_size(dedup_mode: str,
+                         vmm_page_size: str | None = None) -> str:
+    """Resolve the huge-page policy of a Buffer's MoonEP VMM chunks.
+
+    MoonEP's dispatch/combine chunks are priced separately from the training
+    framework's parameters (``buffer_c.VMM_SCOPE_FRAMEWORK``), so this policy
+    only governs the Buffer. Precedence:
+
+      1. an explicit ``Buffer(vmm_page_size=...)`` (``"1g"`` / ``"2m"``);
+      2. the process default, ``ASCEND_MOONEP_VMM_PAGE_SIZE``;
+      3. the dedup-domain default: ``"1g"`` under the server-level dedup domain
+         -- its multi-GiB symmetric PUT combine workspace and its large payload
+         chunks are exactly the case huge pages help -- and ``"2m"`` for
+         rank-level dedup.
+
+    The server-level default is only a default: pass ``vmm_page_size="2m"`` or
+    export ``ASCEND_MOONEP_VMM_PAGE_SIZE=2m`` to keep 2 MiB pages. That matters
+    because ACL rounds *every* Buffer allocation up to the page granularity, so
+    under ``"1g"`` the small comm arena costs a full GiB as well (see
+    ``_warn_server_dedup_page_size``, which reports the resulting footprint).
+    """
+    if dedup_mode not in ("rank", "server"):
+        raise ValueError(
+            f"dedup_mode must be 'rank' or 'server', got {dedup_mode!r}")
+    default = (VMM_PAGE_SIZE_1G if dedup_mode == "server"
+               else VMM_PAGE_SIZE_2M)
+    return resolve_vmm_page_size(
+        vmm_page_size, scope=VMM_SCOPE_MOONEP, default=default)
+
+
+def _warn_server_dedup_page_size(ctx: dict, requested_page_size: str) -> None:
+    """Tell the user that server-level dedup turned on 1 GiB VMM pages.
+
+    Emitted only when the policy came from the dedup-domain default: an
+    explicit ``vmm_page_size`` or an exported ``ASCEND_MOONEP_VMM_PAGE_SIZE``
+    is the caller's own choice. The message prices the decision with this
+    Buffer's total VMM footprint (every allocation rounded up to its page
+    granularity) so the trade-off is visible in the log.
+    """
+    if ctx['dedup_mode'] != "server":
+        return
+    if ctx['vmm_page_size'] != VMM_PAGE_SIZE_1G:
+        return
+    if requested_page_size != VMM_PAGE_SIZE_DEFAULT:
+        return
+    footprint = int(ctx['shmem_footprint_bytes'])
+    warnings.warn(
+        "server-level dedup enables 1 GiB VMM huge pages for the MoonEP "
+        "dispatch/combine chunks by default (page_size='1g'): large-block "
+        "bandwidth improves, but ACL rounds every Buffer allocation up to "
+        "1 GiB, so this Buffer now occupies "
+        f"{footprint / (1 << 30):.2f} GiB ({footprint} bytes) of device HBM in "
+        "total. Pass vmm_page_size='2m' to Buffer (or export "
+        "ASCEND_MOONEP_VMM_PAGE_SIZE=2m) to disable it.",
+        stacklevel=3,
+    )
+
+
 def _log_context_buffer_size(ctx: dict) -> None:
     def tensor_nbytes(tensor: torch.Tensor) -> int:
         return int(tensor.numel()) * int(tensor.element_size())
@@ -119,6 +227,11 @@ def _log_context_buffer_size(ctx: dict) -> None:
         "  config                 : "
         f"R={ctx['R']}, S={ctx['S']}, H={ctx['H']}, E={ctx['E']}, "
         f"K={ctx['K']}, NvS={ctx['NvS']}",
+        "  dedup                  : "
+        f"mode={ctx['dedup_mode']}, ranks_per_server={ctx['ranks_per_server']}",
+        "  vmm_page_size          : "
+        f"{ctx['vmm_page_size']} (moonep scope; framework parameters "
+        f"follow ASCEND_MOONEP_FRAMEWORK_VMM_PAGE_SIZE)",
         "  sm_count               : "
         f"num_sms={ctx['num_sms']}, num_sms_dedup={ctx['num_sms_dedup']}",
         f"  hidden_chunk           : {format_nbytes(hidden_chunk_bytes)}",
@@ -127,6 +240,8 @@ def _log_context_buffer_size(ctx: dict) -> None:
         f"  op_symmetric_workspace : {format_nbytes(op_workspace_bytes)}",
         f"  combine_udma_workspace : "
         f"{format_nbytes(combine_udma_local_workspace_bytes)}",
+        f"  vmm_footprint          : "
+        f"{format_nbytes(int(ctx['shmem_footprint_bytes']))}",
         f"  total_shmem+local      : "
         f"{format_nbytes(hidden_chunk_bytes + meta_vars_bytes + local_temp_bytes + op_workspace_bytes + combine_udma_local_workspace_bytes)}",
     ]
@@ -146,6 +261,9 @@ def _create_context(
     rank: int | None = None,
     use_udma: bool = True,
     udma_flags: dict | None = None,
+    dedup_mode: str = "rank",
+    ranks_per_server: int = RANKS_PER_SERVER,
+    vmm_page_size: str | None = None,
 ) -> dict:
     """Pre-allocate all shmem symmetric chunks and local temp buffers.
 
@@ -155,6 +273,18 @@ def _create_context(
     workspace whose aligned subregions are derived by the C++ launcher.
     There is no cross-rank contiguous VA: remote chunk access goes through the
     peer symmetric address (host put/get, or device aclshmem_ptr in kernels).
+
+    ``dedup_mode`` / ``ranks_per_server`` are the Buffer's dedup domain and are
+    fixed here for the Buffer's whole lifetime (see ``_validate_dedup_config``).
+    The domain is also published as ``ASCEND_MOONEP_DEDUP_MODE`` /
+    ``ASCEND_MOONEP_SERVER_DEDUP`` so the later shmem bootstrap (which holds no
+    Buffer) enforces the domain's QP requirements; see ``publish_dedup_env``.
+
+    ``vmm_page_size`` is the requested huge-page policy of this Buffer's VMM
+    chunks (``None`` / ``"default"`` = resolve the default). The concrete
+    policy is resolved by ``buffer_vmm_page_size``: explicit request >
+    ``ASCEND_MOONEP_VMM_PAGE_SIZE`` > the dedup-domain default (1g for server,
+    2m for rank). It is recorded in ``ctx['vmm_page_size']``.
     """
     if num_sms is None:
         num_sms = 32
@@ -180,6 +310,11 @@ def _create_context(
     max_sms = getattr(props, "multi_processor_count", 32)
     num_sms_dedup = _num_sms_dedup_from_env(max_sms)
     udma_supported = _is_ascend950(device, props)
+    _validate_dedup_config(dedup_mode, ranks_per_server, R, udma_supported)
+    # The shmem bootstrap runs after every Buffer exists and has no Buffer
+    # handle: publish the domain (mode + flag) so it can enforce the server
+    # domain's qp_count=2 requirement.
+    publish_dedup_env(dedup_mode)
 
     epn = E // R
     assert E % R == 0, f"E ({E}) must be divisible by R ({R})"
@@ -222,13 +357,25 @@ def _create_context(
     effective_udma = {name: bool(udma_supported and ctx_udma_flags[name] and requested_udma[name])
                       for name in ctx_udma_flags}
 
-    hidden_buf, _, _ = create_vmm_physical([NvS, H], torch.bfloat16, device)
+    # The arena follows the same page policy as the payload chunks. The
+    # concrete policy is resolved once (explicit request > moonep-scope env >
+    # dedup-domain default) so every chunk of this Buffer, the arena included,
+    # agrees on it.
+    requested_page_size = normalize_vmm_page_size(vmm_page_size)
+    effective_page_size = buffer_vmm_page_size(dedup_mode, requested_page_size)
+
+    hidden_buf, _, _ = create_vmm_physical([NvS, H], torch.bfloat16, device,
+                                           page_size=effective_page_size)
     vmm_chunks = {'hidden_buf': hidden_buf._vmm_allocation}
 
-    # PUT workspace must be symmetric; MTE does not need these large arenas.
-    if effective_udma['combine']:
+    # PUT workspace must be symmetric; MTE and the legacy rank-level UDMA
+    # combine do not need this large arena. Only the server-level dedup kernel
+    # stages gathered payloads there, so rank mode skips a multi-GiB allocation.
+    server_dedup = dedup_mode == "server"
+    if effective_udma['combine'] and server_dedup:
         combine_workspace, _, _ = create_vmm_physical(
-            [combine_put_workspace_bytes(NvS, H, R, K)], torch.uint8, device)
+            [combine_put_workspace_bytes(NvS, H, R, K)], torch.uint8, device,
+            page_size=effective_page_size)
         vmm_chunks['combine_workspace'] = combine_workspace._vmm_allocation
     else:
         combine_workspace = torch.empty(0, dtype=torch.uint8, device=dev)
@@ -236,6 +383,8 @@ def _create_context(
     # Small communication buffers share one physical VMM allocation. Each
     # region has its own 512-byte-aligned, padded range; protocol flags never
     # overlap. Payload buffers retain their independent allocations/page policy.
+    # The arena follows the same page policy as the payload; under a 1g policy
+    # ACL rounds the whole arena up to one 1 GiB symmetric-heap chunk.
     comm_views = create_vmm_arena([
         ('weights_buf', [NvS], torch.int32),
         ('barrier_buf', [BARRIER_SLOTS], torch.int32),
@@ -243,7 +392,7 @@ def _create_context(
          [R * _COMBINE_SYNC_BYTES_PER_RANK + _COMBINE_LOCAL_AIV_SYNC_BYTES], torch.uint8),
         ('dispatch_sync_buffer', [dispatch_sync_buffer_nbytes(R)], torch.uint8),
         ('planning_symmetric_workspace', [planning_symmetric_bytes], torch.uint8),
-    ], device)
+    ], device, page_size=effective_page_size)
     weights_buf = comm_views['weights_buf']
     barrier_buf = comm_views['barrier_buf']
     combine_sync_buffer = comm_views['combine_sync_buffer']
@@ -267,6 +416,8 @@ def _create_context(
     # Kernel ops (ascend_deepep-style: created at Buffer init)
     # ================================================================
     kernels = {
+        # Planning borrows a view of the shared comm arena instead of owning a
+        # separate op workspace; the op itself allocates nothing.
         'planning': PlanningOp(ws_bytes=planning_symmetric_bytes, num_sms=num_sms,
                                ws_tensor=comm_views['planning_symmetric_workspace']),
         # These ops use the context's communication tensors, never a generic
@@ -291,6 +442,12 @@ def _create_context(
         'N': N, 'NvS': NvS,
         'num_sms': num_sms,
         'num_sms_dedup': num_sms_dedup,
+        # Dedup domain: fixed for this Buffer's lifetime, never a per-op arg.
+        'dedup_mode': dedup_mode,
+        'ranks_per_server': ranks_per_server,
+        # Resolved huge-page policy of this Buffer's MoonEP chunks (not the
+        # training framework's parameters, which have their own scope).
+        'vmm_page_size': effective_page_size,
         'device': device,
         '_udma_supported': udma_supported,
         '_udma_ctx_flags': ctx_udma_flags,
@@ -314,7 +471,7 @@ def _create_context(
             barrier_buf,
             combine_sync_buffer,
             dispatch_sync_buffer,
-        ] + ([combine_workspace] if effective_udma['combine'] else []),
+        ] + ([combine_workspace] if effective_udma['combine'] and server_dedup else []),
         # CANN VMM allocations (source_va + mem_handle + shareable_va):
         # collected by the framework for buffer-backed shmem init
         # (ShmemRuntime.init_with_buffer); Buffer.destroy reverses the VMM ops.
@@ -328,15 +485,17 @@ def _create_context(
         'weights_buf_local': weights_buf[:NvS],
         # Kernel ops + barrier state
         'kernels': kernels,
-        '_barrier_round': 0,
         # Buffer-backed: translated by _ensure_shmem_views after
         # init_with_buffer.
         '_shmem_views_ready': False,
         # Sum physical owners once, including the borrowed Planning workspace
-        # in the shared arena. Tensor views and peer mappings do not add HBM.
+        # in the shared arena and the per-allocation page rounding (2 MiB by
+        # default; 1 GiB under the server-dedup default or an explicit request);
+        # tensor views and peer mappings do not add HBM.
         'shmem_footprint_bytes': sum(a.size for a in vmm_allocations),
     }
     _log_context_buffer_size(ctx)
+    _warn_server_dedup_page_size(ctx, requested_page_size)
     return ctx
 
 
@@ -354,6 +513,10 @@ class Buffer:
     symmetric addresses the kernels use via ``_ensure_shmem_views``.
     Call ``destroy()`` before tearing down the process group; shmem runtime
     finalize is owned by the framework/caller (Buffer never finalizes itself).
+
+    The dedup domain is fixed at construction via ``dedup_mode`` /
+    ``ranks_per_server`` (default ``"rank"``, i.e. the local rank-level code
+    path). No Buffer method takes a dedup argument afterwards.
     """
 
     def __init__(
@@ -371,6 +534,10 @@ class Buffer:
         enable_pdl: bool = True,
         explicitly_destroy: bool = False,
         rank: int | None = None,
+        *,
+        dedup_mode: str = "rank",
+        ranks_per_server: int = RANKS_PER_SERVER,
+        vmm_page_size: str | None = None,
         **kwargs,
     ):
         """Allocate and hold all communication buffers.
@@ -381,6 +548,30 @@ class Buffer:
         dependent launch has no equivalent) and kept only for API compatibility.
         ``rank`` may be supplied by bootstrap paths that do not create a
         torch.distributed process group.
+
+        Ascend-only dedup domain, fixed here and never passed per op:
+
+        - ``dedup_mode="rank"`` (default) reproduces the local rank-level dedup
+          path; ``"server"`` enables the eight-rank server protocol and
+          requires the UDMA backend.
+        - ``ranks_per_server`` is the number of cards in one server (default
+          and currently the only compiled value: 8).
+
+        ``vmm_page_size`` selects the huge-page policy of this Buffer's VMM
+        allocations — payload chunks (hidden_buf, server combine_workspace)
+        and the small sync arena alike: ``"1g"``/``"2m"`` override the
+        default; ``None``/``"default"`` resolve it as
+        ``ASCEND_MOONEP_VMM_PAGE_SIZE`` else the dedup-domain default (1g for
+        ``dedup_mode="server"``, 2m for ``"rank"``; see
+        ``buffer_vmm_page_size``). Under a 1g policy the KiB..MiB arena rounds
+        up to one 1 GiB symmetric-heap chunk, so a server-dedup Buffer warns
+        about its total HBM footprint — pass ``vmm_page_size="2m"`` to disable
+        it. The training framework's own parameters are priced separately via
+        ``ASCEND_MOONEP_FRAMEWORK_VMM_PAGE_SIZE`` (or the
+        ``moonep.buffer.create_full_*`` builders' ``vmm_page_size``).
+
+        Every other Buffer method takes the same arguments as its
+        ``moonep.api.Buffer`` counterpart.
         """
         # Buffer-backed only: at construction shmem is uninitialized; the comm
         # chunks are CANN VMM allocations registered in the global descriptor
@@ -403,6 +594,7 @@ class Buffer:
                     break
         if kwargs:
             raise TypeError(f'unexpected Buffer kwargs: {sorted(kwargs)}')
+        vmm_page_size = normalize_vmm_page_size(vmm_page_size)
         self._shmem_ready = False
         assert isinstance(comm_stream_priority, int), (
             f"comm_stream_priority must be an int, got "
@@ -416,6 +608,9 @@ class Buffer:
         self.enable_pdl = enable_pdl
         self._comm_stream: torch_npu.npu.Stream | None = None
         self._destroyed = False
+        # Set before _create_context so a construction-time validation failure
+        # (e.g. an invalid dedup domain) leaves a destructor-safe object.
+        self._ctx = None
         self._ctx = _create_context(
             S, H, K, E, num_ep_ranks,
             num_sms=num_sms,
@@ -425,6 +620,9 @@ class Buffer:
             rank=rank,
             use_udma=use_udma,
             udma_flags=udma_flags,
+            dedup_mode=dedup_mode,
+            ranks_per_server=ranks_per_server,
+            vmm_page_size=vmm_page_size,
         )
         # Buffer-backed: set True by _ensure_shmem_views after init_with_buffer.
         self._shmem_ready = False
@@ -436,6 +634,29 @@ class Buffer:
     @property
     def destroyed(self) -> bool:
         return self._destroyed
+
+    @property
+    def dedup_mode(self) -> str:
+        """Dedup domain of this Buffer (``"rank"`` or ``"server"``).
+
+        Fixed at construction; no Buffer method takes a dedup argument.
+        """
+        return self._require_ctx()['dedup_mode']
+
+    @property
+    def ranks_per_server(self) -> int:
+        """Number of cards in one server for server-level dedup (8)."""
+        return int(self._require_ctx()['ranks_per_server'])
+
+    @property
+    def vmm_page_size(self) -> str:
+        """Resolved huge-page policy of this Buffer's VMM chunks (``"1g"``/``"2m"``).
+
+        Fixed at construction from ``vmm_page_size`` / the process default /
+        the dedup-domain default; the training framework's parameters are a
+        separate scope (``ASCEND_MOONEP_FRAMEWORK_VMM_PAGE_SIZE``).
+        """
+        return str(self._require_ctx()['vmm_page_size'])
 
     @property
     def symmetric_footprint(self) -> int:
@@ -642,7 +863,6 @@ class Buffer:
         zero_copy: bool,
         router_weights_zero_copy: bool = False,
     ) -> None:
-        stream = torch_npu.npu.current_stream().npu_stream
         if not zero_copy:
             # master-style boundary copy of the hidden shard (same stream).
             ctx['hidden_buf_local'].copy_(hidden_nvsh)
@@ -654,6 +874,14 @@ class Buffer:
         # peer shards.  Keeping this boundary common lets CombineOp own the
         # implementation selection without duplicating Buffer call paths.
         if inter_rank_sync:
+            # Read the raw stream *after* the copies: fetching it flushes
+            # torch_npu's CPU task queue, which is what pushes the shard/weight
+            # copies onto the ACL stream. The SHMEM barrier is submitted
+            # directly to that stream and only waits for work already on it, so
+            # reading the stream before the copies (the previous order) let a
+            # fast rank pass the barrier while its inputs were still queued and
+            # peers then gathered stale shards (upstream PR #14).
+            stream = torch_npu.npu.current_stream().npu_stream
             cross_rank_barrier(ctx, stream)
         # Prologue is folded into moonEP_combine (cf. dispatch_epilogue).
         ctx['kernels']['combine'].compute(
@@ -669,6 +897,7 @@ class Buffer:
         ctx: dict,
         experts_to_copy: torch.Tensor,
         weight_prefetch_args,
+        rank_barriers: bool = True,
     ) -> None:
         """Prefetch expert weights into the local prefetch slots.
 
@@ -726,6 +955,7 @@ class Buffer:
                 weight_slots,
                 local_experts,
                 shmem_instance_id=0,
+                rank_barriers=rank_barriers,
             )
 
     def _run_reduce_grad_on_current_stream(
@@ -800,8 +1030,8 @@ class Buffer:
             )
 
     # ------------------------------------------------------------------
-    # Public API (identical signatures to moonep.api.Buffer)
-    # Ascend extension exposes an optional dedup_mode argument; the default remains rank.
+    # Public API (identical signatures to moonep.api.Buffer). The dedup domain
+    # is a Buffer construction property, not a per-call argument.
     # ------------------------------------------------------------------
     def dispatch(
         self,
@@ -815,25 +1045,28 @@ class Buffer:
         inter_rank_sync: bool = True,
         zero_copy: bool = False,
         router_weights_zero_copy: bool = False,
-        dedup_mode: str = "rank",
     ):
         """dispatch fwd: run planning (unless reusing a plan) and scatter tokens
         to their expert-grouped positions on remote ranks.
 
-        Same contract as ``moonep.api.Buffer.dispatch``; ``zero_copy`` returns a
-        hidden view of the local symmetric shard (which remote ranks have written
-        into via the peer address), and ``router_weights_zero_copy`` independently
-        returns the ``route_weights_nvs`` fp32 view of ``weights_buf_local``
-        instead of a fresh copy (default False, matching the CUDA API).
-        ``dedup_mode`` selects rank/server planning when ``plan`` is absent.
+        Same contract and arguments as ``moonep.api.Buffer.dispatch``;
+        ``zero_copy`` returns a hidden view of the local symmetric shard (which
+        remote ranks have written into via the peer address), and
+        ``router_weights_zero_copy`` independently returns the
+        ``route_weights_nvs`` fp32 view of ``weights_buf_local`` instead of a
+        fresh copy (default False, matching the CUDA API). A fresh plan uses the
+        Buffer's ``dedup_mode`` (set at construction).
         """
         ctx = self._require_ctx()
         self._ensure_shmem_views()
 
-        # server plans must go through the already-adapted UDMA Dispatch so failure happens up front, not at send time
-        # after Planning ran.
-        if plan is None and dedup_mode == "server" and not ctx['_dispatch_use_udma']:
-            raise ValueError("server dedup requires UDMA dispatch")
+        # A freshly planned server dispatch must go through the already-adapted
+        # UDMA operator, so fail before Planning runs rather than at send time.
+        if (plan is None and ctx['dedup_mode'] == "server"
+                and not ctx['_dispatch_use_udma']):
+            raise ValueError(
+                "server dedup requires UDMA dispatch: construct the Buffer "
+                "with use_udma=True (or dispatch_use_udma=True)")
 
         if plan is None:
             assert topk_experts_sk is not None and tokens_per_expert is not None
@@ -841,12 +1074,17 @@ class Buffer:
             assert topk_flat.dtype == torch.int32 and topk_flat.numel() == int(ctx['N'])
             assert tokens_per_expert.dtype == torch.int32
             assert tokens_per_expert.numel() == int(ctx['E']) and tokens_per_expert.is_contiguous()
-            plan, cu_seqlens = allocate_planning_outputs(ctx, dedup_mode=dedup_mode)
+            plan, cu_seqlens = allocate_planning_outputs(ctx)
             planning_args = (topk_flat, tokens_per_expert, cu_seqlens)
         else:
             cu_seqlens = None
             planning_args = None
             assert isinstance(plan, MoonEPCommPlan)
+            if plan.dedup_mode != ctx['dedup_mode']:
+                raise ValueError(
+                    f"plan uses {plan.dedup_mode} dedup, but this Buffer was "
+                    f"constructed with dedup_mode={ctx['dedup_mode']!r}; "
+                    "dedup mode is fixed at Buffer construction")
 
         if zero_copy:
             hidden_nvsh = ctx['hidden_buf_local']
@@ -875,17 +1113,17 @@ class Buffer:
             )
             return hidden_nvsh, route_weights_nvs, cu_seqlens, plan
 
-        # True async: launch the kernels on a dedicated comm_stream and return
-        # its event without blocking the host. Cross-rank sync runs on
-        # comm_stream via cross_rank_barrier's on-stream primitive
-        # (acl_shmem_barrier_all_on_stream); no torch.npu.synchronize +
-        # dist.barrier needed. Back-to-back async ops use _barrier_round
-        # generations to avoid deadlocking on the shared sync_counter.
+        # True async: launch on comm_stream and return its event. Cross-rank
+        # sync uses the on-stream barrier; with no generation argument, keep
+        # all of this Buffer's barriers on one stream in issue order.
         tensors = (
             hidden_sh, route_weights_sk, hidden_nvsh, route_weights_nvs,
             plan.dst, plan.experts_to_copy, plan.zero_fill_ranges,
             plan.remote_stats, plan.dup_groups, plan.dup_loffs,
             plan.dup_counts,
+            # plan tensors are used on comm_stream; keep them alive until it
+            # drains.
+            *(planning_args or ()),
         )
         # First make comm_stream wait for sync work already queued on the
         # current stream (e.g. a preceding dispatch) to drain, then launch
@@ -920,9 +1158,12 @@ class Buffer:
         full_gate_weight: torch.Tensor | None = None,
         full_up_weight: torch.Tensor | None = None,
         full_down_weight: torch.Tensor | None = None,
+        rank_barriers: bool = True,
     ):
         """Prefetch the remote expert weights selected by ``plan`` into the
-        local prefetch slots (dispatch fwd, weight side)."""
+        local prefetch slots (dispatch fwd, weight side).
+
+        Three-projection wrapper around ``prefetch_projections``."""
         weight_prefetch_args = (full_gate_weight, full_up_weight, full_down_weight)
         assert all(w is not None for w in weight_prefetch_args), \
             "prefetch_weight tensors must be provided together"
@@ -930,6 +1171,7 @@ class Buffer:
             plan=plan,
             projections=weight_prefetch_args,
             async_finish=async_finish,
+            rank_barriers=rank_barriers,
         )
 
     def prefetch_projections(
@@ -937,6 +1179,7 @@ class Buffer:
         plan: MoonEPCommPlan | None,
         projections: Sequence[torch.Tensor],
         async_finish: bool = False,
+        rank_barriers: bool = True,
     ):
         """Prefetch an arbitrary non-empty sequence of expert projections.
 
@@ -964,6 +1207,7 @@ class Buffer:
                 ctx,
                 plan.experts_to_copy,
                 projections,
+                rank_barriers=rank_barriers,
             )
             return None
 
@@ -972,11 +1216,17 @@ class Buffer:
         prev_stream = torch_npu.npu.current_stream()
         with torch_npu.npu.stream(self._comm_stream):
             self._comm_stream.wait_stream(prev_stream)
+            if rank_barriers:
+                cross_rank_barrier(ctx, self._comm_stream.npu_stream)
             self._run_prefetch_weight_on_current_stream(
                 ctx,
                 plan.experts_to_copy,
                 projections,
+                rank_barriers=False,
             )
+            if rank_barriers:
+                # Exit rendezvous: the event means all readers are done.
+                cross_rank_barrier(ctx, self._comm_stream.npu_stream)
             self._record_streams(
                 (*projections, plan.experts_to_copy), self._comm_stream)
         done = self._comm_stream.record_event()
@@ -1014,6 +1264,11 @@ class Buffer:
         self._ensure_shmem_views()
 
         assert isinstance(plan, MoonEPCommPlan), "Buffer.combine: plan is required"
+        if plan.dedup_mode != ctx['dedup_mode']:
+            raise ValueError(
+                f"plan uses {plan.dedup_mode} dedup, but this Buffer was "
+                f"constructed with dedup_mode={ctx['dedup_mode']!r}; "
+                "dedup mode is fixed at Buffer construction")
 
         assert hidden_nvsh is not None
         assert hidden_nvsh.dtype == torch.bfloat16
@@ -1192,6 +1447,13 @@ class Buffer:
                     "local [B,M,N] reduce-buffer carrier must be contiguous"
             assert getattr(reduce_buffer, _SLOT_SOURCE_VA_ATTR, None) is not None, \
                 "reduce buffer must carry _moonep_slot_source_va"
+
+        # Entry rendezvous: the kernels have no entry barrier, so drain this
+        # rank's slots, then use HCCL (not a cann-shmem barrier) to order ranks.
+        torch_npu.npu.synchronize()
+        group = ctx.get('group')
+        if bool(ctx.get('_uses_process_group', True)) and dist.is_initialized():
+            dist.barrier(group=group)
 
         if not async_finish:
             self._run_reduce_grad_on_current_stream(

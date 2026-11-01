@@ -4,9 +4,11 @@
 The dispatch result stays in Buffer's symmetric storage and is passed to
 ``Buffer.combine`` in zero-copy mode. The combine launcher selects UDMA through
 ``ASCEND_MOONEP_COMBINE_USE_UDMA``. Therefore this test covers the framework-level
-dispatch and UDMA combine path as one operation chain. Both dispatch routing
-and the packed combine execution plan are generated on CPU; no device planner
-or prepare_combine_plan kernel is launched.
+dispatch and UDMA combine path as one operation chain. Dispatch routing is
+generated on CPU. In server dedup mode the combine execution plan is a v6
+structure (ring pages + workspace mirrors) and is built by the metadata-only
+planning kernel via ``Buffer.prepare_combine_plan``; rank dedup uses the legacy
+combine and does not consume an execution plan.
 
 Golden result (there is no expert computation between the two operations):
 
@@ -190,7 +192,8 @@ def make_cpu_combine_plan(args, rank, raw=None):
 
 def attach_cpu_combine_plan(ctx, plan, storage):
     """Upload a CPU snapshot and bind production ownership/version/event guards."""
-    from npu_patch.planning import CombineExecutionPlan, _key, _routes, _stamp
+    from npu_patch.planning import (CombineExecutionPlan, _execution_key, _routes,
+                                    _stamp)
     from npu_patch import ShmemRuntime
     torch.npu.synchronize()
     ShmemRuntime.barrier()
@@ -202,9 +205,12 @@ def attach_cpu_combine_plan(ctx, plan, storage):
     ready.record(stream)
     for tensor in (storage, ctx['combine_workspace'], *_routes(plan)):
         tensor.record_stream(stream)
-    execution = CombineExecutionPlan(storage, id(plan), ctx['combine_workspace'], _key(ctx),
+    # Generation is tracked per plan (PlanningOp stamps plan._planning_generation),
+    # so an unrelated plan's planning run cannot invalidate this snapshot.
+    execution = CombineExecutionPlan(storage, id(plan), ctx['combine_workspace'],
+        _execution_key(ctx),
         tuple(map(_stamp, _routes(plan))), _stamp(storage),
-        ctx.get('_combine_plan_generation', 0), ready, ctx)
+        plan._planning_generation, ready, ctx)
     object.__setattr__(plan, 'combine_execution_plan', execution)
     torch.npu.synchronize()
     ShmemRuntime.barrier()
@@ -323,6 +329,7 @@ def run_rank(local_rank: int, args) -> None:
             explicitly_destroy=True,
             dispatch_use_udma=True,
             combine_use_udma=True,
+            dedup_mode=args.dedup_mode,
         )
         ctx = buffer._require_ctx()
         if not (ctx.get("_dispatch_use_udma", False)
@@ -353,10 +360,17 @@ def run_rank(local_rank: int, args) -> None:
             else None
         )
         plan = make_comm_plan(args, rank, hidden.device)
-        cpu_execution, _ = make_cpu_combine_plan(args, rank)
-        attach_cpu_combine_plan(ctx, plan, cpu_execution)
-        del cpu_execution
-        print(f'[rank {rank}] CPU golden dispatch + combine execution plan ready; '
+        if args.dedup_mode == 'server':
+            # v6 plan: ring page tables and the workspace mirrors are produced
+            # by the metadata-only planning kernel; the old CPU layout only
+            # covered the v5 prefix and fails the native size check.
+            buffer.prepare_combine_plan(plan)
+        else:
+            cpu_execution, _ = make_cpu_combine_plan(args, rank)
+            attach_cpu_combine_plan(ctx, plan, cpu_execution)
+            del cpu_execution
+        print(f'[rank {rank}] golden dispatch plan ready; '
+              f'combine_plan={"kernel" if args.dedup_mode == "server" else "cpu-golden"} '
               f'dedup={args.dedup_mode}', flush=True)
 
         ShmemRuntime.barrier()
@@ -527,7 +541,7 @@ def main() -> int:
         f"UDMA dispatch+combine joint: R={args.R} S={args.S} H={args.H} "
         f"K={args.K} E={dispatch_test.num_experts(args)} "
         f"weights={not args.no_weights} plan_mode={args.plan_mode} dedup_mode={args.dedup_mode} "
-        f"combine_plan=cpu-golden "
+        f"combine_plan={'kernel' if args.dedup_mode == 'server' else 'cpu-golden'} "
         f"qp_count={UDMA_QP_COUNT} max_checks={args.max_checks or 'all'}",
         flush=True,
     )

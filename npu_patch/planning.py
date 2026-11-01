@@ -221,6 +221,10 @@ def prepare_combine_plan(ctx, plan, *, storage=None, fused_timing=None):
     from .launchers import _env_use_udma
     if not _env_use_udma('combine'):
         raise ValueError('execution plans require UDMA combine')
+    if plan.dedup_mode != "server":
+        raise ValueError(
+            'combine execution plans are a server-level dedup feature; '
+            'rank-level dedup uses the legacy combine kernel')
     object.__setattr__(plan, 'combine_execution_plan', None)
     fused = fused_timing is not None
     begin, end, stream = fused_timing if fused else begin_fused_combine_plan()
@@ -246,11 +250,19 @@ def _round4(n: int) -> int:
     return (n + 3) & ~3
 
 
-def allocate_planning_outputs(ctx: dict, *, dedup_mode: str = "rank"):
+def allocate_planning_outputs(ctx: dict):
     """Allocate a ``(MoonEPCommPlan, cu_seqlens)`` pair on ctx's NPU device.
 
     The plan-owned dedup tensors are allocated here; the Ascend Planning kernel
     materializes their compact prefixes together with ``dup_counts``.
+
+    The dedup domain is a property of the Buffer, fixed at construction:
+    ``ctx['dedup_mode']`` is ``"rank"`` (the default, same as the local
+    rank-level code path) or ``"server"``, and ``ctx['ranks_per_server']`` is
+    the server size (8 by default and currently the only compiled value).
+    There is deliberately no per-call override: dispatching with a dedup mode
+    that differs from the Buffer's would mix two workspace/layout contracts.
+    Synthetic contexts that predate these keys keep the rank-level behavior.
     """
     E = ctx['E']
     B = ctx.get('B', 0)
@@ -259,12 +271,24 @@ def allocate_planning_outputs(ctx: dict, *, dedup_mode: str = "rank"):
     N = S * K
     NvS = ctx['NvS']
     R = ctx['R']
+    dedup_mode = ctx.get('dedup_mode', 'rank')
+    ranks_per_server = ctx.get('ranks_per_server', RANKS_PER_SERVER)
     if dedup_mode not in ('rank', 'server'):
         raise ValueError("dedup_mode must be 'rank' or 'server'")
+    if isinstance(ranks_per_server, bool) or not isinstance(ranks_per_server, int):
+        raise TypeError("ranks_per_server must be an int")
+    if ranks_per_server <= 0:
+        raise ValueError("ranks_per_server must be positive")
     server_dedup = dedup_mode == 'server'
     # Server mode addresses physical boards; an incomplete board cannot be treated as one dedup domain.
-    if server_dedup and (R <= 0 or R % RANKS_PER_SERVER != 0):
-        raise ValueError("server planning requires R divisible by 8")
+    if server_dedup:
+        if ranks_per_server != RANKS_PER_SERVER:
+            raise NotImplementedError(
+                "server dedup kernels are compiled for "
+                f"{RANKS_PER_SERVER} ranks/server, got {ranks_per_server}")
+        if R <= 0 or R % ranks_per_server != 0:
+            raise ValueError(
+                f"server planning requires R divisible by {ranks_per_server}")
     if NvS < N or (server_dedup and NvS != N):
         raise ValueError("invalid NvS for the selected dedup mode")
     dev = ctx['weights_buf'].device
@@ -284,7 +308,7 @@ def allocate_planning_outputs(ctx: dict, *, dedup_mode: str = "rank"):
         _round4(NvS * 3), dtype=torch.int32, device=dev
     )[:NvS * 3].view(NvS, 3)
     # Only server mode enlarges the secondary list and reserves a group start for each source.
-    dup_capacity = RANKS_PER_SERVER * NvS if server_dedup else NvS
+    dup_capacity = ranks_per_server * NvS if server_dedup else NvS
     count_size = R + 2 if server_dedup else 2
     dup_loffs = torch.empty(_round4(dup_capacity), dtype=torch.int32, device=dev)[:dup_capacity]
     dup_counts = torch.empty(_round4(count_size), dtype=torch.int32, device=dev)[:count_size]

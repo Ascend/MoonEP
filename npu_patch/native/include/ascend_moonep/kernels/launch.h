@@ -27,7 +27,17 @@ ASCEND_MOONEP_EXPORT void moonep_combine_kernel_do(
     uint8_t* route_weights_sk_out,
     uint8_t* tiling_host);
 
-ASCEND_MOONEP_EXPORT void moonep_udma_combine_plan_kernel_do(
+// Legacy rank-level dedup combine: gather scratch and bandwidth diagnostics are
+// split out of one rank-local workspace by the host op.
+ASCEND_MOONEP_EXPORT void moonep_udma_combine_kernel_do(
+    void* stream, uint8_t* hidden, uint8_t* weights, uint8_t* sync_buffer,
+    uint8_t* dst, uint8_t* groups, uint8_t* dups, uint8_t* counts,
+    uint8_t* out, uint8_t* outw, uint8_t* workspace, uint8_t* bandwidth_scratch,
+    uint8_t* tiling, uint64_t magic);
+
+// Server-level dedup combine: consumes the execution plan produced by
+// planning_server_dedup_kernel_do.
+ASCEND_MOONEP_EXPORT void moonep_udma_combine_server_dedup_kernel_do(
     void* stream, uint8_t* hidden, uint8_t* weights, uint8_t* dst,
     uint8_t* groups, uint8_t* dups, uint8_t* counts, uint8_t* out, uint8_t* outw,
     uint8_t* workspace, uint8_t* plan, uint8_t* tiling,
@@ -74,7 +84,61 @@ ASCEND_MOONEP_EXPORT void moonep_dispatch_udma_profile_kernel_do(
     uint8_t* tiling_host,
     uint64_t magic);
 
+ASCEND_MOONEP_EXPORT void moonep_dispatch_udma_server_dedup_kernel_do(
+    void* stream,
+    uint8_t* hidden_sh,
+    uint8_t* route_weights,
+    uint8_t* dst,
+    uint8_t* dup_groups,
+    uint8_t* dup_loffs,
+    uint8_t* dup_counts,
+    uint8_t* hidden_buf,
+    uint8_t* weights_buf,
+    uint8_t* sync_buffer,
+    uint8_t* tiling_host,
+    uint64_t magic);
+
+ASCEND_MOONEP_EXPORT void moonep_dispatch_udma_server_dedup_profile_kernel_do(
+    void* stream,
+    uint8_t* hidden_sh,
+    uint8_t* route_weights,
+    uint8_t* dst,
+    uint8_t* dup_groups,
+    uint8_t* dup_loffs,
+    uint8_t* dup_counts,
+    uint8_t* hidden_buf,
+    uint8_t* weights_buf,
+    uint8_t* sync_buffer,
+    uint8_t* profile_cycles,
+    uint8_t* tiling_host,
+    uint64_t magic);
+
 ASCEND_MOONEP_EXPORT void planning_kernel_do(
+    void* stream,
+    uint8_t* topk_idx,
+    uint8_t* symmetric_buffer,
+    uint8_t* dst,
+    uint8_t* cu_seqlens,
+    uint8_t* experts_to_copy,
+    uint8_t* dup_groups,
+    uint8_t* dup_loffs,
+    uint8_t* dup_counts,
+    uint8_t* tpe_all,
+    uint8_t* tpe_prefix,
+    uint8_t* balance,
+    uint8_t* z_tensor,
+    uint8_t* alloc_tensor,
+    uint8_t* alloc_cumsum,
+    uint8_t* expert_offsets,
+    uint8_t* core_expert_counts,
+    uint8_t* dup_workspace,
+    uint8_t* dup_key_workspace,
+    uint8_t* tiling_host,
+    uint64_t ffts_addr);
+
+// Server-level dedup planner: also materializes the combine execution plan when
+// the tiling requests the fused mode.
+ASCEND_MOONEP_EXPORT void planning_server_dedup_kernel_do(
     void* stream,
     uint8_t* topk_idx,
     uint8_t* symmetric_buffer,

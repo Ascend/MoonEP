@@ -84,9 +84,17 @@ def launch_planning_op(
     core_num: int,
     rank: int,
     world_size: int,
+    server_dedup: bool,
     combine_workspace: torch.Tensor | None = None,
     hidden_size: int = 0,
 ) -> torch.Tensor | None:
+    """Launch planning.
+
+    ``server_dedup`` selects the kernel family: ``True`` runs the server-level
+    dedup planner (which can also emit the fused combine execution plan when
+    ``combine_workspace`` is given), ``False`` runs the legacy rank-level
+    planner and never produces a combine plan.
+    """
     global _PLANNING
     if _PLANNING is None:
         _PLANNING = torch.classes.AscendMoonEP.Planning()
@@ -109,6 +117,7 @@ def launch_planning_op(
         core_num,
         rank,
         world_size,
+        bool(server_dedup),
         _env_use_udma('planning'),
     )
     if combine_workspace is not None:
@@ -132,6 +141,7 @@ def launch_dispatch_op(
     num_topk: int,
     world_size: int,
     rank: int,
+    server_dedup: bool = False,
 ) -> None:
     global _DISPATCH
     if _DISPATCH is None:
@@ -152,6 +162,7 @@ def launch_dispatch_op(
         world_size,
         rank,
         _env_use_udma('dispatch'),
+        bool(server_dedup),
     )
 
 
@@ -171,6 +182,7 @@ def launch_dispatch_profile_op(
     num_topk: int,
     world_size: int,
     rank: int,
+    server_dedup: bool = False,
 ) -> None:
     global _DISPATCH
     if _DISPATCH is None:
@@ -192,6 +204,7 @@ def launch_dispatch_profile_op(
         world_size,
         rank,
         _env_use_udma('dispatch'),
+        bool(server_dedup),
     )
 
 
@@ -211,8 +224,16 @@ def launch_combine_op(
     num_topk: int,
     world_size: int,
     rank: int,
+    server_dedup: bool = False,
 ) -> None:
-    """Select native/UDMA combine from the process environment."""
+    """Select the native / legacy-rank / server-dedup combine kernel.
+
+    - ``not use_udma``: legacy MTE combine (rank dedup only).
+    - ``use_udma and server_dedup``: server-level dedup kernel, which consumes
+      the execution plan prepared by the planner.
+    - ``use_udma and not server_dedup``: legacy rank-level dedup kernel, which
+      only needs the plan's dst/dup tables.
+    """
     global _COMBINE, _COMBINE_UDMA
     use_udma = _env_use_udma("combine")
     if not use_udma and tuple(dup_counts.shape) == (world_size + 2,):
@@ -220,23 +241,43 @@ def launch_combine_op(
     if use_udma:
         if _COMBINE_UDMA is None:
             _COMBINE_UDMA = torch.classes.AscendMoonEP.CombineUrma()
-        _COMBINE_UDMA.compute(
-            hidden_buf,
-            weight_buf,
-            sync_buffer,
-            combine_workspace,
-            dst,
-            dup_groups,
-            dup_loffs,
-            dup_counts,
-            hidden_sk_out,
-            route_weights_sk_out,
-            num_tokens,
-            hidden_size,
-            num_topk,
-            world_size,
-            rank,
-        )
+        if server_dedup:
+            _COMBINE_UDMA.compute(
+                hidden_buf,
+                weight_buf,
+                sync_buffer,
+                combine_workspace,
+                dst,
+                dup_groups,
+                dup_loffs,
+                dup_counts,
+                hidden_sk_out,
+                route_weights_sk_out,
+                num_tokens,
+                hidden_size,
+                num_topk,
+                world_size,
+                rank,
+            )
+        else:
+            # Rank-level dedup uses the frozen kernel; its gather staging and
+            # bandwidth scratch live in the op-owned rank-local workspace.
+            _COMBINE_UDMA.compute_legacy(
+                hidden_buf,
+                weight_buf,
+                sync_buffer,
+                dst,
+                dup_groups,
+                dup_loffs,
+                dup_counts,
+                hidden_sk_out,
+                route_weights_sk_out,
+                num_tokens,
+                hidden_size,
+                num_topk,
+                world_size,
+                rank,
+            )
         return
 
     sk_stride = ((num_topk + 7) // 8) * 8
@@ -339,6 +380,7 @@ def launch_prefetch(
     prefetch_buffers: torch.Tensor,
     experts_to_copy: torch.Tensor,
     num_sms: int,
+    rank_barriers: bool = True,
 ) -> torch.Tensor:
     """Prefetch selected expert weights using the registered custom class."""
     assert remote_expert.dtype == torch.bfloat16
@@ -359,7 +401,7 @@ def launch_prefetch(
         _PREFETCH_WEIGHT = torch.classes.AscendMoonEP.PrefetchWeight(0)
     return _PREFETCH_WEIGHT.compute(
         remote_expert, prefetch_buffers, experts_to_copy,
-        num_experts, num_sms, 0, _env_use_udma('prefetch'))
+        num_experts, num_sms, 0, _env_use_udma('prefetch'), rank_barriers)
 
 
 def launch_grad_reduce(
@@ -386,7 +428,12 @@ def launch_grad_reduce(
     del meta_buf, meta_stride, barrier_off, grid_sync_bar
 
     if remote_reduce_buffers.numel() == 0 or experts_to_copy.numel() == 0:
-        return
+        # The fused kernel ends with a collective barrier that every rank must
+        # enter; skipping the launch here would desynchronise the job silently.
+        raise RuntimeError(
+            "launch_grad_reduce: empty grad-reduce operands "
+            f"(reduce_buffers.numel()={remote_reduce_buffers.numel()}, "
+            f"experts_to_copy.numel()={experts_to_copy.numel()})")
 
     assert remote_expert_grads.dtype == torch.float32
     assert remote_expert_grads.is_contiguous()

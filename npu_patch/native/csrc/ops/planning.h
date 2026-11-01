@@ -37,6 +37,7 @@ torch::Tensor Planning(
     int64_t core_num,
     int64_t rank,
     int64_t world_size,
+    bool server_dedup,
     bool use_udma,
     torch::Tensor combine_workspace = {}, int64_t hidden_size = 0);
 

@@ -16,8 +16,10 @@ Two mutually exclusive build paths:
 
 2. Ascend / NPU (when an Ascend toolchain is detected): compiles the
    vendored `npu_patch._C` extension from `npu_patch/native/csrc/` and
-   links the AscendC kernel library (`npu_patch/lib/libascend_moonep_kernels.so`)
-   built by `npu_patch/scripts/build_base.sh` (wrapper: `build_a5.sh`). The GPU
+   links the AscendC kernel libraries
+   (`npu_patch/lib/libascend_moonep_kernels.so` and
+   `npu_patch/lib/libascend_moonep_kernels_server_dedup.so`) built by
+   `npu_patch/scripts/build_base.sh` (wrapper: `build_a5.sh`). The GPU
    logic is unchanged.
 
 The backend is selected at build time by `_is_ascend_build()`: it prefers an
@@ -85,11 +87,16 @@ def _npu_extension():
     kernel_lib_dir = Path(
         os.environ.get("ASCEND_MOONEP_KERNEL_LIB_DIR", ROOT / "npu_patch" / "lib")
     )
-    if not (kernel_lib_dir / "libascend_moonep_kernels.so").exists():
-        raise RuntimeError(
-            f"Kernel library not found in {kernel_lib_dir}. Run "
-            "npu_patch/scripts/build_base.sh -soc_type <SOC_TYPE> first."
-        )
+    kernel_libs = (
+        "libascend_moonep_kernels.so",
+        "libascend_moonep_kernels_server_dedup.so",
+    )
+    for kernel_lib in kernel_libs:
+        if not (kernel_lib_dir / kernel_lib).exists():
+            raise RuntimeError(
+                f"Kernel library {kernel_lib} not found in {kernel_lib_dir}. Run "
+                "npu_patch/scripts/build_base.sh -soc_type <SOC_TYPE> first."
+            )
     torch_npu_root = Path(torch_npu.__file__).resolve().parent
     native = ROOT / "npu_patch" / "native"
 
@@ -155,8 +162,16 @@ def _npu_extension():
         define_macros=[],
         include_dirs=include_dirs,
         library_dirs=library_dirs,
-        libraries=["ascend_moonep_kernels", "torch_npu", "ascendcl", "runtime", "shmem", "dl"],
-        extra_compile_args=["-O2", "-std=c++17"],
+        libraries=[
+            "ascend_moonep_kernels",
+            "ascend_moonep_kernels_server_dedup",
+            "torch_npu",
+            "ascendcl",
+            "runtime",
+            "shmem",
+            "dl",
+        ],
+        extra_compile_args=["-O2", "-std=c++20"],
         extra_link_args=["-Wl,-rpath,$ORIGIN/lib"]
         + [f"-Wl,-rpath,{path}" for path in rpath_dirs],
     )

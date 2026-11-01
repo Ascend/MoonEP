@@ -22,6 +22,13 @@ allocate and register the CANN VMM descriptors *before*
 set, so chunks created afterwards never enter the current symmetric heap. The
 point-visit accessors (``remote_home_rows`` / ``read_reduce_slot`` /
 ``expert_pool_row``) instead require init to have run already.
+
+Their huge-page policy is the *framework* VMM scope
+(``ASCEND_MOONEP_FRAMEWORK_VMM_PAGE_SIZE``, or the builders'
+``vmm_page_size=`` argument), independent of MoonEP's ``Buffer``
+(``vmm_page_size`` / ``ASCEND_MOONEP_VMM_PAGE_SIZE``), so training-framework
+parameters and the dispatch/combine chunks can be aligned to different page
+sizes.
 """
 
 from __future__ import annotations
@@ -90,10 +97,20 @@ def _take_owned() -> list:
     return owned
 
 
-def _home_slot_projection(E, B, R, H, Hp, dtype, device, local_rank):
+def _home_slot_projection(E, B, R, H, Hp, dtype, device, local_rank,
+                          vmm_page_size=None):
     epn = int(E) // int(R)
-    home, _, _ = buffer_c.create_vmm_physical([epn, H, Hp], dtype, device)
-    slot, _, _ = buffer_c.create_vmm_physical([B, H, Hp], dtype, device)
+    # The training framework's parameters form their own page-size scope:
+    # ``ASCEND_MOONEP_FRAMEWORK_VMM_PAGE_SIZE`` (falling back to
+    # ``ASCEND_MOONEP_VMM_PAGE_SIZE``), independent of MoonEP's dispatch/combine
+    # chunks. Both chunks take the same policy so the [E+B] projection alias
+    # (which uses lcm(home_gran, slot_gran)) stays representable.
+    page_size = buffer_c.resolve_vmm_page_size(
+        vmm_page_size, scope=buffer_c.VMM_SCOPE_FRAMEWORK)
+    home, _, _ = buffer_c.create_vmm_physical(
+        [epn, H, Hp], dtype, device, page_size=page_size)
+    slot, _, _ = buffer_c.create_vmm_physical(
+        [B, H, Hp], dtype, device, page_size=page_size)
     full = buffer_c.create_full_projection_tensor(
         home, slot, int(E), int(B), int(local_rank), device)
     buffer_c.attach_local_source_vas(full, home.data_ptr(), slot.data_ptr())
@@ -115,6 +132,7 @@ def create_full_weight(
     group=None,
     dtype: torch.dtype = torch.bfloat16,
     device: int | None = None,
+    vmm_page_size: str | None = None,
 ) -> torch.Tensor:
     """Backend-specific high-level constructor for one ``[E+B]`` weight pool.
 
@@ -122,13 +140,20 @@ def create_full_weight(
     in the returned projection. Remote expert rows are observable after shmem
     initialization through :func:`remote_home_rows` / :func:`expert_pool_row`
     (bind-free point-visit).
+
+    ``vmm_page_size`` is the huge-page policy of the framework-owned parameter
+    chunks: ``None``/``"default"`` resolve
+    ``ASCEND_MOONEP_FRAMEWORK_VMM_PAGE_SIZE`` (falling back to
+    ``ASCEND_MOONEP_VMM_PAGE_SIZE``, else 2 MiB); ``"1g"``/``"2m"`` override it
+    here. This is independent of the MoonEP ``Buffer``'s ``vmm_page_size``.
     """
     E, B, R = int(num_experts), int(slot_rows), int(num_ep_ranks)
     rank = int(local_rank)
     epn = E // R
     device = _current_device() if device is None else int(device)
     pool, home, slot = _home_slot_projection(
-        E, B, R, int(hidden), int(hidden_prime), dtype, device, rank)
+        E, B, R, int(hidden), int(hidden_prime), dtype, device, rank,
+        vmm_page_size=vmm_page_size)
     home.copy_(expert_table[rank * epn:(rank + 1) * epn])
     if source_offset:
         home.add_(source_offset)
@@ -150,29 +175,41 @@ def create_full_grad_and_reduce_buffer(
     group=None,
     dtype: torch.dtype = torch.float32,
     device: int | None = None,
+    vmm_page_size: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Create one local full-grad projection and its pre-init reduce carrier.
 
     ``grad_table`` is the rank-invariant ``[E, H, H']`` reference; this rank
-    copies only its home slice. ``reduce_table`` is ``[R, B, H, H']``; this
-    rank copies only its own slot slice. Cross-rank slot reads go through
-    :func:`read_reduce_slot` (bind-free point-visit).
+    copies only its home slice. ``reduce_table`` is ``[R, epn, H, H']``; this
+    rank copies only its own slot slice. The returned carrier has the logical
+    ``[R, epn, H, H']`` shape but only this rank's ``epn`` rows have backing:
+    the other R-1 slices are stride-0 aliases of the local chunk, never
+    allocated. Read a peer's slots with :func:`read_reduce_slot`, not by
+    indexing the carrier.
+
+    ``vmm_page_size`` follows :func:`create_full_weight`: it sets the
+    framework-parameter huge-page policy (``ASCEND_MOONEP_FRAMEWORK_VMM_PAGE_SIZE``
+    when omitted) independently of the MoonEP ``Buffer`` chunks.
     """
     E, B, R = int(num_experts), int(slot_rows), int(num_ep_ranks)
     rank = int(local_rank)
     epn = E // R
     H, Hp = int(hidden), int(hidden_prime)
     device = _current_device() if device is None else int(device)
+    if epn != B:
+        raise ValueError(
+            f"reduce carrier needs slot_rows == epn, got slot_rows={B}, "
+            f"epn=E/R={epn}")
 
     full_grad, home, slot = _home_slot_projection(
-        E, B, R, H, Hp, dtype, device, rank)
+        E, B, R, H, Hp, dtype, device, rank, vmm_page_size=vmm_page_size)
     home.copy_(grad_table[rank * epn:(rank + 1) * epn])
     slot.copy_(reduce_table[rank])
-    # Pre-init [R,B,H,H'] carrier. Its storage is not read by reduce_grad; only
-    # the attached slot source VA is consumed. read_reduce_slot() resolves each
-    # rank's live slot chunk from it.
-    reduce_buffer = torch.empty(
-        R, B, H, Hp, dtype=dtype, device=torch.device(f"npu:{device}"))
+    # Logical [R,B,H,H'] over the local slot chunk: every rank slice is a
+    # stride-0 alias, so this process backs only epn*H*H' floats and slice
+    # [rank] *is* the local chunk the reduce kernel consumes. No storage exists
+    # for the other ranks; remote reads go through read_reduce_slot().
+    reduce_buffer = slot.unsqueeze(0).expand(R, -1, -1, -1)
     buffer_c.attach_local_source_vas(
         reduce_buffer, home.data_ptr(), slot.data_ptr())
     reduce_buffer._npu_slot_chunk = slot
@@ -215,7 +252,8 @@ def read_reduce_slot(reduce_buffer: torch.Tensor, pe: int) -> torch.Tensor:
 
     Bind-free cross-rank read for the reduce carrier: resolves ``pe``'s
     address from the attached slot chunk's source VA on demand. Accepts the
-    pre-init ``[R,B,...]`` carrier or a bare slot chunk — anything carrying
+    ``[R, epn, H, H']`` carrier (whose non-local slices are aliases, so they
+    must not be read directly) or a bare slot chunk — anything carrying
     ``_npu_slot_chunk`` (or being the chunk itself).
     """
     _require_npu()

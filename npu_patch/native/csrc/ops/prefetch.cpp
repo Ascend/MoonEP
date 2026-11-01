@@ -38,7 +38,8 @@ torch::Tensor LaunchPrefetch(
     torch::Tensor experts_to_copy,
     int64_t num_sms,
     int64_t instance_id,
-    bool use_udma) {
+    bool use_udma,
+    bool rank_barriers) {
     // The current SHMEM runtime is a single global instance.
     (void)instance_id;
     (void)num_sms;
@@ -96,7 +97,12 @@ torch::Tensor LaunchPrefetch(
     const int64_t block_dim = aicore_count;
 
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-    aclshmemx_barrier_all_on_stream(stream);
+    // Entry: home rows are published before the gets. Exit: all readers are
+    // done before home backing may change. rank_barriers=false drops both;
+    // the caller then owns both boundaries.
+    if (rank_barriers) {
+        aclshmemx_barrier_all_on_stream(stream);
+    }
     auto kernel = use_udma
         ? prefetch_weight_kernel_udma_do
         : prefetch_weight_kernel_do;
@@ -110,7 +116,9 @@ torch::Tensor LaunchPrefetch(
         Hp,
         B,
         block_dim);
-    aclshmemx_barrier_all_on_stream(stream);
+    if (rank_barriers) {
+        aclshmemx_barrier_all_on_stream(stream);
+    }
     return prefetch_buffers;
 }
 

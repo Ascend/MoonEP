@@ -22,7 +22,8 @@ MoonEPDispatch(
     int64_t K,
     int64_t R,
     int64_t rank,
-    bool use_udma);
+    bool use_udma,
+    bool server_dedup);
 
 void
 MoonEPDispatchProfile(
@@ -41,6 +42,7 @@ MoonEPDispatchProfile(
     int64_t K,
     int64_t R,
     int64_t rank,
-    bool use_udma);
+    bool use_udma,
+    bool server_dedup);
 
 }  // namespace ascend_moonep::ops

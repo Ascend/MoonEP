@@ -318,17 +318,12 @@ def cross_rank_barrier(ctx: dict, stream: int) -> None:
     block; combined with the api async path launching kernels on a dedicated
     comm_stream this yields true async.
 
-    ``_barrier_round`` is a context-local diagnostic count. The native SHMEM
-    primitive owns the device barrier generation; this Python count is not
-    passed to the device and cannot enforce generation ordering.
-
     ``stream`` is the caller's current/comm stream ``npu_stream`` handle,
     forwarded verbatim to the on-stream primitive.
     ``ASCEND_MOONEP_ASYNC_BARRIER=0`` falls back to the historical
     host-blocking ``acl_shmem_barrier_all()`` (correct but not async; the
     fallback when the on-stream primitive is unavailable).
     """
-    ctx['_barrier_round'] = int(ctx.get('_barrier_round', 0)) + 1
     if _async_barrier_enabled():
         acl_shmem_barrier_all_on_stream(stream)
     else:

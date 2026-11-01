@@ -336,17 +336,41 @@ void acl_shmem_barrier_all() {
 // CANN VMM (aclrt* physical allocation + shareable VA)
 // ================================================================
 
+// Resolve one allocation's huge-page policy.
+//
+// ``page_size`` is the per-allocation request: "" / "default" inherits the
+// process default (ASCEND_MOONEP_VMM_PAGE_SIZE, else "2m"); "1g" / "2m"
+// override it for this allocation only. Every VMM allocation carries its own
+// ``memAttr``, and ACLSHMEM re-queries each descriptor's property
+// (validate_buffer_mapping), so one symmetric heap may mix page sizes as long
+// as every descriptor stays aligned to its own granularity.
+std::string resolve_vmm_page_size(const std::string& page_size) {
+    if (!page_size.empty() && page_size != "default") {
+        TORCH_CHECK(page_size == "1g" || page_size == "2m",
+                    "vmm page_size must be '1g', '2m' or 'default', got '",
+                    page_size, "'");
+        return page_size;
+    }
+    const char* env = std::getenv("ASCEND_MOONEP_VMM_PAGE_SIZE");
+    const std::string policy =
+        (env == nullptr || *env == '\0') ? "2m" : env;
+    TORCH_CHECK(policy == "1g" || policy == "2m",
+                "ASCEND_MOONEP_VMM_PAGE_SIZE must be 1g or 2m, got ", policy);
+    return policy;
+}
+
+std::string acl_vmm_resolve_page_size(const std::string& page_size) {
+    return resolve_vmm_page_size(page_size);
+}
+
 // Build ACL physical-mem properties: HBM huge page, DEVICE memory on device_id.
-aclrtPhysicalMemProp vmm_mem_prop(int64_t device_id) {
+aclrtPhysicalMemProp vmm_mem_prop(int64_t device_id,
+                                  const std::string& page_size) {
     aclrtPhysicalMemProp prop{};
     prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
     prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
-    // Default to 2 MiB huge pages to avoid 1 GiB allocation rounding.
-    // Set ASCEND_MOONEP_VMM_PAGE_SIZE=1g before VMM allocation to opt in.
-    const char* page_size = std::getenv("ASCEND_MOONEP_VMM_PAGE_SIZE");
-    const std::string policy = page_size == nullptr ? "2m" : page_size;
-    TORCH_CHECK(policy == "1g" || policy == "2m",
-                "ASCEND_MOONEP_VMM_PAGE_SIZE must be 1g or 2m, got ", policy);
+    // 2 MiB pages by default; large data-plane chunks opt into 1 GiB.
+    const std::string policy = resolve_vmm_page_size(page_size);
     prop.memAttr = policy == "2m" ? ACL_HBM_MEM_HUGE : ACL_HBM_MEM_HUGE1G;
     prop.location = aclrtMemLocation{
         static_cast<uint32_t>(device_id), ACL_MEM_LOCATION_TYPE_DEVICE};
@@ -354,25 +378,28 @@ aclrtPhysicalMemProp vmm_mem_prop(int64_t device_id) {
     return prop;
 }
 
-int64_t acl_vmm_granularity(int64_t device_id) {
-    aclrtPhysicalMemProp prop = vmm_mem_prop(device_id);
+int64_t acl_vmm_granularity(int64_t device_id, const std::string& page_size) {
+    aclrtPhysicalMemProp prop = vmm_mem_prop(device_id, page_size);
     size_t gran = 0;
     const aclError rc = aclrtMemGetAllocationGranularity(
         &prop, ACL_RT_MEM_ALLOC_GRANULARITY_MINIMUM, &gran);
     TORCH_CHECK(rc == ACL_SUCCESS && gran > 0,
                 "aclrtMemGetAllocationGranularity failed with ", rc,
-                " (device_id=", device_id, ")");
+                " (device_id=", device_id, ", page_size=",
+                resolve_vmm_page_size(page_size), ")");
     return static_cast<int64_t>(gran);
 }
 
-int64_t acl_vmm_malloc_physical(int64_t size, int64_t device_id) {
+int64_t acl_vmm_malloc_physical(int64_t size, int64_t device_id,
+                                const std::string& page_size) {
     TORCH_CHECK(size > 0, "vmm physical size must be positive, got ", size);
     aclrtDrvMemHandle handle = nullptr;
-    aclrtPhysicalMemProp prop = vmm_mem_prop(device_id);
+    aclrtPhysicalMemProp prop = vmm_mem_prop(device_id, page_size);
     const aclError rc = aclrtMallocPhysical(
         &handle, static_cast<size_t>(size), &prop, 0);
     TORCH_CHECK(rc == ACL_SUCCESS && handle != nullptr,
                 "aclrtMallocPhysical(", size, ", device_id=", device_id,
+                ", page_size=", resolve_vmm_page_size(page_size),
                 ") failed with ", rc);
     return reinterpret_cast<int64_t>(handle);
 }
@@ -462,8 +489,9 @@ std::string acl_vmm_export_fabric(int64_t handle) {
 }
 
 std::tuple<int64_t, int64_t, int64_t, int64_t, std::string> acl_vmm_alloc_source(
-    int64_t size, int64_t device_id, int64_t access_device_id) {
-    const int64_t gran = acl_vmm_granularity(device_id);
+    int64_t size, int64_t device_id, int64_t access_device_id,
+    const std::string& page_size) {
+    const int64_t gran = acl_vmm_granularity(device_id, page_size);
     TORCH_CHECK(size > 0 && size % gran == 0,
                 "vmm source size must be a positive multiple of granularity ",
                 gran, ", got ", size);
@@ -480,7 +508,7 @@ std::tuple<int64_t, int64_t, int64_t, int64_t, std::string> acl_vmm_alloc_source
     int64_t va = 0;
     bool mapped = false;
     try {
-        handle = acl_vmm_malloc_physical(size, device_id);
+        handle = acl_vmm_malloc_physical(size, device_id, page_size);
         va = acl_vmm_reserve(size);
         acl_vmm_map(va, size, handle, 0);
         mapped = true;

@@ -57,8 +57,20 @@ void acl_shmem_barrier_all();
 // CANN VMM (aclrt* physical allocation + shareable VA, for buffer-backed shmem init)
 // ================================================================
 // Low-level primitives: handles are passed as int64 (internal reinterpret_cast<void*>); device_id is the NPU id.
-int64_t acl_vmm_granularity(int64_t device_id);
-int64_t acl_vmm_malloc_physical(int64_t size, int64_t device_id);
+//
+// Huge-page policy is chosen per allocation (page_size):
+//   - "" / "default": process default, ASCEND_MOONEP_VMM_PAGE_SIZE, else "2m";
+//   - "1g": 1 GiB HBM huge pages (ACL_HBM_MEM_HUGE1G);
+//   - "2m": 2 MiB HBM huge pages (ACL_HBM_MEM_HUGE).
+// Mixing policies in one symmetric heap is supported by ACLSHMEM (each
+// descriptor is validated against its own granularity), but the descriptors
+// must be ordered so that every range starts at an offset aligned to its own
+// granularity -- see symmetric_descriptors() in buffer_c.py.
+std::string acl_vmm_resolve_page_size(const std::string& page_size = "");
+int64_t acl_vmm_granularity(int64_t device_id,
+                            const std::string& page_size = "");
+int64_t acl_vmm_malloc_physical(int64_t size, int64_t device_id,
+                                const std::string& page_size = "");
 void acl_vmm_free_physical(int64_t handle);
 int64_t acl_vmm_reserve(int64_t size);
 void acl_vmm_release(int64_t va);
@@ -82,8 +94,11 @@ std::string acl_vmm_export_fabric(int64_t handle);
 //   - access_device_id: desc.location.id for aclrtMemSetAccess, the PHYSICAL card
 //                       id (= mask entries, e.g. 4/5 in "4,5"); -1 = same as device_id.
 // A wrong space yields 107001 (allocation side) or 507899 (set_access side).
+// ``page_size`` selects this allocation's huge-page policy (see above); the
+// returned mapping is already aligned to the resolved granularity.
 std::tuple<int64_t, int64_t, int64_t, int64_t, std::string> acl_vmm_alloc_source(
-    int64_t size, int64_t device_id, int64_t access_device_id = -1);
+    int64_t size, int64_t device_id, int64_t access_device_id = -1,
+    const std::string& page_size = "");
 void acl_vmm_free_source(int64_t va, int64_t handle);
 
 // ================================================================

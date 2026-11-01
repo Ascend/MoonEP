@@ -105,5 +105,27 @@ ascend_moonep_add_kernel_library(
         USE_SIMT
 )
 
+# Server-level dedup kernels are built as a second library on purpose. The
+# legacy rank-level kernels above and the server-dedup kernels below were
+# written against different versions of the same headers (plan dedup tables,
+# combine PUT workspace, tiling padding) and use the same namespace/helper
+# names, so a unity build of both sets in one target would collide.
+ascend_moonep_add_kernel_library(
+    ascend_moonep_kernels_server_dedup
+    SOURCES
+        kernels/moonep_combine_udma_server_dedup.cpp
+        kernels/moonep_dispatch_udma_server_dedup.cpp
+        kernels/planning_server_dedup.cpp
+    INCLUDES
+        include
+        kernels
+        ../3rdparty/catlass/include
+        ../3rdparty/catlass
+    COMPILE_DEFINITIONS
+        CATLASS_ARCH=${ASCEND_MOONEP_CATLASS_ARCH}
+        USE_SIMT
+)
+
 message(STATUS "ascend-moonep kernel library: ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libascend_moonep_kernels.so")
+message(STATUS "ascend-moonep server-dedup kernel library: ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libascend_moonep_kernels_server_dedup.so")
 message(STATUS "SHMEM installation: ${SHMEM_HOME_PATH}")

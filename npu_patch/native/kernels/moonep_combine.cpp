@@ -15,7 +15,8 @@
 // Parallelism: tokens partitioned across AIVs. Full hidden row processed in one pass
 // (no H-chunk); UB holds ping/pong bf16 rows + fp32 tmp/acc.
 //
-// Sync: prologue → aclshmemx_barrier_all_vec → combine
+// Sync: prologue → stable generation barrier → combine
+//       → stable generation barrier (remote-read final-use fence)
 // Hot paths use MTE2↔V HardEvents + mte_get_nbi ping-pong (grad_reduce style).
 // Weight (EVENT_ID2/3): same topK walk as dispatch ScatterPhase — primary issues
 // hidden+weight together; dup (load_mask=0) issues weight-only in the same pass
@@ -184,6 +185,8 @@ public:
         if (n_tokens_ > 0) {
             ProcessCombine();
         }
+        PipeBarrier<PIPE_ALL>();
+        aclshmemx_barrier_all_vec();
     }
 
 private:

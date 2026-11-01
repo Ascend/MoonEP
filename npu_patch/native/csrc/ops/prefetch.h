@@ -10,6 +10,7 @@ torch::Tensor LaunchPrefetch(
     torch::Tensor experts_to_copy,
     int64_t num_sms,
     int64_t instance_id,
-    bool use_udma);
+    bool use_udma,
+    bool rank_barriers = true);
 
 }  // namespace ascend_moonep::ops

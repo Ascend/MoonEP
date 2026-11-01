@@ -18,35 +18,25 @@ inline constexpr uint32_t kMoonEPAivNum = 32;
 inline constexpr uint32_t kMoonEPDispatchRanksPerServer = 8;
 inline constexpr uint32_t kMoonEPUdmaCombineQpCount = 2;
 
-// Server-dedup planning keeps the public dup_groups tensor at [NvS, 3].  The
-// third word packs the source-rank-local route index above the duplicate count.
-// K is capped at 16 by combine, so five low bits are sufficient for dup_n and
-// leave 26 bits for a route index (well above the advertised 8M-token limit).
-inline constexpr uint32_t kMoonEPServerDupCountBits = 5;
-inline constexpr uint32_t kMoonEPServerDupCountMask =
-    (1U << kMoonEPServerDupCountBits) - 1U;
-inline constexpr uint32_t kMoonEPServerDupRouteLimit =
-    1U << (31U - kMoonEPServerDupCountBits);
+// Plan dedup tables are identical in both dedup domains; the domain only
+// changes the capacities and the duplicate address encoding:
+//   dup_groups[NvS, 3] = {primary loff on its owning rank, dup_start, dup_n}.
+//     dup_n counts the non-primary members (<= K-1); a group is owned and
+//     materialized by the primary route's destination rank.
+//   dup_loffs: rank domain has NvS entries holding the in-rank loff; server
+//     domain has 8*NvS entries holding the full destination address
+//     rank*NvS + loff, so a group may list members on sibling ranks of the
+//     same server.  There is no packed count word.
+//   dup_counts: rank [n_groups, n_dups]; server appends R per-source group
+//     prefixes [P_0 .. P_{R-1}], where P_src counts this rank's groups whose
+//     token source rank is below src (dispatch waits on that prefix).
+inline constexpr uint32_t kMoonEPServerDupRouteLimit = 1U << 26;
 
-MOONEP_DEVICE_INLINE int32_t PackMoonEPServerDupRoute(
-    uint32_t source_route, uint32_t duplicate_count) {
-    return static_cast<int32_t>(
-        (source_route << kMoonEPServerDupCountBits) |
-        (duplicate_count & kMoonEPServerDupCountMask));
-}
-
-MOONEP_DEVICE_INLINE uint32_t UnpackMoonEPServerDupCount(int32_t packed) {
-    return static_cast<uint32_t>(packed) & kMoonEPServerDupCountMask;
-}
-
-MOONEP_DEVICE_INLINE uint32_t UnpackMoonEPServerDupSourceRoute(int32_t packed) {
-    return static_cast<uint32_t>(packed) >> kMoonEPServerDupCountBits;
-}
-
-// dst uses three states in server mode.  Existing positive values are normal
-// canonical routes, ~raw remains a secondary duplicate, and 0x80000000|raw is
-// a canonical route whose reduced payload is pushed into source-rank staging.
-// The latter two are disjoint while R*NvS < 2^30.
+// Combine-plan internal route tag: the fused planner's per-token packed tables
+// (contributors / relays) mark a representative that lives on the reading rank
+// with 0x80000000 | raw.  It is disjoint from the public dst encoding (positive
+// canonical route, ~raw duplicate) while R*NvS < 2^30, and public dst never
+// carries it: dispatch and the metric tests only ever see the two-state form.
 inline constexpr uint32_t kMoonEPServerForwardedRouteTag = 0x80000000U;
 inline constexpr uint32_t kMoonEPServerRoutePayloadMask = 0x3fffffffU;
 

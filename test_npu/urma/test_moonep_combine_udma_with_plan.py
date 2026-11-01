@@ -9,12 +9,30 @@ verifies:
   - staged kernel combine output against the CPU reference
   - optional weight gather invertibility
 
+``--dedup-mode`` selects the Buffer's dedup domain. ``rank`` (default) uses the
+legacy rank-level combine kernel with rank tables; ``server`` reuses the dispatch
+test's server tables (8*slots duplicate addresses, R+2 counts with per-source
+prefixes), prepares the execution plan, and folds duplicates over the whole
+8-rank server in the CPU reference.
+
+``--combine-engine`` selects the combine kernel family. ``auto`` (default) keeps
+the historical behaviour — legacy MTE for rank dedup, UDMA for server dedup.
+``udma`` additionally covers the frozen rank-level UDMA kernel
+(``CombineUrma.compute_legacy``) with rank tables; ``mte`` forces the MTE kernel
+and is rejected for server dedup, which is UDMA-only.
+
 By default all R ranks are spawned on one host.
 
 Examples:
 
   python test_npu/urma/test_moonep_combine_udma_with_plan.py --mode kernel \
       --R 8 --S 8192 --K 8 --H 7168 --E 384 --plan-mode cyclic
+  python test_npu/urma/test_moonep_combine_udma_with_plan.py --mode kernel \
+      --R 8 --S 8192 --K 8 --H 7168 --E 384 --plan-mode cyclic \
+      --dedup-mode server
+  python test_npu/urma/test_moonep_combine_udma_with_plan.py --mode kernel \
+      --R 8 --S 256 --K 8 --H 1024 --E 384 --plan-mode cyclic \
+      --combine-engine udma
   python test_npu/urma/test_moonep_combine_udma_with_plan.py --mode kernel \
       --R 16 --S 8192 --K 8 --H 7168 --E 384 --plan-mode cyclic \
       --nproc-per-node 8 --node-rank 0
@@ -26,9 +44,9 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from kernel_test_utils import init_shmem
 import argparse
 import gc
+import time
 import os
 import sys
 from dataclasses import dataclass
@@ -43,6 +61,25 @@ import test_moonep_dispatch_udma_with_plan as dispatch_test
 
 MAX_UB_ROW_BYTES = 128 * 1024
 SEED = 20260803
+# An Ascend server is 8 consecutive ranks; mirrors npu_patch.planning.
+RANKS_PER_SERVER = 8
+
+
+def combine_udma_enabled(args) -> bool:
+    """Resolve ``--combine-engine`` into the Buffer's UDMA combine switch.
+
+    ``auto`` keeps the historical behaviour: server dedup needs UDMA, rank dedup
+    uses the legacy MTE kernel. ``udma``/``mte`` force the kernel family; server
+    dedup cannot run on MTE (validated in :func:`validate_args`).
+    """
+    if args.dedup_mode == "server":
+        return True
+    engine = getattr(args, "combine_engine", "auto")
+    if engine == "udma":
+        return True
+    if engine == "mte":
+        return False
+    return False
 
 
 def validate_args(args) -> None:
@@ -50,12 +87,28 @@ def validate_args(args) -> None:
         raise ValueError("R/S/K/H/E must be positive")
     if args.B < 0:
         raise ValueError("B must be non-negative")
+    if args.combine_entry_delay_ms < 0:
+        raise ValueError("combine-entry-delay-ms must be non-negative")
     if args.H % 8 != 0:
         raise ValueError("H must be multiple of 8")
     if args.H * 2 > MAX_UB_ROW_BYTES:
         raise ValueError(f"H is too large for UB row buffer: H*2={args.H * 2} > {MAX_UB_ROW_BYTES}")
     if args.R * args.S * args.K >= 2**31:
         raise ValueError("R*S*K must fit in positive int32 dst encoding")
+    if args.dedup_mode == "server":
+        if getattr(args, "combine_engine", "auto") == "mte":
+            raise ValueError(
+                "server dedup requires the UDMA combine kernel; "
+                "--combine-engine mte is rank-only")
+        if args.R % RANKS_PER_SERVER != 0:
+            raise ValueError("server dedup requires a complete eight-rank server")
+        if args.K < 2:
+            raise ValueError(
+                "server dedup requires K >= 2 to exercise intra-server forwarding")
+        if args.plan_mode not in ("random", "cyclic"):
+            raise ValueError(
+                "server dedup needs --plan-mode random|cyclic; the all-to-all "
+                "generator only builds rank-level tables")
     if args.nproc_per_node is None:
         if args.node_rank != 0:
             raise ValueError("--node-rank requires --nproc-per-node")
@@ -175,6 +228,11 @@ def make_all_to_all_destinations(args) -> torch.Tensor:
 
 
 def make_plan(args, local_rank: int):
+    # Server dedup tables (8*slots dup capacity, R+2 counts, full addresses and
+    # per-source prefixes) are the dispatch test's model; reuse it verbatim so
+    # both suites agree on the server plan. Its routing modes are random/cyclic.
+    if getattr(args, "dedup_mode", "rank") == "server":
+        return dispatch_test.make_plan(args, local_rank)
     slots = num_output_slots(args)
     dst_local = torch.empty(args.S * args.K, dtype=torch.int32)
     dup_groups_local = torch.full((slots, 3), -1, dtype=torch.int32)
@@ -260,18 +318,21 @@ def combine_identity_reference(
 ) -> torch.Tensor:
     """Model the staged BF16 reduction instead of assuming hidden * K exactly.
 
-    Routes for one token are first reduced per destination rank and rounded to
-    BF16 by the duplicate prologue. Combine then accumulates those per-rank
-    partials in FP32 and rounds the final row back to BF16.
+    Routes for one token are first reduced per dedup domain (one destination
+    rank, or one 8-rank server in server mode) and rounded to BF16 by the
+    duplicate prologue. Combine then accumulates those partials in FP32 and
+    rounds the final row back to BF16.
     """
     encoded = dst.reshape(args.S, args.K).to(torch.int64)
     raw = torch.where(encoded >= 0, encoded, -encoded - 1)
     destination_rank = torch.div(raw, num_output_slots(args), rounding_mode="floor")
+    width = (RANKS_PER_SERVER if args.dedup_mode == "server" else 1)
+    domain = torch.div(destination_rank, width, rounding_mode="floor")
 
     hidden_fp32 = hidden.float()
     reference_fp32 = torch.zeros_like(hidden_fp32)
-    for rank in range(args.R):
-        route_count = (destination_rank == rank).sum(dim=1, dtype=torch.int32)
+    for dom in range((args.R + width - 1) // width):
+        route_count = (domain == dom).sum(dim=1, dtype=torch.int32)
         active_tokens = torch.nonzero(route_count, as_tuple=False).flatten()
         if active_tokens.numel() == 0:
             continue
@@ -449,6 +510,7 @@ def apply_prologue_cpu(
     dup_loffs: torch.Tensor,
     dup_counts: torch.Tensor,
 ) -> torch.Tensor:
+    """Rank dedup: fold in-rank duplicates into each primary row."""
     out = hidden.clone().to(torch.float32)
     n_groups = int(dup_counts[0])
     for gid in range(n_groups):
@@ -464,6 +526,42 @@ def apply_prologue_cpu(
     return out.to(torch.bfloat16)
 
 
+def apply_prologue_cpu_server(
+    staged_by_rank: list[torch.Tensor],
+    plans: list[tuple],
+    args,
+) -> list[torch.Tensor]:
+    """Server dedup: fold each server's groups into its primary rows.
+
+    ``dup_loffs`` holds full ``rank * slots + loff`` addresses, so the fold runs
+    on a server-wide ``[RANKS_PER_SERVER * slots, H]`` canvas: a group owned by
+    rank ``r`` may pull members that live on sibling ranks of the same server.
+    """
+    slots = num_output_slots(args)
+    width = RANKS_PER_SERVER
+    folded: list[torch.Tensor] = [None] * len(staged_by_rank)
+    for base in range(0, args.R, width):
+        members = range(base, min(base + width, args.R))
+        canvas = torch.cat([staged_by_rank[r] for r in members]).to(torch.float32)
+        for local_index, r in enumerate(members):
+            _, groups, loffs, counts = plans[r][:4]
+            for gid in range(int(counts[0])):
+                primary, start, dup_n = map(int, groups[gid].tolist())
+                if primary < 0 or dup_n <= 0:
+                    continue
+                row = local_index * slots + primary
+                acc = canvas[row].clone()
+                for j in range(dup_n):
+                    address = int(loffs[start + j])
+                    if address < 0:
+                        continue
+                    acc += canvas[address - base * slots]
+                canvas[row] = acc
+        for index, r in enumerate(members):
+            folded[r] = canvas[index * slots:(index + 1) * slots]
+    return folded
+
+
 def combine_reference_all_ranks(args):
     """CPU golden: stage every rank, prologue, then gather for each rank."""
     slots = num_output_slots(args)
@@ -474,10 +572,17 @@ def combine_reference_all_ranks(args):
         dst, dup_groups, dup_loffs, dup_counts, expected = make_plan(args, rank)
         hidden = build_staged_hidden(args, expected)
         weights = build_staged_weights(args, expected)
-        hidden = apply_prologue_cpu(hidden, dup_groups, dup_loffs, dup_counts)
         staged.append(hidden)
         staged_w.append(weights)
         plans.append((dst, dup_groups, dup_loffs, dup_counts, expected))
+
+    if args.dedup_mode == "server":
+        staged = apply_prologue_cpu_server(staged, plans, args)
+    else:
+        staged = [
+            apply_prologue_cpu(staged[r], plans[r][1], plans[r][2], plans[r][3])
+            for r in range(args.R)
+        ]
 
     outputs = []
     outputs_sk = []
@@ -544,9 +649,9 @@ def run_rank(local_rank: int, args) -> None:
     os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["WORLD_SIZE"] = str(args.R)
     os.environ["ASCEND_MOONEP_SHMEM_IP_PORT"] = args.shmem_ip_port
-    os.environ["ASCEND_MOONEP_COMBINE_USE_UDMA"] = "1"
 
     import torch_npu
+    from kernel_test_utils import init_shmem
     from npu_patch._device import local_device_index
     from npu_patch import Buffer, MoonEPCommPlan, ShmemRuntime
 
@@ -555,6 +660,8 @@ def run_rank(local_rank: int, args) -> None:
     # UnboundLocalError.
     device_id = local_device_index(local_rank)
     torch.npu.set_device(device_id)
+    combine_udma = combine_udma_enabled(args)
+    os.environ["ASCEND_MOONEP_COMBINE_USE_UDMA"] = "1" if combine_udma else "0"
     buffer = None
     hidden_shared = None
     weights_shared = None
@@ -571,6 +678,15 @@ def run_rank(local_rank: int, args) -> None:
             B=args.B,
             explicitly_destroy=True,
             rank=rank,
+            # The dedup domain is fixed at construction. Server mode always uses
+            # the UDMA combine kernel: it consumes a planning-produced execution
+            # plan and the multi-GiB PUT workspace. Rank mode defaults to the
+            # historical legacy MTE kernel and can be switched to the frozen
+            # rank-level UDMA kernel (CombineUrma.compute_legacy) with
+            # --combine-engine udma.
+            dedup_mode=args.dedup_mode,
+            use_udma=combine_udma,
+            combine_use_udma=combine_udma,
         )
         if not ShmemRuntime.is_initialized():
             init_shmem(args=args, 
@@ -613,7 +729,13 @@ def run_rank(local_rank: int, args) -> None:
             K=args.K,
         )
 
-        buffer.prepare_combine_plan(plan)
+        # Server combine consumes a prepared execution plan; the rank-level
+        # combine kernel reads dst/dup_* directly and rejects a prepared plan.
+        if args.dedup_mode == "server":
+            buffer.prepare_combine_plan(plan)
+        # A delayed peer exposes reads that bypass input publication at entry.
+        if args.combine_entry_delay_ms and rank == args.R - 1:
+            time.sleep(args.combine_entry_delay_ms / 1000.0)
         output_sh, output_sk, done = buffer.combine(
             plan=plan,
             hidden_nvsh=hidden_input,
@@ -639,12 +761,17 @@ def run_rank(local_rank: int, args) -> None:
                 atol=0,
             ):
                 hidden_after = hidden_shared.cpu()
-                expected_local_hidden_after = apply_prologue_cpu(
-                    build_staged_hidden(args, expected),
-                    dup_groups,
-                    dup_loffs,
-                    dup_counts,
-                )
+                if args.dedup_mode == "server":
+                    # Server groups may span sibling ranks: a per-rank prologue
+                    # fold does not apply, so show the staged rows as-is.
+                    expected_local_hidden_after = build_staged_hidden(args, expected)
+                else:
+                    expected_local_hidden_after = apply_prologue_cpu(
+                        build_staged_hidden(args, expected),
+                        dup_groups,
+                        dup_loffs,
+                        dup_counts,
+                    )
                 actual_weights_diag = (
                     None if args.no_weights else output_sk.cpu()
                 )
@@ -732,18 +859,45 @@ def parse_args():
             "permutation"
         ),
     )
+    parser.add_argument("--dedup-mode", choices=("rank", "server"), default="rank",
+                        help="dedup domain fixed at Buffer construction: rank "
+                             "(default) or server (8 consecutive ranks). Server "
+                             "mode reuses the dispatch test's server tables and "
+                             "needs --plan-mode random|cyclic.")
+    parser.add_argument(
+        "--combine-engine", choices=("auto", "udma", "mte"), default="auto",
+        help="combine kernel family: auto (default) = UDMA for server dedup and "
+             "legacy MTE for rank dedup; udma also covers the frozen rank-level "
+             "UDMA kernel (compute_legacy) with rank tables; mte forces the MTE "
+             "kernel and is rank-only.")
     parser.add_argument("--R", type=int, default=8)
     parser.add_argument("--S", type=int, default=2)
     parser.add_argument("--K", type=int, default=2)
     parser.add_argument("--H", type=int, default=16)
     parser.add_argument("--E", type=int, default=4)
     parser.add_argument("--B", type=int, default=0)
+    parser.add_argument(
+        "--combine-entry-delay-ms", type=int, default=0,
+        help="Delay the last rank before Combine so a peer that is slow to "
+             "publish its inputs exposes reads that bypass the entry barrier "
+             "(regression check for the pre-barrier stream flush).",
+    )
     parser.add_argument("--no-weights", action="store_true")
+    parser.add_argument(
+        "--prod-shape",
+        action="store_true",
+        help="use the production 8-card shape: R=8, S=4096, K=16, H=7168, "
+             "E=896, B=112",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.prod_shape:
+        args.R, args.S, args.K, args.H, args.E = 8, 4096, 16, 7168, 896
+        if not args.B:
+            args.B = 112
     if not args.B:
         args.B = args.E // args.R
     validate_args(args)
@@ -753,9 +907,13 @@ def main():
     last_global_rank = global_rank_for_local(local_count - 1, args)
     print(
         f"MoonEPCombine Test: mode={args.mode}, "
+        f"dedup_mode={args.dedup_mode}, "
+        f"combine_engine={args.combine_engine}, "
         f"plan_mode={args.plan_mode}, seed={args.seed}, "
+        f"prod_shape={args.prod_shape}, "
         f"R={args.R}, S={args.S}, K={args.K}, H={args.H}, E={args.E}, "
         f"B={args.B}, slots={num_output_slots(args)}, with_weights={not args.no_weights}, "
+        f"combine_entry_delay_ms={args.combine_entry_delay_ms}, "
         f"node_rank={args.node_rank}, local_processes={local_count}, "
         f"global_ranks={first_global_rank}-{last_global_rank}",
         flush=True,

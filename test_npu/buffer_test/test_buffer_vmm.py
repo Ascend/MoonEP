@@ -38,6 +38,10 @@ from moonep.buffer import (
 )
 from npu_patch.planning import allocate_planning_outputs
 
+# The VMM cases below use tiny projections (Hp=1024 -> epn*row=2 MiB), so the
+# [E+B] projection needs 2 MiB VMM pages even if the caller exports 1g.
+os.environ.setdefault("ASCEND_MOONEP_VMM_PAGE_SIZE", "2m")
+
 
 def _expert_value(expert, H, Hp, dev, dtype=torch.bfloat16):
     gen = torch.Generator(device=dev).manual_seed(2026 + expert)
@@ -187,7 +191,7 @@ def test_vmm_reduce_grad_launch(dist_env, Hp, use_udma):
         # created together by create_full_grad_and_reduce_buffer (initialized from the zero table).
         # The case requires home grad content rank+i (rank-dependent, no rank-invariant table can express it), so
         # it is overwritten via the projection home segment after creation -- same physical memory as the home chunk.
-        # reduce_buffer (the [R,B,H,Hp] pre-init carrier) only carries the slot source VA; the
+        # reduce_buffer (the [R,epn,H,Hp] pre-init carrier) only carries the slot source VA; the
         # kernel does not dereference it.
         zero_grad = torch.zeros(E, H, Hp, dtype=torch.float32, device=dev)
         zero_reduce = torch.zeros(R, B, H, Hp, dtype=torch.float32, device=dev)
@@ -216,6 +220,56 @@ def test_vmm_reduce_grad_launch(dist_env, Hp, use_udma):
         release_owned(buffers=[buffer] if buffer is not None else [])
     if rank == 0:
         print(f"  [PASS] test_vmm_reduce_grad_launch: R={R}, E={E}, B={B}")
+
+
+def test_dedup_config_at_construction(dist_env):
+    """Dedup mode/server size are Buffer construction properties, not per-op args."""
+    rank, R = dist_env
+    epn, B, H = 2, 2, 512
+    E = R * epn
+    S, K = 32, 1
+    K_server = 2  # server dedup needs K >= 2 to exercise forwarding
+
+    try:
+        from npu_patch.api import _is_ascend950
+
+        device = int(torch.npu.current_device())
+        udma_ok = bool(_is_ascend950(
+            device, torch.npu.get_device_properties(device)))
+    except Exception:
+        udma_ok = False
+
+    buffer = None
+    server_buffer = None
+    try:
+        # Default: rank-level dedup, same as the local code path.
+        buffer = Buffer(S, H, K, E, R, B=B, num_sms=8, use_udma=True)
+        assert buffer.dedup_mode == "rank"
+        assert buffer.ranks_per_server == 8
+        # The multi-GiB symmetric PUT combine workspace is server-only.
+        assert buffer._require_ctx()["combine_workspace"].numel() == 0
+
+        # The server protocol is compiled for eight ranks/server; other sizes
+        # must fail before any VMM allocation happens.
+        with pytest.raises(NotImplementedError):
+            Buffer(S, H, K, E, R, B=B, num_sms=8, use_udma=True,
+                   dedup_mode="server", ranks_per_server=4)
+        with pytest.raises(ValueError):
+            Buffer(S, H, K, E, R, B=B, num_sms=8, use_udma=True,
+                   dedup_mode="bogus")
+
+        # Positive server case: a complete eight-rank domain constructs, and its
+        # PUT combine workspace is allocated so server combine can stage there.
+        if R % 8 == 0 and udma_ok:
+            server_buffer = Buffer(S, H, K_server, E, R, B=B, num_sms=8,
+                                   use_udma=True, dedup_mode="server")
+            assert server_buffer.dedup_mode == "server"
+            assert server_buffer.ranks_per_server == 8
+            assert server_buffer._require_ctx()["combine_workspace"].numel() > 0
+    finally:
+        release_owned(buffers=[b for b in (buffer, server_buffer) if b is not None])
+    if rank == 0:
+        print(f"  [PASS] test_dedup_config_at_construction: R={R}, E={E}")
 
 
 if __name__ == "__main__":

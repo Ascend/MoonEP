@@ -116,7 +116,8 @@ public:
         int64_t num_experts,
         int64_t num_sms,
         int64_t instance_id,
-        bool use_udma) {
+        bool use_udma,
+        bool rank_barriers) {
         TORCH_CHECK(num_experts == remote_expert.size(0),
                     "num_experts must equal remote_expert.shape[0]");
         return ascend_moonep::ops::LaunchPrefetch(
@@ -125,7 +126,8 @@ public:
             experts_to_copy,
             num_sms,
             instance_id,
-            use_udma);
+            use_udma,
+            rank_barriers);
     }
 };
 
@@ -173,15 +175,15 @@ public:
         int64_t symmetric_workspace_addr, int64_t symmetric_workspace_bytes,
         int64_t num_tokens, int64_t num_topk, int64_t num_experts,
         int64_t num_max_tokens_per_rank, int64_t num_prefetch_slots,
-        int64_t core_num, int64_t rank, int64_t world_size, bool use_udma,
-        torch::Tensor combine_workspace, int64_t hidden_size) {
+        int64_t core_num, int64_t rank, int64_t world_size, bool server_dedup,
+        bool use_udma, torch::Tensor combine_workspace, int64_t hidden_size) {
         TORCH_CHECK(rank == aclshmem_my_pe() && world_size == aclshmem_n_pes(),
                     "planning topology must match the active SHMEM runtime");
         return ascend_moonep::ops::Planning(topk_idx, dst, cu_seqlens, experts_to_copy,
             dup_groups, dup_loffs, dup_counts, local_workspace,
             symmetric_workspace_addr, symmetric_workspace_bytes,
             num_tokens, num_topk, num_experts, num_max_tokens_per_rank,
-            num_prefetch_slots, core_num, rank, world_size, use_udma,
+            num_prefetch_slots, core_num, rank, world_size, server_dedup, use_udma,
             combine_workspace, hidden_size);
     }
 
@@ -238,6 +240,7 @@ public:
         int64_t core_num,
         int64_t rank,
         int64_t world_size,
+        bool server_dedup,
         bool use_udma) {
         TORCH_CHECK(
             rank == aclshmem_my_pe(),
@@ -261,6 +264,7 @@ public:
             core_num,
             rank,
             world_size,
+            server_dedup,
             use_udma);
     }
 };
@@ -284,7 +288,8 @@ public:
         int64_t num_topk,
         int64_t world_size,
         int64_t rank,
-        bool use_udma) {
+        bool use_udma,
+        bool server_dedup) {
         TORCH_CHECK(
             rank == aclshmem_my_pe(),
             "rank does not match the active CANN-SHMEM PE");
@@ -303,7 +308,8 @@ public:
             num_topk,
             world_size,
             rank,
-            use_udma);
+            use_udma,
+            server_dedup);
     }
 
     void compute_profile(
@@ -322,7 +328,8 @@ public:
         int64_t num_topk,
         int64_t world_size,
         int64_t rank,
-        bool use_udma) {
+        bool use_udma,
+        bool server_dedup) {
         TORCH_CHECK(
             rank == aclshmem_my_pe(),
             "rank does not match the active CANN-SHMEM PE");
@@ -342,7 +349,8 @@ public:
             num_topk,
             world_size,
             rank,
-            use_udma);
+            use_udma,
+            server_dedup);
     }
 };
 
@@ -386,6 +394,32 @@ public:
     }
 };
 
+// Rank-local gather workspace of the legacy rank-level dedup combine. Mirrors
+// the frozen kernel ABI: NvS*H bf16 payload, one fp32 weight region per source
+// rank, then the bandwidth-diagnostics tail.
+static std::size_t LegacyRankCombineWorkspaceBytes(
+    int64_t S, int64_t H, int64_t K, int64_t R) {
+    constexpr uint64_t kBandwidthScratchAlign = 64;
+    constexpr uint64_t kBandwidthScratchBytes = uint64_t{32} * 8 * sizeof(int64_t);
+    TORCH_CHECK(S > 0 && H > 0 && K > 0 && R > 0,
+                "legacy UDMA combine workspace requires S/H/K/R > 0");
+    const uint64_t slots = static_cast<uint64_t>(S) * static_cast<uint64_t>(K);
+    const uint64_t hidden_bytes =
+        slots * static_cast<uint64_t>(H) * sizeof(c10::BFloat16);
+    const uint64_t weight_bytes =
+        static_cast<uint64_t>(R) * slots * sizeof(float);
+    uint64_t bytes = hidden_bytes + weight_bytes;
+    TORCH_CHECK(bytes <= std::numeric_limits<uint64_t>::max() - (kBandwidthScratchAlign - 1),
+                "legacy UDMA combine workspace alignment overflows uint64_t");
+    bytes = (bytes + kBandwidthScratchAlign - 1) & ~(kBandwidthScratchAlign - 1);
+    TORCH_CHECK(bytes <= std::numeric_limits<uint64_t>::max() - kBandwidthScratchBytes,
+                "legacy UDMA combine bandwidth scratch size overflows uint64_t");
+    bytes += kBandwidthScratchBytes;
+    TORCH_CHECK(bytes <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+                "legacy UDMA combine workspace size overflows int64_t");
+    return static_cast<std::size_t>(bytes);
+}
+
 // Buffer-facing UDMA combine. Inputs and gather workspace are symmetric tensors
 // owned by Buffer; this custom class is intentionally stateless.
 class CombineUrma : public torch::jit::CustomClassHolder {
@@ -393,7 +427,58 @@ public:
     CombineUrma() = default;
     ~CombineUrma() override = default;
 
-    void destroy() {}
+    void destroy() {
+        if (legacy_workspace_.defined()) {
+            SynchronizeCurrentNpuStream();
+            legacy_workspace_ = torch::Tensor();
+        }
+    }
+
+    // Legacy rank-level dedup combine. The frozen kernel keeps its gather
+    // staging and bandwidth diagnostics in one rank-local workspace, so this
+    // class caches it instead of using the Buffer's symmetric PUT workspace.
+    void compute_legacy(
+        torch::Tensor hidden_nvsh,
+        c10::optional<torch::Tensor> route_weights_nvs,
+        torch::Tensor sync_buffer,
+        torch::Tensor dst,
+        torch::Tensor dup_groups,
+        torch::Tensor dup_loffs,
+        torch::Tensor dup_counts,
+        torch::Tensor output_sh,
+        c10::optional<torch::Tensor> output_sk,
+        int64_t S,
+        int64_t H,
+        int64_t K,
+        int64_t R,
+        int64_t rank) {
+        TORCH_CHECK(
+            rank == aclshmem_my_pe(),
+            "rank does not match the active CANN-SHMEM PE");
+        TORCH_CHECK(
+            R == aclshmem_n_pes(),
+            "world size does not match the active CANN-SHMEM runtime");
+        const std::size_t workspace_bytes =
+            LegacyRankCombineWorkspaceBytes(S, H, K, R);
+        const bool replace_workspace =
+            !legacy_workspace_.defined() ||
+            legacy_workspace_.device() != hidden_nvsh.device() ||
+            static_cast<std::size_t>(legacy_workspace_.numel()) < workspace_bytes;
+        if (replace_workspace) {
+            if (legacy_workspace_.defined()) {
+                SynchronizeCurrentNpuStream();
+            }
+            legacy_workspace_ = torch::empty(
+                {static_cast<int64_t>(workspace_bytes)},
+                torch::TensorOptions()
+                    .device(hidden_nvsh.device())
+                    .dtype(torch::kUInt8));
+        }
+        ascend_moonep::ops::MoonEPUdmaCombineLegacy(
+            hidden_nvsh, route_weights_nvs, sync_buffer, dst,
+            dup_groups, dup_loffs, dup_counts, output_sh, output_sk,
+            S, H, K, R, rank, legacy_workspace_);
+    }
 
     void compute_prepared(
         torch::Tensor hidden, c10::optional<torch::Tensor> weights,
@@ -471,6 +556,8 @@ private:
             rank,
             combine_workspace);
     }
+
+    torch::Tensor legacy_workspace_;
 };
 
 }  // namespace ascend_moonep::torch_classes
@@ -524,6 +611,7 @@ static auto combine_urma_registry =
     torch::jit::class_<ascend_moonep::torch_classes::CombineUrma>("AscendMoonEP", "CombineUrma")
         .def(torch::jit::init<>())
         .def("compute_prepared", &ascend_moonep::torch_classes::CombineUrma::compute_prepared)
+        .def("compute_legacy", &ascend_moonep::torch_classes::CombineUrma::compute_legacy)
 
         .def("compute", &ascend_moonep::torch_classes::CombineUrma::compute)
         .def("destroy", &ascend_moonep::torch_classes::CombineUrma::destroy);

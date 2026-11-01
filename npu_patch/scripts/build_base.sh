@@ -10,6 +10,7 @@
 #   2. git submodule update --init --recursive (cann/shmem, catlass)
 #   3. build cann/shmem for the SoC -> npu_patch/3rdparty/shmem/install
 #   4. cmake -S npu_patch/native -B <build dir> -> ascend_moonep_kernels
+#      and ascend_moonep_kernels_server_dedup (both kernel libraries)
 #   5. stage the kernel + shmem .so into npu_patch/lib
 #   6. pip install -e . (compiles the npu_patch._C NPU extension)
 #
@@ -167,10 +168,17 @@ if [[ -n "${ASCEND_MOONEP_RUNTIME_INCLUDE_DIR:-}" ]]; then
     CMAKE_ARGS+=(-DASCEND_MOONEP_RUNTIME_INCLUDE_DIR="${ASCEND_MOONEP_RUNTIME_INCLUDE_DIR}")
 fi
 cmake "${CMAKE_ARGS[@]}"
-cmake --build "${BUILD_DIR}" --target ascend_moonep_kernels --parallel
+cmake --build "${BUILD_DIR}" --target ascend_moonep_kernels \
+    ascend_moonep_kernels_server_dedup --parallel
 
 mkdir -p "${LIB_TARGET}"
-cp "${BUILD_DIR}/lib/libascend_moonep_kernels.so" "${LIB_TARGET}/"
+# Both kernel libraries are required: setup.py links the rank-level and the
+# server-dedup symbols from separate .so files (their headers/collide rules
+# differ, so they cannot share one unity build).
+for kernel_lib in libascend_moonep_kernels.so \
+                  libascend_moonep_kernels_server_dedup.so; do
+    cp "${BUILD_DIR}/lib/${kernel_lib}" "${LIB_TARGET}/"
+done
 find "${SHMEM_HOME_PATH}/shmem/lib" \
     -maxdepth 1 \( -type f -o -type l \) \( -name "*.so" -o -name "*.so.*" \) \
     -exec cp -P {} "${LIB_TARGET}/" \;
@@ -187,4 +195,5 @@ python -m pip install -e . --no-build-isolation --no-deps
 popd >/dev/null
 
 echo "[INFO] Build completed."
-echo "[INFO] Kernel library: ${LIB_TARGET}/libascend_moonep_kernels.so"
+echo "[INFO] Kernel libraries: ${LIB_TARGET}/libascend_moonep_kernels.so"
+echo "[INFO]                   ${LIB_TARGET}/libascend_moonep_kernels_server_dedup.so"

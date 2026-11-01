@@ -34,7 +34,8 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
-from _bench_common import add_engine_args, apply_engine, setup
+from _bench_common import (add_common_bench_arg, add_ip_port_arg,
+                           apply_engine, setup)
 from npu_patch import ShmemRuntime
 from npu_patch._C import launch_device_barrier_bench
 from npu_patch.buffer_c import (
@@ -46,19 +47,12 @@ from npu_patch.shmem_runtime import default_shmem_ip_port
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    add_engine_args(parser)
-    parser.add_argument("--iters", type=int, default=100,
-                        help="Device barriers in one timed kernel.")
-    parser.add_argument("--warmup", type=int, default=10,
-                        help="Device barriers in the untimed warmup kernel.")
+    add_common_bench_arg(parser, warmup=10, iters=100)
     parser.add_argument("--samples", type=int, default=5,
                         help="Number of independently timed kernels.")
     parser.add_argument("--block-dim", type=int, default=32,
                         help="AIV block count; use 32 to match planning.")
-    parser.add_argument("--ip-port", default=None,
-                        help="Multi-node SHMEM bootstrap, for example "
-                             "tcp://10.0.0.1:29501. Defaults to "
-                             "MASTER_ADDR:(MASTER_PORT+1) on multi-node runs.")
+    add_ip_port_arg(parser)
     return parser.parse_args()
 
 
@@ -92,7 +86,7 @@ def main():
     # SHMEM owns and uses its internal synchronization pool.
     backing, _, _ = create_vmm_physical(
         [4096], torch.uint8,
-        torch.npu.current_device())
+        torch.npu.current_device(), page_size=args.vmm_page_size)
 
     try:
         ShmemRuntime.init_with_buffer(group=None, ip_port=ip_port,

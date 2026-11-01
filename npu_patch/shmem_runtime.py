@@ -24,6 +24,7 @@ mixed (do not mix).
 from __future__ import annotations
 
 import os
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -43,10 +44,114 @@ from ._C import acl_shmem_barrier_all, acl_shmem_get_unique_id
 from .runtime_audit import audit_loaded_shmem_library
 
 
+# ---------------------------------------------------------------------------
+# Dedup domain flags.
+#
+# The Buffer's dedup domain is fixed at construction (``dedup_mode``), but the
+# shmem bootstrap runs later, after every Buffer (and every framework-side VMM
+# chunk) exists, and it holds no Buffer handle. ``_create_context`` therefore
+# publishes the choice as two process environment variables -- the mode plus its
+# boolean flag -- and the bootstrap reads it back. A manually exported pair is
+# honoured identically, which lets a launcher configure the domain outside
+# Python without passing ``dedup_mode`` through every layer.
+# ---------------------------------------------------------------------------
+DEDUP_MODE_ENV = "ASCEND_MOONEP_DEDUP_MODE"
+SERVER_DEDUP_ENV = "ASCEND_MOONEP_SERVER_DEDUP"
+DEDUP_MODES = ("rank", "server")
+
+# UDMA QP count per peer pair when the caller does not configure one.
+DEFAULT_QP_COUNT = 2
+# The server-level dedup kernels map chunks onto two active QPs per peer pair
+# (``GetChunkQpSlot``); any other count desynchronises dispatch/combine.
+SERVER_DEDUP_QP_COUNT = 2
+
+_TRUE_VALUES = ("1", "true", "yes", "on")
+_FALSE_VALUES = ("0", "false", "no", "off")
+
+
+def publish_dedup_env(dedup_mode: str) -> None:
+    """Publish a Buffer's dedup domain for the later shmem bootstrap.
+
+    Writes ``ASCEND_MOONEP_DEDUP_MODE`` (``rank`` / ``server``) and
+    ``ASCEND_MOONEP_SERVER_DEDUP`` (``1`` / ``0``) so that
+    ``ShmemRuntime.init_with_buffer`` / ``init_with_ip_port`` -- and any child
+    process or launcher inspecting the environment -- can tell which dedup
+    domain this process uses without holding the Buffer.
+    """
+    mode = str(dedup_mode).strip().lower()
+    if mode not in DEDUP_MODES:
+        raise ValueError(
+            f"dedup_mode must be 'rank' or 'server', got {dedup_mode!r}")
+    os.environ[DEDUP_MODE_ENV] = mode
+    os.environ[SERVER_DEDUP_ENV] = "1" if mode == "server" else "0"
+
+
+def server_dedup_enabled() -> bool:
+    """Whether this process runs the server-level dedup domain.
+
+    The boolean flag wins when it is explicitly set (it is the flag a launcher
+    toggles on its own); otherwise the published mode decides. Anything
+    unrecognised is treated as rank-level dedup, the process default.
+    """
+    raw = os.environ.get(SERVER_DEDUP_ENV, "").strip().lower()
+    if raw in _TRUE_VALUES:
+        return True
+    if raw in _FALSE_VALUES:
+        return False
+    return os.environ.get(DEDUP_MODE_ENV, "").strip().lower() == "server"
+
+
+def resolve_qp_count(enable_udma: bool, qp_count: int = 0) -> int:
+    """Resolve the per-peer UDMA QP count of a bootstrap call.
+
+    ``qp_count=0`` means "not configured": fall back to
+    ``ASCEND_MOONEP_QP_COUNT`` and then to :data:`DEFAULT_QP_COUNT`. QP
+    configuration only exists on the UDMA path, so a non-UDMA bootstrap is left
+    untouched.
+
+    Server-level dedup only supports two QPs per peer pair, so a caller that
+    configured anything else is overridden with a warning rather than failing
+    the collective: the requested count is a performance knob, while the
+    server kernels are only correct at two.
+    """
+    if not enable_udma:
+        return qp_count
+    if not qp_count:
+        qp_count = _env_qp_count() or DEFAULT_QP_COUNT
+    if server_dedup_enabled() and qp_count != SERVER_DEDUP_QP_COUNT:
+        warnings.warn(
+            "server-level dedup only supports "
+            f"qp_count={SERVER_DEDUP_QP_COUNT} (got {qp_count} from "
+            "qp_count/ASCEND_MOONEP_QP_COUNT); forcing "
+            f"qp_count={SERVER_DEDUP_QP_COUNT}",
+            stacklevel=2,
+        )
+        qp_count = SERVER_DEDUP_QP_COUNT
+    return qp_count
+
+
 def _env_udma_enabled() -> bool:
     return os.environ.get("ASCEND_MOONEP_USE_UDMA", "0").strip().lower() in (
         "1", "true", "yes", "on"
     )
+
+
+def _env_qp_count() -> int:
+    """UDMA QP count per peer pair (``ASCEND_MOONEP_QP_COUNT``, default 2).
+
+    Each QP is one more URMA connection created during shmem_init: at 64 ranks
+    that is 63 * qp_count connections per rank, so lowering it to 1 shortens
+    init noticeably at the cost of some UDMA bandwidth. Under server-level dedup
+    the value is ignored: :func:`resolve_qp_count` forces 2 with a warning.
+    """
+    raw = os.environ.get("ASCEND_MOONEP_QP_COUNT", "").strip()
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    return value if value > 0 else 0
 
 
 def default_shmem_ip_port(master_addr: str, master_port: int) -> str:
@@ -155,6 +260,12 @@ class ShmemRuntime:
         (``buffer_c.symmetric_descriptors()``, populated by ``Buffer`` /
         ``create_vmm_physical`` at construction). Must run AFTER every Buffer is
         constructed and BEFORE the first dispatch/combine/prefetch/reduce_grad.
+
+        ``qp_count`` is the per-peer UDMA QP count (``0`` = unset, resolved from
+        ``ASCEND_MOONEP_QP_COUNT`` else 2). When the Buffer construction
+        published the server-level dedup domain
+        (``ASCEND_MOONEP_SERVER_DEDUP=1``), a non-2 value is overridden with a
+        warning: the server dedup kernels only support two QPs.
         """
         if cls._poisoned:
             raise RuntimeError(
@@ -164,8 +275,9 @@ class ShmemRuntime:
             enable_udma = _env_udma_enabled()
         if cls._initialized:
             return
-        if enable_udma and not qp_count:
-            qp_count = 2
+        # Server-level dedup only supports two QPs per peer pair; the domain is
+        # read from the flags published at Buffer construction.
+        qp_count = resolve_qp_count(enable_udma, qp_count)
         if ip_port is not None:
             cls.init_with_ip_port(group=group, descriptors=descriptors,
                                   tail_bytes=tail_bytes, ip_port=ip_port,
@@ -240,6 +352,10 @@ class ShmemRuntime:
         omit it. ``descriptors`` defaults to the process-wide registered VMM
         allocations (``buffer_c.symmetric_descriptors()``). Timing is the
         same as ``init_with_buffer``.
+
+        ``qp_count`` follows the same policy as ``init_with_buffer``: the
+        per-peer UDMA QP count, forced to 2 with a warning when the process
+        published the server-level dedup domain.
         """
         if cls._poisoned:
             raise RuntimeError(
@@ -276,8 +392,7 @@ class ShmemRuntime:
                 )
         if descriptors is None:
             descriptors = symmetric_descriptors()
-        if enable_udma and not qp_count:
-            qp_count = 2
+        qp_count = resolve_qp_count(enable_udma, qp_count)
         shmem_init_with_ip_port(
             int(rank), int(world_size), ip_port, descriptors,
             tail_bytes=int(tail_bytes),

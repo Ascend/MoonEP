@@ -15,7 +15,9 @@ seam). Both return ``{status: "ok", us}``.
 import argparse
 import math
 import os
+import socket
 import sys
+import time
 
 import torch
 import torch_npu
@@ -47,16 +49,55 @@ PROD_HP = 3072
 PROD_B = 112
 
 
+def _emit(prefix: str, stage: str, msg: str) -> None:
+    """One timestamped line from **this rank**, with host / global / local rank."""
+    now = time.time()
+    stamp = "%s.%03d" % (time.strftime("%H:%M:%S", time.localtime(now)),
+                         int(now % 1 * 1000))
+    tag = "%s rank %s/%s lrank %s" % (
+        os.environ.get("HOSTNAME") or socket.gethostname(),
+        os.environ.get("RANK", "?"),
+        os.environ.get("WORLD_SIZE", "?"),
+        os.environ.get("LOCAL_RANK", "?"),
+    )
+    print("[%s][%s][%s][%s] %s" % (prefix, stamp, tag, stage, msg), flush=True)
+
+
+def log_init(stage: str, msg: str) -> None:
+    """Emit one initialization progress line **from every rank**.
+
+    A 64-rank run spends most of its start-up in two places that can both hang
+    without saying anything: the HCCL process group (cross-node link setup) and
+    the shmem symmetric heap (UID/ip_port bootstrap + descriptor exchange).
+    Printing start/done per rank turns "is it stuck or just slow?" into a
+    per-node timestamp comparison, and a rank that never prints ``done`` is
+    immediately identifiable.
+
+    The tag carries wall-clock time, host, global/local rank and world size, so
+    logs collected per node (``logs/node<i>.log``) can be correlated directly.
+    """
+    _emit("init", stage, msg)
+
+
 def setup():
     """torchrun-style distributed init over HCCL (Ascend)."""
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = local_device_index(local_rank)
     torch.npu.set_device(device)
+    log_init(
+        "hccl",
+        "init start: backend=hccl master=%s:%s device=npu:%s"
+        % (os.environ.get("MASTER_ADDR", "?"),
+           os.environ.get("MASTER_PORT", "?"), device),
+    )
+    _t0 = time.time()
     dist.init_process_group(
         backend="hccl", device_id=torch.device(f"npu:{device}")
     )
+    _dt = time.time() - _t0
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+    log_init("hccl", "init done in %.2fs: rank=%d world_size=%d" % (_dt, rank, world_size))
     return rank, world_size, local_rank
 
 
@@ -211,6 +252,18 @@ def add_engine_args(parser: argparse.ArgumentParser) -> None:
              "urma = UDMA/URMA path (A5/Ascend950 only).")
 
 
+def add_vmm_page_size_arg(parser: argparse.ArgumentParser) -> None:
+    """Add the shared ``--vmm-page-size`` switch for VMM chunk allocation."""
+    parser.add_argument(
+        "--vmm-page-size", choices=("default", "1g", "2m"), default="default",
+        help="Huge-page policy of the benchmark's VMM chunks and the Buffer's "
+             "MoonEP dispatch/combine chunks: 'default' follows the process "
+             "default (ASCEND_MOONEP_VMM_PAGE_SIZE, else 2m; a server-dedup "
+             "Buffer defaults to 1g); '1g'/'2m' override it. ACL rounds every "
+             "allocation up to the page granularity. Framework parameters have "
+             "their own scope (ASCEND_MOONEP_FRAMEWORK_VMM_PAGE_SIZE).")
+
+
 def _urma_supported() -> bool:
     """UDMA capability probe reusing the library's own check (api._is_ascend950)."""
     from npu_patch.api import _is_ascend950
@@ -245,13 +298,115 @@ def apply_engine(engine: str) -> bool:
     return want
 
 
+def add_out_arg(parser: argparse.ArgumentParser, *, default=None) -> None:
+    """Add ``--out`` (CSV path); each benchmark passes its own filename."""
+    help_text = ("CSV output path on rank 0 (default: %(default)s)."
+                 if default is not None else "CSV output path on rank 0.")
+    parser.add_argument("--out", default=default, help=help_text)
+
+
+def add_plot_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--plot", default=None,
+                        help="Optional result figure path (rank 0 only).")
+
+
+def add_maxvios_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--maxvios", default="0.2,1,10,20",
+                        help="Comma-separated target MaxVio values; the lognormal "
+                             "sigma is reverse-solved for each "
+                             "(default: %(default)s)")
+
+
+def add_ip_port_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--ip-port", default=None,
+                        help="shmem DEFAULT-bootstrap ip_port URL for the "
+                             "buffer-backed shmem init (\"tcp://<rank0_ip>:<port>\" "
+                             "or \"tcp6://[ipv6]:<port>\"). Required for multi-node; "
+                             "when omitted in a multi-node launch it is derived "
+                             "from MASTER_ADDR/MASTER_PORT (port + 1). Single-node "
+                             "launches keep the UID bootstrap and ignore this.")
+
+
+def add_shape_args(parser: argparse.ArgumentParser, *, experts, hidden, topk,
+                   tokens=None, hp=None) -> None:
+    """Fixed-default model-shape args for the sweep benchmarks.
+
+    ``tokens`` / ``hp`` are added only when their default is not None: the
+    dispatch/combine sweeps have no --hp and bench_vs has no --tokens.
+    """
+    if tokens is not None:
+        parser.add_argument("--tokens", type=int, default=tokens)
+    parser.add_argument("--experts", type=int, default=experts)
+    parser.add_argument("--hidden", type=int, default=hidden)
+    parser.add_argument("--topk", type=int, default=topk)
+    if hp is not None:
+        parser.add_argument("--hp", type=int, default=hp,
+                            help="Expert weight inner dim H' (MoE intermediate "
+                                 "size) for the MoonEP prefetch op "
+                                 "(default: %(default)s)")
+
+
+def add_warmup_iters_args(parser: argparse.ArgumentParser, *,
+                          warmup: int, iters: int) -> None:
+    parser.add_argument("--warmup", type=int, default=warmup,
+                        help="Warmup iterations before timing.")
+    parser.add_argument("--iters", type=int, default=iters,
+                        help="Timed iterations.")
+
+
+def add_num_sms_arg(parser: argparse.ArgumentParser, *,
+                    default: int | None = None) -> None:
+    """--num-sms; op benches pass default=None (device max)."""
+    parser.add_argument("--num-sms", type=int, default=default,
+                        help="SM count for the op launches (None: device max).")
+
+
+def add_cudagraph_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--no-cudagraph", dest="cudagraph", action="store_false",
+                        help="Use the eager timing loop instead of CUDA-graph "
+                             "capture (CUDA-graph removes per-launch host "
+                             "overhead).")
+    parser.set_defaults(cudagraph=True)
+
+
+def add_dedup_mode_arg(parser: argparse.ArgumentParser, *,
+                       default: str = "rank") -> None:
+    parser.add_argument("--dedup-mode", choices=("rank", "server"),
+                        default=default,
+                        help="Dedup domain, fixed at Buffer construction: rank "
+                             "(default: one destination rank per domain) or "
+                             "server (8 consecutive ranks). Server mode requires "
+                             "the effective URMA engine, ep %% 8 == 0 and K >= 2, "
+                             "and allocates the multi-GiB PUT combine workspace.")
+
+
+def add_no_dist_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--no-dist", action="store_true",
+                        help="Use torchrun only as a process launcher; SHMEM "
+                             "bootstrap and statistics bypass torch.distributed.")
+
+
+def add_no_weights_arg(parser: argparse.ArgumentParser, *, op: str) -> None:
+    parser.add_argument("--no-weights", action="store_true",
+                        help=f"Benchmark hidden-only {op} (skip the per-token "
+                             "weights).")
+
+
+def add_common_bench_arg(parser: argparse.ArgumentParser, *,
+                         warmup: int = 20, iters: int = 50) -> None:
+    """--engine / --vmm-page-size / --warmup / --iters, present in every
+    benchmark. bench_combine_udma_maxvio is the exception: its --engine is
+    restricted to urma, so it assembles the rest from the pieces.
+    """
+    add_engine_args(parser)
+    add_vmm_page_size_arg(parser)
+    add_warmup_iters_args(parser, warmup=warmup, iters=iters)
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     """Arguments shared by all benchmarks."""
-    add_engine_args(parser)
-    parser.add_argument("--warmup", type=int, default=5, help="Warmup iterations per flow.")
-    parser.add_argument("--iters", type=int, default=20, help="Timed iterations per flow.")
-    parser.add_argument("--num-sms", type=int, default=None,
-                        help="SM count for the op launches (default: device max).")
+    add_common_bench_arg(parser, warmup=5, iters=20)
+    add_num_sms_arg(parser)
     parser.add_argument("--ep-size", type=int, default=None,
                         help="EP group size (default: world size = launched ranks). "
                              "Must be <= world size; only ranks [0, ep) run the bench.")
@@ -259,8 +414,5 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
                         help="Treat op-seam NotImplementedError as a failure instead "
                              "of reporting the flow as stub (use once kernels land).")
     parser.set_defaults(allow_stub=True)
-    parser.add_argument("--no-cudagraph", dest="cudagraph", action="store_false",
-                        help="Use the eager timing loop instead of CUDA-graph capture "
-                             "(CUDA-graph removes per-launch host overhead).")
-    parser.set_defaults(cudagraph=True)
-    parser.add_argument("--out", default=None, help="Output CSV path (rank 0 only).")
+    add_cudagraph_arg(parser)
+    add_out_arg(parser)

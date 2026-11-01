@@ -13,10 +13,20 @@ intra-server relay is reported separately. --check validates nonzero data before
 timing. Only end-to-end latency and payload bandwidth are measured; the combine
 kernel does not collect per-core profiling counters or timeline events.
 
+``--dedup-mode {server,rank}`` selects the combine kernel family. ``server``
+(default) is the PUT kernel with 8 consecutive ranks per domain, the symmetric
+combine workspace and a planning-produced execution plan; ``rank`` is the frozen
+rank-level UDMA kernel (``CombineUrma.compute_legacy``) with rank tables and no
+execution plan, so the two domains are directly comparable on the same sweep.
+
 Examples:
 
     # One node, 8 ranks
     torchrun --nproc-per-node=8 benchmarks/bench_combine_udma_maxvio.py
+
+    # Rank-level dedup on the same sweep
+    torchrun --nproc-per-node=8 benchmarks/bench_combine_udma_maxvio.py \
+        --dedup-mode rank
 
     # Two nodes, 8 ranks per node (run on both nodes with NODE_RANK=0/1)
     MASTER_ADDR=192.168.1.10 NODES=2 NODE_RANK=0 \
@@ -38,14 +48,20 @@ import torch
 import torch_npu  # noqa: F401
 import torch.distributed as dist
 
-from _bench_common import generate_topk_routing, setup
+from _bench_common import (add_dedup_mode_arg, add_ip_port_arg,
+                           add_maxvios_arg, add_no_dist_arg,
+                           add_no_weights_arg, add_num_sms_arg, add_out_arg,
+                           add_plot_arg, add_shape_args, add_vmm_page_size_arg,
+                           add_warmup_iters_args, generate_topk_routing,
+                           setup)
 from bench_dispatch_maxvio import TcpStoreStats, setup_no_dist
 
 from npu_patch import Buffer, ShmemRuntime
 from npu_patch.combine import COMBINE_PUT_CORES, combine_put_roles
 from npu_patch.buffer_c import reset_symmetric_descriptors
 from npu_patch._device import local_device_index
-from npu_patch.shmem_runtime import default_shmem_ip_port
+from npu_patch.shmem_runtime import (default_shmem_ip_port,
+                                   resolve_qp_count)
 from npu_patch.launchers import (
     launch_combine,
     launch_planning,
@@ -616,7 +632,8 @@ class CombineUdmaRunner:
     """Own the Buffer, plan, symmetric inputs, and fixed combine outputs."""
 
     def __init__(self, group, R, S, K, E, H, num_sms, local_rank, with_weights,
-                 rank=None, stats=None):
+                 rank=None, stats=None, dedup_mode='server',
+                 vmm_page_size='default'):
         self.group = group
         self.rank = rank if rank is not None else dist.get_rank(group=group)
         self.stats = stats
@@ -625,6 +642,7 @@ class CombineUdmaRunner:
         self.K = K
         self.H = H
         self.with_weights = with_weights
+        self.dedup_mode = dedup_mode
         self.execution_plan = None
         self.execution_plan_prepare_us = 0.0
         self.buffer = Buffer(
@@ -636,15 +654,19 @@ class CombineUdmaRunner:
             num_sms=num_sms,
             group=group,
             explicitly_destroy=True,
+            # Combine-only UDMA: the MTE dispatch path is never used here, and
+            # only the server domain allocates the multi-GiB PUT workspace.
             use_udma=False,
             combine_use_udma=True,
             rank=rank,
+            dedup_mode=dedup_mode,
+            vmm_page_size=vmm_page_size,
         )
         self.ctx = self.buffer._require_ctx()
         # Instrument only this benchmark; normal PlanningOp callers need not
         # pay for extra events. No device synchronize is inserted between stages.
         self.ctx['_planning_timing_enabled'] = True
-        self.plan, self.cu_seqlens = allocate_planning_outputs(self.ctx, dedup_mode='server')
+        self.plan, self.cu_seqlens = allocate_planning_outputs(self.ctx)
         dev = torch.device(f"npu:{local_rank}")
         self.output_sh = torch.empty(
             (S, H), dtype=torch.bfloat16, device=dev
@@ -681,6 +703,21 @@ class CombineUdmaRunner:
         ShmemRuntime.barrier(group=self.group)
 
     def prepare_execution_plan(self):
+        if self.dedup_mode == "rank":
+            # Rank-level dedup has no execution plan: the frozen rank combine
+            # kernel (CombineUrma.compute_legacy) reads dst/dup_* directly, and
+            # the PUT workspace is not allocated at all.
+            self.execution_plan = None
+            self.execution_plan_prepare_us = 0.0
+            summary = {'_method': 'npu_event_stream_interval_single_preparation'}
+            for stage in STAGES:
+                summary[stage] = None
+            self.planning_timing_summary = summary
+            if self.rank == 0:
+                print("[combine prepare] rank dedup: no execution plan "
+                      "(legacy UDMA kernel); excluded from combine timing",
+                      flush=True)
+            return
         # Real routing already produced the plan in PlanningOp. Only synthetic
         # cyclic routes need the planning substage explicitly after manual writes.
         self.execution_plan = self.plan.combine_execution_plan
@@ -810,55 +847,31 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--engine', choices=('urma',), default='urma',
                         help='PUT combine benchmark requires Ascend950 UDMA/URMA')
-    parser.add_argument(
-        "--out",
-        default="bench_combine_udma_maxvio_results.csv",
-        help="CSV output path on rank 0 (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--plot", default=None, help="Optional latency figure path on rank 0"
-    )
-    parser.add_argument(
-        "--maxvios",
-        default="0.2,1,10,20",
-        help="Comma-separated target MaxVio values (default: %(default)s)",
-    )
+    add_vmm_page_size_arg(parser)
+    add_warmup_iters_args(parser, warmup=20, iters=50)
+    add_out_arg(parser, default="bench_combine_udma_maxvio_results.csv")
+    add_plot_arg(parser)
+    add_maxvios_arg(parser)
     parser.add_argument(
         "--plan-mode",
         choices=("maxvio", "cyclic"),
         default="maxvio",
         help="sigma-based MaxVio sweep or cyclic correctness-test plan",
     )
-    parser.add_argument("--tokens", type=int, default=8192)
-    parser.add_argument("--experts", type=int, default=384)
-    parser.add_argument("--hidden", type=int, default=7168)
-    parser.add_argument("--topk", type=int, default=8)
-    parser.add_argument("--num-sms", type=int, default=32)
+    add_shape_args(parser, tokens=8192, experts=384, hidden=7168, topk=8)
+    add_dedup_mode_arg(parser, default="server")
+    add_num_sms_arg(parser, default=32)
     parser.add_argument(
         "--active-qp-count",
         type=int,
         default=DEFAULT_ACTIVE_QP_COUNT,
         help="Hot UDMA QP count (default: %(default)s)",
     )
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--check", action="store_true",
                         help="Check nonzero hidden, all weights, 3 epochs before timing")
-    parser.add_argument(
-        "--no-weights",
-        action="store_true",
-        help="Benchmark hidden-only combine",
-    )
-    parser.add_argument(
-        "--ip-port",
-        default=None,
-        help=(
-            "SHMEM DEFAULT-bootstrap endpoint. Multi-node runs derive it from "
-            "MASTER_ADDR and MASTER_PORT (+1) when omitted"
-        ),
-    )
-    parser.add_argument('--no-dist', action='store_true',
-                        help='Use torchrun only as a launcher; SHMEM bootstrap and CPU TCPStore statistics')
+    add_no_weights_arg(parser, op="combine")
+    add_ip_port_arg(parser)
+    add_no_dist_arg(parser)
     args = parser.parse_args()
     if args.warmup < 0:
         parser.error("--warmup must be >= 0")
@@ -887,6 +900,14 @@ def main():
     targets = [float(value) for value in args.maxvios.split(",")]
     if args.plan_mode == "cyclic":
         targets = [0.0]
+    if args.dedup_mode == "server":
+        # Server dedup groups a complete eight-rank board and routes same-server
+        # duplicates through the PUT kernel; K >= 2 exercises the forwarding path.
+        if R % 8 != 0:
+            parser.error(
+                f"--dedup-mode server requires world size divisible by 8, got {R}")
+        if K < 2:
+            parser.error("--dedup-mode server requires K >= 2")
 
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
     multi_node = world_size > local_world_size
@@ -901,8 +922,19 @@ def main():
         local_rank,
         with_weights=not args.no_weights,
         rank=rank if args.no_dist else None,
+        dedup_mode=args.dedup_mode,
+        vmm_page_size=args.vmm_page_size,
     )
     qp_count = created_qp_count(args.active_qp_count)
+    if not ShmemRuntime.is_initialized():
+        # Server-level dedup only supports two active QPs per peer pair: the
+        # shmem bootstrap clamps a configured 4/6 (and warns). The device
+        # derives active_qp_count from the created count, so report the value
+        # that is actually in effect.
+        resolved_qp_count = resolve_qp_count(True, qp_count)
+        if resolved_qp_count != qp_count:
+            qp_count = resolved_qp_count
+            args.active_qp_count = qp_count
     if not ShmemRuntime.is_initialized():
         if args.no_dist:
             ip_port = args.ip_port or default_shmem_ip_port(
@@ -933,6 +965,7 @@ def main():
     if rank == 0:
         print(
             f"moonep-udma combine bench: ep={R} S={S} E={E} H={H} K={K} "
+            f"dedup={args.dedup_mode} "
             f"qp={args.active_qp_count} (created={qp_count}) "
             f"with_weights={not args.no_weights} stats={'TCPStore' if args.no_dist else 'HCCL'}",
             flush=True,
@@ -991,14 +1024,22 @@ def main():
             # not equal ranges of dup_groups as the old GET prologue did.
             phase1_groups = int(runner.plan.dup_counts[0].item())
             phase1_dups = int(runner.plan.dup_counts[1].item())
-            role_layout = combine_put_roles(R)
-            role_summary = "/".join(str(role_layout.count(role)) for role in range(4))
-            print(
-                f"[rank {rank}] PUT plan: groups={phase1_groups} "
-                f"dups={phase1_dups} roles={role_summary}(relay/reduce/sender/final-only) "
-                f"source_lanes=16 aiv={COMBINE_PUT_CORES} batch_rows=64",
-                flush=True,
-            )
+            if args.dedup_mode == "server":
+                role_layout = combine_put_roles(R)
+                role_summary = "/".join(str(role_layout.count(role)) for role in range(4))
+                print(
+                    f"[rank {rank}] PUT plan: groups={phase1_groups} "
+                    f"dups={phase1_dups} roles={role_summary}(relay/reduce/sender/final-only) "
+                    f"source_lanes=16 aiv={COMBINE_PUT_CORES} batch_rows=64",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[rank {rank}] rank plan (legacy UDMA combine): "
+                    f"groups={phase1_groups} dups={phase1_dups} "
+                    f"aiv={COMBINE_PUT_CORES}",
+                    flush=True,
+                )
 
             (
                 local_hidden_rows,
@@ -1059,6 +1100,7 @@ def main():
                 "combine_plan_prepare_rank0_us": runner.execution_plan_prepare_us,
                 **planning_timing_csv(runner.planning_timing_summary),
                 "server_dedup": runner.plan.dup_counts.numel() == R + 2,
+                "dedup": args.dedup_mode,
                 "ep": R,
                 "S": S,
                 "E": E,

@@ -392,15 +392,30 @@ def dedup_plan_fields_equal(plan, snapshot):
                for field in DEDUP_PLAN_FIELDS)
 
 
-def _dedup_group_map(plan, *, max_print=5):
-    """Build {primary_loff: sorted duplicate loff tuple} plus internal
+def _dedup_group_map(plan, *, max_print=5, dedup_mode=None,
+                     ranks_per_server=8):
+    """Build {primary_loff: sorted duplicate tuple} plus internal
     consistency errors. The builder allocates the compact prefixes with
     per-warp atomicAdds, so ``dup_groups`` / ``dup_loffs`` ordering is not
-    stable — only the group set is compared."""
+    stable — only the group set is compared.
+
+    ``dedup_mode`` defaults to the plan's own domain. Rank-level plans store
+    duplicate *loffs* (< NvS); server-level plans store full destination
+    addresses (< R * NvS) and reserve R+2 count rows, so both the capacity and
+    the address range follow the domain instead of assuming rank.
+    """
+    if dedup_mode is None:
+        dedup_mode = plan.dedup_mode
+    if dedup_mode not in ("rank", "server"):
+        raise ValueError(f"unsupported dedup_mode: {dedup_mode!r}")
     groups = plan.dup_groups.cpu()
     dup_loffs = plan.dup_loffs.cpu()
     counts = plan.dup_counts.cpu()
-    NvS = dup_loffs.numel()
+    NvS = int(plan.NvS)
+    R = int(plan.R)
+    is_server = dedup_mode == "server"
+    capacity = ranks_per_server * NvS if is_server else NvS
+    address_limit = R * NvS if is_server else NvS
     errors = []
     mapping = {}
 
@@ -409,9 +424,10 @@ def _dedup_group_map(plan, *, max_print=5):
     if group_count < 0 or group_count > NvS:
         errors.append(f"dup group count {group_count} out of range [0, {NvS}]")
         group_count = max(0, min(group_count, NvS))
-    if dup_count_total < 0 or dup_count_total > NvS:
-        errors.append(f"dup loff count {dup_count_total} out of range [0, {NvS}]")
-        dup_count_total = max(0, min(dup_count_total, NvS))
+    if dup_count_total < 0 or dup_count_total > capacity:
+        errors.append(
+            f"dup loff count {dup_count_total} out of range [0, {capacity}]")
+        dup_count_total = max(0, min(dup_count_total, capacity))
 
     seen_dups = []
     for group_idx in range(group_count):
@@ -433,7 +449,7 @@ def _dedup_group_map(plan, *, max_print=5):
         dups = []
         for offset_t in dup_loffs[dup_start:dup_start + dup_count].tolist():
             offset = int(offset_t)
-            if not (0 <= offset < NvS):
+            if not (0 <= offset < address_limit):
                 errors.append(
                     f"dup group {group_idx} contains out-of-range dup loff {offset}"
                 )
@@ -442,7 +458,7 @@ def _dedup_group_map(plan, *, max_print=5):
             seen_dups.append(offset)
         if primary in mapping:
             errors.append(f"primary loff {primary} appears in multiple dup groups")
-        if primary in dups:
+        if not is_server and primary in dups:
             errors.append(f"dup group {group_idx} lists its own primary {primary}")
         mapping[primary] = tuple(sorted(dups))
 
@@ -453,16 +469,18 @@ def _dedup_group_map(plan, *, max_print=5):
         errors.append(
             f"dup loff count mismatch: header={dup_count_total}, used={len(seen_dups)}"
         )
-    overlap = seen_dup_set & set(mapping.keys())
-    if overlap:
-        errors.append(
-            f"rows appear both as primary and duplicate: {sorted(overlap)[:max_print]}"
-        )
+    if not is_server:
+        overlap = seen_dup_set & set(mapping.keys())
+        if overlap:
+            errors.append(
+                f"rows appear both as primary and duplicate: {sorted(overlap)[:max_print]}"
+            )
 
     return mapping, errors
 
 
-def dedup_plan_semantic_errors(name, actual, expected, max_print=5):
+def dedup_plan_semantic_errors(name, actual, expected, max_print=5,
+                               ranks_per_server=8):
     errors = []
     for field in DEDUP_PLAN_FIELDS:
         actual_t = getattr(actual, field)
@@ -479,17 +497,33 @@ def dedup_plan_semantic_errors(name, actual, expected, max_print=5):
         if errors:
             return errors
 
+    dedup_mode = actual.dedup_mode
+    if expected.dedup_mode != dedup_mode:
+        errors.append(
+            f"{name} dedup domain actual={dedup_mode} "
+            f"expected={expected.dedup_mode}")
+        return errors
+
     actual_counts = actual.dup_counts.cpu()
     expected_counts = expected.dup_counts.cpu()
-    for idx, label in ((0, "dup group count"), (1, "dup loff count")):
-        a = int(actual_counts[idx].item())
-        e = int(expected_counts[idx].item())
-        if a != e:
-            errors.append(f"{name} {label} actual={a} expected={e}")
+    if not torch.equal(actual_counts, expected_counts):
+        diff = (actual_counts != expected_counts).nonzero().reshape(-1).tolist()
+        idx = int(diff[0]) if diff else 0
+        if idx == 0:
+            label = "dup group count"
+        elif idx == 1:
+            label = "dup loff count"
+        else:
+            label = f"source prefix [{idx - 2}]"
+        errors.append(
+            f"{name} {label} actual={int(actual_counts[idx])} "
+            f"expected={int(expected_counts[idx])}")
 
-    actual_map, group_errors = _dedup_group_map(actual, max_print=max_print)
+    map_kwargs = dict(max_print=max_print, dedup_mode=dedup_mode,
+                      ranks_per_server=ranks_per_server)
+    actual_map, group_errors = _dedup_group_map(actual, **map_kwargs)
     expected_map, expected_group_errors = _dedup_group_map(
-        expected, max_print=max_print
+        expected, **map_kwargs
     )
     errors.extend(f"{name} actual {err}" for err in group_errors[:max_print])
     errors.extend(f"{name} expected {err}" for err in expected_group_errors[:max_print])
@@ -552,10 +586,15 @@ def assert_ulp_all_ranks(name, actual, expected, rank, R, max_ulps=1):
 def dedup_plan_invariant_errors(case, ctx, plan):
     errors = []
     NvS = int(ctx["NvS"])
+    R = int(ctx["R"])
+    dedup_mode = ctx.get("dedup_mode", plan.dedup_mode)
+    ranks_per_server = int(ctx.get("ranks_per_server", 8))
+    is_server = dedup_mode == "server"
+    capacity = ranks_per_server * NvS if is_server else NvS
     expected_shapes = {
         "dup_groups": (NvS, 3),
-        "dup_loffs": (NvS,),
-        "dup_counts": (2,),
+        "dup_loffs": (capacity,),
+        "dup_counts": (R + 2,) if is_server else (2,),
     }
 
     for field, shape in expected_shapes.items():
@@ -571,10 +610,28 @@ def dedup_plan_invariant_errors(case, ctx, plan):
 
     counts = plan.dup_counts.cpu()
     for idx, label in ((0, "dup group count"), (1, "dup loff count")):
+        limit = NvS if idx == 0 else capacity
         count = int(counts[idx].item())
-        if count < 0 or count > NvS:
-            errors.append(f"{label} {count} is out of range [0, {NvS}]")
+        if count < 0 or count > limit:
+            errors.append(f"{label} {count} is out of range [0, {limit}]")
 
-    _mapping, group_errors = _dedup_group_map(plan)
+    if is_server:
+        prefixes = counts[2:].to(torch.int64)
+        if prefixes.numel() != R:
+            errors.append(
+                f"server source prefixes must have {R} entries, "
+                f"got {prefixes.numel()}")
+        else:
+            if int(prefixes[0].item()) != 0:
+                errors.append(
+                    f"server source prefix[0] must be 0, got {int(prefixes[0].item())}")
+            if not bool(torch.all(prefixes[1:] >= prefixes[:-1]).item()):
+                errors.append("server source prefixes are not non-decreasing")
+            if int(prefixes[-1].item()) > int(counts[0].item()):
+                errors.append(
+                    "server source prefix exceeds the total group count")
+
+    _mapping, group_errors = _dedup_group_map(
+        plan, dedup_mode=dedup_mode, ranks_per_server=ranks_per_server)
     errors.extend(group_errors)
     return errors

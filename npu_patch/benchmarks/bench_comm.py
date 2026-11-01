@@ -32,6 +32,14 @@ size defaults to the launched world size (8 on a single node, 16 across two
 nodes) — override with ``--ep-size`` for a subgroup of ranks [0, ep). ``--prod``
 runs just the production 8-card config (S=4096, K=16, E=896, H=7168).
 
+``--dedup-mode {rank,server}`` selects the Buffer's dedup domain, fixed at
+construction (same rule as bench_vs.py). ``server`` groups 8 consecutive ranks
+into one domain, needs ``--engine urma`` (effective UDMA), ``ep % 8 == 0`` and
+``K >= 2``, and allocates the multi-GiB symmetric PUT combine workspace. The
+planner emits the fused combine execution plan, so this benchmark can time the
+server combine flow without an extra preparation step; a missing plan fails fast
+before timing.
+
 Every flow runs a live Ascend kernel and reports a cross-rank mean latency.
 
 Run:
@@ -59,6 +67,7 @@ from _bench_common import (
     PROD_K,
     PROD_S,
     add_common_args,
+    add_dedup_mode_arg,
     apply_engine,
     fmt4,
     measure_flow,
@@ -69,7 +78,7 @@ from _bench_common import generate_topk_routing  # re-export
 
 from npu_patch import Buffer, ShmemRuntime
 from npu_patch.launchers import launch_combine, launch_dispatch, launch_planning
-from npu_patch.planning import allocate_planning_outputs
+from npu_patch.planning import RANKS_PER_SERVER, allocate_planning_outputs
 
 # Reference sweep defaults (experts-per-rank shrinks as R grows).
 HIDDENS = [3584, 7168]
@@ -111,7 +120,9 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, args, flows):
     # capability and writes ASCEND_MOONEP_*_USE_UDMA, so init_with_buffer
     # below just inherits that policy.
     buffer = Buffer(S, H, K, E, R, num_sms=args.num_sms, group=group,
-                    use_udma=use_udma, explicitly_destroy=True)
+                    use_udma=use_udma, explicitly_destroy=True,
+                    dedup_mode=args.dedup_mode,
+                    vmm_page_size=args.vmm_page_size)
     ctx = buffer._require_ctx()
     if not ShmemRuntime.is_initialized():
         ShmemRuntime.init_with_buffer(group=group, enable_udma=use_udma)
@@ -132,6 +143,18 @@ def bench_one(group, group_rank, R, S, K, E, H, bias_ratio, args, flows):
     topk_flat = topk.reshape(-1).contiguous()
     output_sh = torch.empty(S, H, dtype=torch.bfloat16, device=dev)
     output_sk = torch.empty(S, K, dtype=torch.float32, device=dev)
+
+    # Server dedup combine consumes the planning-produced execution plan. Run
+    # one untimed planning here so an unsupported/missing plan fails fast with a
+    # clear message instead of an ABI error inside the timed combine loop.
+    if args.dedup_mode == "server" and any(
+            flow.startswith("combine") for flow in flows):
+        launch_planning(ctx, topk_flat, tpe, cu_seqlens, plan)
+        torch_npu.npu.synchronize()
+        if plan.combine_execution_plan is None:
+            raise RuntimeError(
+                "server dedup planning did not produce a combine execution "
+                "plan; check that combine UDMA is enabled for this Buffer")
 
     # Global expert-load imbalance (max / mean over experts, all ranks summed).
     global_tpe = tpe.to(torch.int64)
@@ -224,6 +247,7 @@ def parse_args():
     ap.add_argument("--prod", action="store_true",
                     help="Run only the production 8-card config: "
                          "S=4096, K=16, E=896, H=7168, unbalance_ratio=1.0.")
+    add_dedup_mode_arg(ap)
     return ap.parse_args()
 
 
@@ -235,6 +259,21 @@ def main():
     ep = args.ep_size if args.ep_size is not None else world_size
     assert ep >= 1, f"--ep-size must be >= 1, got {ep}"
     assert ep <= world_size, f"--ep-size {ep} exceeds world size {world_size}"
+    if args.dedup_mode == "server":
+        # Server dedup needs the UDMA dispatch/combine kernels and a complete
+        # 8-rank board; the kernel ABI is compiled for 8 ranks per server.
+        if not args.use_udma:
+            raise SystemExit(
+                "--dedup-mode server requires an effective URMA engine: pass "
+                "--engine urma on an Ascend950 device")
+        if ep % RANKS_PER_SERVER != 0:
+            raise SystemExit(
+                f"--dedup-mode server requires ep divisible by "
+                f"{RANKS_PER_SERVER}, got ep={ep}")
+        if args.topk is not None and args.topk < 2:
+            raise SystemExit(
+                "--dedup-mode server requires K >= 2 to exercise the "
+                "intra-server forwarding path")
     in_group = rank < ep
 
     # Subgroup over ranks [0, ep); every world rank participates in new_group.
@@ -262,7 +301,8 @@ def main():
 
     if rank == 0:
         print(f"=== bench_comm: world={world_size} ep={ep} nodesize={local_rank} "
-              f"flows={flows} configs={len(configs)} ===", flush=True)
+              f"flows={flows} configs={len(configs)} "
+              f"dedup={args.dedup_mode} engine={args.engine} ===", flush=True)
 
     # shmem init lives inside each config's bench_one: construct Buffer ->
     # ShmemRuntime.init_with_buffer -> run -> destroy -> finalize -> reset
@@ -276,6 +316,7 @@ def main():
         "combine_fwd_us", "combine_bwd_us",
         "dispatch_fwd_GBps", "dispatch_bwd_GBps",
         "combine_fwd_GBps", "combine_bwd_GBps",
+        "dedup", "engine",
     ]
     if rank == 0 and args.out:
         out_dir = os.path.dirname(args.out)
@@ -355,6 +396,7 @@ def main():
                     _cv_us("combine_bwd"),
                     _cv_gb("dispatch_fwd"), _cv_gb("dispatch_bwd"),
                     _cv_gb("combine_fwd"), _cv_gb("combine_bwd"),
+                    args.dedup_mode, args.engine,
                 ])
                 csv_file.flush()
 

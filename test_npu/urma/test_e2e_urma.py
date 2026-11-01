@@ -6,6 +6,19 @@ URMA (UDMA) operator chain: sync/async dispatch, separate prefetch, combine, pub
 plan-reuse dispatch, zero-copy aliasing, and sync/async reduce_grad, all executed
 by URMA kernels and checked against the affine fp32 reference.
 
+Both dedup domains are covered through the ``dedup_mode`` parameter:
+
+  * ``rank`` (default): one destination rank per dedup domain, legacy rank-level
+    kernels, and **no** combine execution plan (``plan.combine_execution_plan`` is
+    ``None``);
+  * ``server``: eight consecutive ranks per domain, server-level kernels, and a
+    planning-produced combine execution plan (the fused path). The case skips
+    itself unless R is a multiple of 8, K >= 2, and the device is A5 (UDMA).
+
+The identical ``K * hidden`` identity check after combine runs in both domains, so
+a wrong canonical/duplicate decision or a missing forwarded route fails here even
+without an expert-GEMM stage.
+
 URMA-specific adaptations (vs ``test_npu/mte/test_e2e.py``):
   - Buffer is pinned to ``use_udma=True`` and the URMA env is set explicitly
     (``ASCEND_MOONEP_{DISPATCH,COMBINE,PREFETCH,GRAD_REDUCE}_USE_UDMA=1``),
@@ -43,6 +56,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -66,6 +80,36 @@ from moonep.buffer import (
 
 # URMA QP configuration (mirrors qp_count=2 in the dispatch/combine URMA tests).
 URMA_QP_COUNT = 2
+# An Ascend server is 8 consecutive ranks; mirrors npu_patch.planning.
+RANKS_PER_SERVER = 8
+# Dedup domains exercised by the parametrized test.
+DEDUP_MODES = ("rank", "server")
+
+
+def server_dedup_skip_reason(R: int, K: int):
+    """Return why the server-level dedup domain cannot run here, or ``None``.
+
+    Server mode groups eight consecutive ranks into one dedup domain, so an
+    incomplete board cannot be treated as one domain; K >= 2 is required to
+    exercise the intra-server forwarding path; and the kernels need the UDMA
+    (Ascend950) backend. Device/runtime errors are reported as a skip reason
+    instead of failing the rank domain's run.
+    """
+    if R % RANKS_PER_SERVER != 0:
+        return (f"server dedup needs R divisible by {RANKS_PER_SERVER}, "
+                f"got R={R}")
+    if K < 2:
+        return f"server dedup needs K >= 2 to exercise forwarding, got K={K}"
+    try:
+        from npu_patch.api import _is_ascend950
+
+        device = int(torch.npu.current_device())
+        props = torch.npu.get_device_properties(device)
+        if not _is_ascend950(device, props):
+            return "server dedup needs the UDMA (Ascend950) backend"
+    except Exception as exc:  # probe failure must skip, not fail the rank run
+        return f"server dedup capability probe failed: {exc!r}"
+    return None
 
 
 def enable_urma_env():
@@ -310,12 +354,13 @@ def assert_raises_assertion(expected_substr, fn):
         raise AssertionError(f"expected AssertionError containing {expected_substr!r}")
 
 
-def test_e2e_urma():
+@pytest.mark.parametrize("dedup_mode", DEDUP_MODES, ids=list(DEDUP_MODES))
+def test_e2e_urma(dedup_mode):
     """Use 2 MiB VMM pages for the smoke test's small expert projections."""
     previous = os.environ.get("ASCEND_MOONEP_VMM_PAGE_SIZE")
     try:
         os.environ["ASCEND_MOONEP_VMM_PAGE_SIZE"] = "2m"
-        _run_e2e_urma()
+        _run_e2e_urma(dedup_mode)
     finally:
         if previous is None:
             os.environ.pop("ASCEND_MOONEP_VMM_PAGE_SIZE", None)
@@ -323,7 +368,7 @@ def test_e2e_urma():
             os.environ["ASCEND_MOONEP_VMM_PAGE_SIZE"] = previous
 
 
-def _run_e2e_urma():
+def _run_e2e_urma(dedup_mode="rank"):
     """Full URMA operator-chain e2e: dispatch / prefetch / combine / reduce_grad."""
     enable_urma_env()
     rank, R = setup()
@@ -340,10 +385,16 @@ def _run_e2e_urma():
     device = local_device_index()
     dev = f"npu:{device}"
 
+    if dedup_mode == "server":
+        reason = server_dedup_skip_reason(R, K)
+        if reason is not None:
+            pytest.skip(reason)
+
     buffer = None
     try:
         # buffer-backed only: Buffer is constructed first (registers the VMM descriptor), then init_shmem.
-        buffer = Buffer(S, H, K, E, R, B=B, num_sms=num_sms, use_udma=True)
+        buffer = Buffer(S, H, K, E, R, B=B, num_sms=num_sms, use_udma=True,
+                        dedup_mode=dedup_mode)
         # URMA-specific check: dispatch/combine/prefetch/grad_reduce all have URMA enabled.
         assert_urma_active(buffer._require_ctx())
 
@@ -385,10 +436,17 @@ def _run_e2e_urma():
         cu_sync_cpu = cu_sync.clone()
         assert isinstance(plan_sync, MoonEPCommPlan)
         plan_snapshot = plan_sync.clone()
-        assert plan_snapshot.combine_execution_plan is not None
-        assert plan_snapshot.combine_execution_plan is not plan_sync.combine_execution_plan
-        assert plan_snapshot.combine_execution_plan.storage.data_ptr() != \
-            plan_sync.combine_execution_plan.storage.data_ptr()
+# The combine execution plan exists only for the server domain: rank-level
+        # dedup keeps the frozen legacy combine kernel, which reads dst/dup_* and
+        # rejects a prepared plan (npu_patch.planning.prepare_combine_plan).
+        if dedup_mode == "server":
+            assert plan_snapshot.combine_execution_plan is not None
+            assert plan_snapshot.combine_execution_plan is not plan_sync.combine_execution_plan
+            assert plan_snapshot.combine_execution_plan.storage.data_ptr() != \
+                plan_sync.combine_execution_plan.storage.data_ptr()
+        else:
+            assert plan_snapshot.combine_execution_plan is None, (
+                "rank-level dedup must not produce a combine execution plan")
         buffer.prefetch_weight(plan=plan_snapshot, **sync_prefetch_args)
         torch.npu.synchronize()
         assert_prefetched(sync_prefetch_meta, plan_snapshot.experts_to_copy[rank])
@@ -492,6 +550,21 @@ def _run_e2e_urma():
         out_sync_snap = out_sync.clone()
         torch.npu.synchronize()
 
+        # Dedup-domain-independent identity: there is no expert math between
+        # dispatch and combine, so every token's K routes carry the same hidden
+        # row and combine must return K * hidden. A wrong canonical/duplicate
+        # decision, a dropped forwarded route or a broken server group all fail
+        # this check in both domains.
+        golden_h = (hidden.float() * float(K)).to(torch.bfloat16)
+        if not torch.allclose(
+            out_sync_snap.float(), golden_h.float(),
+            rtol=torch.finfo(torch.bfloat16).eps, atol=0,
+        ):
+            diff = (out_sync_snap.float() - golden_h.float()).abs().max().item()
+            raise AssertionError(
+                f"combine identity mismatch (dedup={dedup_mode}): "
+                f"expected K*{K} hidden, max_abs={diff:.4g}")
+
         h_for_combine, w_for_combine, _, _ = buffer.dispatch(
             hidden, weights, topk, tpe,
         )
@@ -580,8 +653,9 @@ def _run_e2e_urma():
 
         if rank == 0:
             print(
-                "[test_e2e_urma] PASS: URMA dispatch/combine/prefetch/reduce_grad "
-                "sync/async, separate prefetch, and plan reuse match."
+                f"[test_e2e_urma] PASS (dedup={dedup_mode}): URMA "
+                "dispatch/combine/prefetch/reduce_grad sync/async, separate "
+                "prefetch, plan reuse and the K*hidden identity match."
             )
     finally:
         # release_owned does the unified teardown: finalize first (tears down the symmetric
@@ -601,4 +675,6 @@ def setup():
 
 
 if __name__ == "__main__":
-    test_e2e_urma()
+    # Direct execution keeps the historical rank-level smoke run; pytest runs
+    # both parametrized domains.
+    test_e2e_urma("rank")

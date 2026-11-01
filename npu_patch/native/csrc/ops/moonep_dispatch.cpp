@@ -48,7 +48,8 @@ CheckedDispatchArgs CheckDispatchArgs(
     int64_t K,
     int64_t R,
     int64_t rank,
-    bool use_udma) {
+    bool use_udma,
+    bool server_dedup) {
 
     CheckNpuContiguous(hidden_sh, "hidden_sh");
     CheckNpuContiguous(dst, "dst");
@@ -120,12 +121,17 @@ CheckedDispatchArgs CheckDispatchArgs(
                 dup_groups.size(0) == NvS && dup_groups.size(1) == 3,
                 "dup_groups must be int32 [NvS, 3]");
     // Detect the protocol from the counts length; server plans go only to the already-adapted UDMA operator.
-    const bool server_dedup = dup_counts.dim() == 1 && dup_counts.size(0) == R + 2;
-    TORCH_CHECK(!server_dedup || use_udma, "server dedup requires UDMA dispatch");
-    TORCH_CHECK(!server_dedup || R % kMoonEPDispatchRanksPerServer == 0,
+    const bool counts_server_dedup = dup_counts.dim() == 1 && dup_counts.size(0) == R + 2;
+    TORCH_CHECK(server_dedup == counts_server_dedup,
+                "dispatch dedup mode must match the plan tables: plan has ",
+                counts_server_dedup ? "server" : "rank",
+                " dedup tables");
+    const bool server_dedup_tables = counts_server_dedup;
+    TORCH_CHECK(!server_dedup_tables || use_udma, "server dedup requires UDMA dispatch");
+    TORCH_CHECK(!server_dedup_tables || R % kMoonEPDispatchRanksPerServer == 0,
                 "server dedup requires R divisible by 8");
-    const int64_t dup_capacity = server_dedup ? kMoonEPDispatchRanksPerServer * NvS : NvS;
-    const int64_t count_size = server_dedup ? R + 2 : 2;
+    const int64_t dup_capacity = server_dedup_tables ? kMoonEPDispatchRanksPerServer * NvS : NvS;
+    const int64_t count_size = server_dedup_tables ? R + 2 : 2;
     TORCH_CHECK(dup_loffs.scalar_type() == torch::kInt32 &&
                 dup_loffs.dim() == 1 && dup_loffs.size(0) == dup_capacity,
                 "dup_loffs must be int32 [", dup_capacity, "] for the selected dup format");
@@ -178,24 +184,36 @@ MoonEPDispatch(
     int64_t K,
     int64_t R,
     int64_t rank,
-    bool use_udma) {
+    bool use_udma,
+    bool server_dedup) {
 
     auto args = CheckDispatchArgs(
         hidden_sh, route_weights, dst, dup_groups, dup_loffs, dup_counts,
-        hidden_buf, route_weights_buf, S, H, K, R, rank, use_udma);
+        hidden_buf, route_weights_buf, S, H, K, R, rank, use_udma, server_dedup);
 
-    if (use_udma) {
-        LaunchMoonEPDispatchUdmaKernel(
-            hidden_sh, args.route_weights, dst,
-            dup_groups, dup_loffs, dup_counts,
-            hidden_buf, args.route_weights_buf, sync_buffer,
-            args.tiling, NextDispatchMagic());
-    } else {
+    if (!use_udma) {
+        // Peer-to-peer MTE path: rank-level dedup only, no UDMA messaging.
         LaunchMoonEPDispatchKernel(
             hidden_sh, args.route_weights, dst,
             dup_groups, dup_loffs, dup_counts,
             hidden_buf, args.route_weights_buf,
             args.tiling);
+    } else if (server_dedup) {
+        // Server-level dedup: the optimized kernel that forwards secondaries
+        // inside an eight-rank board.
+        LaunchMoonEPDispatchUdmaServerDedupKernel(
+            hidden_sh, args.route_weights, dst,
+            dup_groups, dup_loffs, dup_counts,
+            hidden_buf, args.route_weights_buf, sync_buffer,
+            args.tiling, NextDispatchMagic());
+    } else {
+        // Rank-level dedup: the legacy kernel, frozen before the server dedup
+        // optimization so that rank-level results stay on the old baseline.
+        LaunchMoonEPDispatchUdmaLegacyKernel(
+            hidden_sh, args.route_weights, dst,
+            dup_groups, dup_loffs, dup_counts,
+            hidden_buf, args.route_weights_buf, sync_buffer,
+            args.tiling, NextDispatchMagic());
     }
 }
 
@@ -216,11 +234,12 @@ MoonEPDispatchProfile(
     int64_t K,
     int64_t R,
     int64_t rank,
-    bool use_udma) {
+    bool use_udma,
+    bool server_dedup) {
 
     auto args = CheckDispatchArgs(
         hidden_sh, route_weights, dst, dup_groups, dup_loffs, dup_counts,
-        hidden_buf, route_weights_buf, S, H, K, R, rank, use_udma);
+        hidden_buf, route_weights_buf, S, H, K, R, rank, use_udma, server_dedup);
     CheckNpuContiguous(profile_cycles, "profile_cycles");
     CheckSameDevice(profile_cycles, hidden_sh, "profile_cycles");
 
@@ -232,11 +251,19 @@ MoonEPDispatchProfile(
                     "profile_cycles must be int64 [32, ",
                     kMoonEPDispatchUdmaProfileFields, "]");
 
-        LaunchMoonEPDispatchUdmaProfileKernel(
-            hidden_sh, args.route_weights, dst,
-            dup_groups, dup_loffs, dup_counts,
-            hidden_buf, args.route_weights_buf, sync_buffer, profile_cycles,
-            args.tiling, NextDispatchMagic());
+        if (server_dedup) {
+            LaunchMoonEPDispatchUdmaServerDedupProfileKernel(
+                hidden_sh, args.route_weights, dst,
+                dup_groups, dup_loffs, dup_counts,
+                hidden_buf, args.route_weights_buf, sync_buffer, profile_cycles,
+                args.tiling, NextDispatchMagic());
+        } else {
+            LaunchMoonEPDispatchUdmaLegacyProfileKernel(
+                hidden_sh, args.route_weights, dst,
+                dup_groups, dup_loffs, dup_counts,
+                hidden_buf, args.route_weights_buf, sync_buffer, profile_cycles,
+                args.tiling, NextDispatchMagic());
+        }
     }
 }
 

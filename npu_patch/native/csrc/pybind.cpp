@@ -67,10 +67,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Global shmem barrier (waits for all ranks + pending RMA)");
 
     // ---- CANN VMM (aclrt* physical allocation + shareable VA) ----
+    // page_size: "" / "default" = ASCEND_MOONEP_VMM_PAGE_SIZE (else 2m);
+    // "1g" / "2m" override the huge-page policy for this allocation only.
+    m.def("acl_vmm_resolve_page_size",
+          &ascend_moonep::acl_vmm_resolve_page_size,
+          arg("page_size") = "",
+          "Resolve a page-size request ('', 'default', '1g', '2m') to '1g'/'2m'");
     m.def("acl_vmm_granularity", &ascend_moonep::acl_vmm_granularity,
-          arg("device_id"), "VMM minimum allocation granularity (bytes)");
+          arg("device_id"), arg("page_size") = "",
+          "VMM minimum allocation granularity (bytes) for the page-size policy");
     m.def("acl_vmm_malloc_physical", &ascend_moonep::acl_vmm_malloc_physical,
-          arg("size"), arg("device_id"),
+          arg("size"), arg("device_id"), arg("page_size") = "",
           "Allocate a physical memory handle via aclrtMallocPhysical");
     m.def("acl_vmm_free_physical", &ascend_moonep::acl_vmm_free_physical,
           arg("handle"), "Free a physical memory handle");
@@ -100,16 +107,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // High-level transaction: malloc -> reserve -> map -> set_access -> export.
     // Returns (source_va, mem_handle, shareable_handle, size, fabric_bytes).
     m.def("acl_vmm_alloc_source",
-          [](int64_t size, int64_t device_id, int64_t access_device_id) {
+          [](int64_t size, int64_t device_id, int64_t access_device_id,
+             const std::string& page_size) {
               auto [va, handle, shareable, sz, fabric] =
                   ascend_moonep::acl_vmm_alloc_source(
-                      size, device_id, access_device_id);
+                      size, device_id, access_device_id, page_size);
               return py::make_tuple(va, handle, shareable, sz, py::bytes(fabric));
           },
           arg("size"), arg("device_id"), arg("access_device_id") = -1,
+          arg("page_size") = "",
           "Allocate a VMM source (source_va + mem handle + shareable + fabric "
           "bytes); device_id is the process-visible index, access_device_id is "
-          "the physical card id for aclrtMemSetAccess (-1 = same as device_id)");
+          "the physical card id for aclrtMemSetAccess (-1 = same as device_id), "
+          "page_size selects this allocation's huge-page policy");
     m.def("acl_vmm_free_source", &ascend_moonep::acl_vmm_free_source,
           arg("va"), arg("handle"),
           "Free a VMM source (unmap -> release -> free_physical)");

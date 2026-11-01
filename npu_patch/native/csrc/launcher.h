@@ -31,7 +31,7 @@ void LaunchMoonEPDispatchKernel(
     torch::Tensor route_weights_buf,
     const ascend_moonep::MoonEPDispatchTilingData& tiling);
 
-void LaunchMoonEPDispatchUdmaKernel(
+void LaunchMoonEPDispatchUdmaLegacyKernel(
     torch::Tensor hidden_sh,
     torch::Tensor route_weights,
     torch::Tensor dst,
@@ -44,7 +44,7 @@ void LaunchMoonEPDispatchUdmaKernel(
     const ascend_moonep::MoonEPDispatchTilingData& tiling,
     uint64_t magic);
 
-void LaunchMoonEPDispatchUdmaProfileKernel(
+void LaunchMoonEPDispatchUdmaLegacyProfileKernel(
     torch::Tensor hidden_sh,
     torch::Tensor route_weights,
     torch::Tensor dst,
@@ -58,7 +58,35 @@ void LaunchMoonEPDispatchUdmaProfileKernel(
     const ascend_moonep::MoonEPDispatchTilingData& tiling,
     uint64_t magic);
 
-void LaunchPlanningKernel(
+void LaunchMoonEPDispatchUdmaServerDedupKernel(
+    torch::Tensor hidden_sh,
+    torch::Tensor route_weights,
+    torch::Tensor dst,
+    torch::Tensor dup_groups,
+    torch::Tensor dup_loffs,
+    torch::Tensor dup_counts,
+    torch::Tensor hidden_buf,
+    torch::Tensor route_weights_buf,
+    torch::Tensor sync_buffer,
+    const ascend_moonep::MoonEPDispatchTilingData& tiling,
+    uint64_t magic);
+
+void LaunchMoonEPDispatchUdmaServerDedupProfileKernel(
+    torch::Tensor hidden_sh,
+    torch::Tensor route_weights,
+    torch::Tensor dst,
+    torch::Tensor dup_groups,
+    torch::Tensor dup_loffs,
+    torch::Tensor dup_counts,
+    torch::Tensor hidden_buf,
+    torch::Tensor route_weights_buf,
+    torch::Tensor sync_buffer,
+    torch::Tensor profile_cycles,
+    const ascend_moonep::MoonEPDispatchTilingData& tiling,
+    uint64_t magic);
+
+// Legacy rank-level dedup planner (writes routing + rank dedup tables only).
+void LaunchPlanningLegacyKernel(
     torch::Tensor topk_idx,
     torch::Tensor dst,
     torch::Tensor cu_seqlens,
@@ -80,11 +108,44 @@ void LaunchPlanningKernel(
     void* symmetric_buffer,
     uint64_t ffts_addr);
 
-void LaunchMoonEPUdmaCombinePlanKernel(
+// Server-level dedup planner (routing + server dedup tables + combine plan).
+void LaunchPlanningServerDedupKernel(
+    torch::Tensor topk_idx,
+    torch::Tensor dst,
+    torch::Tensor cu_seqlens,
+    torch::Tensor experts_to_copy,
+    torch::Tensor dup_groups,
+    torch::Tensor dup_loffs,
+    torch::Tensor dup_counts,
+    torch::Tensor tpe_all,
+    torch::Tensor tpe_prefix,
+    torch::Tensor balance,
+    torch::Tensor z_tensor,
+    torch::Tensor alloc_tensor,
+    torch::Tensor alloc_cumsum,
+    torch::Tensor expert_offsets,
+    torch::Tensor core_expert_counts,
+    torch::Tensor dup_workspace,
+    torch::Tensor dup_key_workspace,
+    const ascend_moonep::PlanningTilingData& tiling,
+    void* symmetric_buffer,
+    uint64_t ffts_addr);
+
+void LaunchMoonEPUdmaCombineServerDedupKernel(
     torch::Tensor hidden, torch::Tensor weights, torch::Tensor dst,
     torch::Tensor groups, torch::Tensor dups, torch::Tensor counts,
     torch::Tensor out, torch::Tensor outw, torch::Tensor workspace,
     torch::Tensor plan,
+    const ascend_moonep::MoonEPUdmaCombineTilingData& tiling,
+    uint64_t magic);
+
+// Legacy rank-level dedup combine: workspace and its bandwidth scratch tail are
+// rank-local host tensors, not the symmetric PUT workspace.
+void LaunchMoonEPUdmaCombineLegacyKernel(
+    torch::Tensor hidden, torch::Tensor weights, torch::Tensor sync_buffer,
+    torch::Tensor dst, torch::Tensor groups, torch::Tensor dups,
+    torch::Tensor counts, torch::Tensor out, torch::Tensor outw,
+    void* bandwidth_scratch, void* local_workspace,
     const ascend_moonep::MoonEPUdmaCombineTilingData& tiling,
     uint64_t magic);
 

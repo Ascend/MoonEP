@@ -15,7 +15,40 @@ Reported ops (public Buffer API end-to-end):
   - c_f:  buffer.combine(hidden only)
   - c_b:  buffer.combine(with route_weights gather)
   - pf:   launch_prefetch separately (for its share of d_f/d_b)
-grad_reduce is NOT included (overlappable, not on the MoE critical path).
+grad_reduce is not timed but is checked under ``--verify``.
+
+``--pf-overlap`` overlaps async prefetch (no rank barriers) with synchronous
+dispatch on the main stream; the standalone pf number is unchanged.
+
+``--dedup-mode {rank,server}`` selects the Buffer's dedup domain, which is fixed
+at construction: ``rank`` (default) dedups per destination rank and ``server``
+groups 8 consecutive ranks into one domain, which needs ``--engine urma`` and
+allocates the multi-GiB symmetric PUT combine workspace. Note that at EP=8 one
+server covers the whole world, so only R>8 exercises cross-server behaviour.
+
+``--verify`` runs a correctness check per MaxVio point before timing (plan,
+dispatch hidden/weights, combine hidden/weights, prefetch slots, grad_reduce)
+plus a latency sanity check. ``--verify-stages`` selects a subset. The plan
+reference applies the selected dedup domain (dst canonicalisation and the
+duplicate table layout, including the server table's source prefixes).
+
+``--verify-grad-shape {small,model}`` selects the matrix shape used by the
+grad_reduce check. The kernel only consumes the flattened ``hidden*projection``
+row, so the default ``small`` (128x256) exercises the same plan lookup,
+accumulate and slot-zeroing paths -- including multiple 12288-element kernel
+tiles -- at ~1/400 of the symmetric-heap cost of the production shape.
+``model`` uses the benchmark's ``--hidden``/``--hp`` when a shape-specific
+issue needs to be reproduced.
+
+``--vmm-page-size {default,1g,2m}`` selects the huge-page policy of the five
+per-rank ``[epn+B, H, H']`` chunks this benchmark registers before shmem init
+(3 weights + 2 fp32 grad chunks). ACL rounds each allocation up to its page
+granularity, so 1 GiB pages make 5.25 GiB chunks cost 6 GiB apiece; the
+default ``2m`` keeps them exact. ``1g`` can exceed
+``ACLSHMEM_MAX_LOCAL_SIZE`` (40 GiB) with ``--dedup-mode server`` plus
+``--verify-grad-shape model``. ``default`` follows the process default
+(``ASCEND_MOONEP_VMM_PAGE_SIZE``, else 2m) for these chunks and every
+Buffer-internal VMM allocation (payload + comm arena) alike.
 
 Prefetch is timed through the low-level ``launch_prefetch`` on per-rank
 ``[epn+B, H, H']`` symmetric chunks (``make_symmetric_experts``, same as
@@ -23,6 +56,9 @@ Prefetch is timed through the low-level ``launch_prefetch`` on per-rank
 ``[E+B, H, H']`` weight pools need an E+B VMM per rank that the current shmem
 implementation does not support. Prefetch reads home rows locally rather than
 across ranks; the dispatch/combine comm paths are the cross-rank measurements.
+
+Prefetch bandwidth reports both ends: ingress (``pf_in_gbps``, experts pulled
+in) and egress (``pf_out_gbps``, home rows served to peers).
 
 Bandwidth = S*K*H*2 / t (logical payload bytes, same formula as the reference).
 Results are saved to a CSV on rank 0 (--out, default bench_vs_results.csv) for
@@ -46,37 +82,58 @@ EP group = whole world (R == world_size). Single- and multi-node both work:
 
 import argparse
 import csv
+import math
 import os
+import time
 
 import torch
 import torch_npu
 import torch.distributed as dist
 
 from _bench_common import (
-    add_engine_args,
+    add_common_bench_arg,
+    add_cudagraph_arg,
+    add_dedup_mode_arg,
+    add_ip_port_arg,
+    add_maxvios_arg,
+    add_num_sms_arg,
+    add_out_arg,
+    add_plot_arg,
+    add_shape_args,
     apply_engine,
+    log_init,
     setup,
     time_kernel,
 )
 from _bench_common import generate_topk_routing  # re-export
+from _verify_reference import (
+    dispatch_expectation,
+    plan_dedup_pairs,
+    plan_expectation,
+    row_fingerprint,
+)
 
 from npu_patch import Buffer, ShmemRuntime, launch_prefetch
 from npu_patch._device import local_device_index
 from npu_patch.buffer_c import (
+    VMM_PAGE_SIZE_2M,
     create_sym_tensor_from_ptr,
     create_vmm_physical,
     map_to_sym_ptr,
     reset_symmetric_descriptors,
+    sym_tensor,
 )
 from npu_patch.launchers import (
     launch_combine,
     launch_dispatch,
+    launch_grad_reduce,
     launch_planning,
 )
-from npu_patch.planning import allocate_planning_outputs
+from npu_patch.planning import RANKS_PER_SERVER, allocate_planning_outputs
 
 
-def make_symmetric_experts(device_id, R, E, H, Hp, B):
+def make_symmetric_experts(device_id, R, E, H, Hp, B,
+                           page_size=None):
     """Allocate a per-rank ``[epn + B, H, Hp]`` VMM chunk registered with the
     buffer-backed init. Returns the source tensor (``data_ptr`` = source VA);
     ``remote_expert`` (logical ``[E]``) and ``prefetch_buffers`` (local ``[B]``)
@@ -88,10 +145,13 @@ def make_symmetric_experts(device_id, R, E, H, Hp, B):
     NOT the global rank (>= the local card count in multi-node) or the physical
     card id. The VMM physical allocation (``location.id``) uses this visible
     index and must be the current device.
+
+    ``page_size`` is the per-allocation huge-page policy (``None`` = process
+    default, ``"1g"`` / ``"2m"``; see ``create_vmm_physical``).
     """
     epn = (E + R - 1) // R
     return create_vmm_physical([epn + B, H, Hp], torch.bfloat16,
-                               device_id)[0]
+                               device_id, page_size=page_size)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +165,51 @@ def time_op(fn, group, rank, warmup=20, iters=50, cudagraph=True):
 
 def gbps(S, K, H, us):
     return S * K * H * 2 / (us * 1e-6) / 1e9
+
+
+# --verify helpers
+
+# Hidden-row fingerprints are bit-identical on both ends; the tolerance only
+# absorbs a different summation blocking for [S, H] vs [NvS, H] reductions.
+_HIDDEN_FP_RTOL = 1e-3
+
+def _report_ok(label, ok, rank, group, dev):
+    """All-reduce the pass flag (MIN) and print the verdict on rank 0."""
+    t = torch.tensor([1 if ok else 0], dtype=torch.int32, device=dev)
+    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=group)
+    passed = int(t.item()) == 1
+    if rank == 0:
+        print(f'[Verify] {label}: {"PASS" if passed else "FAIL"}', flush=True)
+    return passed
+
+
+def _precision_stats(real, golden):
+    """Return (max_abs, max_rel, n_bad); bad needs both errors >= 1e-2."""
+    ae = (real.float() - golden.float()).abs()
+    re = ae / (golden.float().abs() + 1e-8)
+    bad = (ae >= 1e-2) & (re >= 1e-2)
+    return ae.max().item(), re.max().item(), int(bad.sum().item())
+
+
+# Grad-reduce verification shape (kernel-side tiles are 12288 fp32 elements;
+# 128x256 = 32768 elements -> three tile iterations).
+VERIFY_GRAD_SMALL_HIDDEN = 128
+VERIFY_GRAD_SMALL_HP = 256
+
+
+def _grad_value_row(local_expert, H, Hp, dev):
+    """Deterministic fp32 home-grad row (dyadic, exact accumulation)."""
+    row = torch.arange(H, dtype=torch.float32, device=dev).view(H, 1)
+    col = torch.arange(Hp, dtype=torch.float32, device=dev).view(1, Hp)
+    return local_expert * 17.0 + row * 0.125 + col * 0.0078125
+
+
+def _slot_value_row(src_rank, b, H, Hp, dev):
+    """fp32 reduce-slot row that ``src_rank`` would hold in local slot ``b``."""
+    row = torch.arange(H, dtype=torch.float32, device=dev).view(H, 1)
+    col = torch.arange(Hp, dtype=torch.float32, device=dev).view(1, Hp)
+    return (src_rank + 1) * 101.0 + b * 11.0 + row * 0.03125 + col * 0.00390625
+
 
 
 def _maxvio_for_sigma(sigma, S, K, E, R, dev):
@@ -149,16 +254,51 @@ class MoonEPRunner:
     NAME = 'moonep'
 
     def __init__(self, group, R, S, K, E, H, num_sms, local_rank, hp=2048,
-                 use_udma=False):
+                 use_udma=False, pf_overlap=False, verify=False,
+                 verify_stages=None, verify_trace=False, dedup_mode='rank',
+                 vmm_page_size=None, verify_grad_shape='small'):
         self.group = group
         self.num_sms = num_sms
         self.rank = dist.get_rank(group)
         self.R = R
+        self.S = S
+        self.K = K
+        self.E = E
+        self.H = H
         self.local_rank = local_rank
         self.hp = hp
+        # grad_reduce verification only needs the flattened hidden*projection
+        # matrix; a small one keeps the same coverage without the production
+        # 2x(epn+B)*H*Hp fp32 symmetric chunks.
+        if verify_grad_shape not in ('small', 'model'):
+            raise ValueError(
+                f"verify_grad_shape must be 'small' or 'model', got "
+                f"{verify_grad_shape!r}")
+        self.verify_grad_shape = verify_grad_shape
+        if verify_grad_shape == 'model':
+            self.verify_grad_H, self.verify_grad_hp = H, hp
+        else:
+            self.verify_grad_H = VERIFY_GRAD_SMALL_HIDDEN
+            self.verify_grad_hp = VERIFY_GRAD_SMALL_HP
         self.use_udma = use_udma
+        self.dedup_mode = dedup_mode
+        # Huge-page policy of this benchmark's 5 VMM chunks (None = default).
+        self.vmm_page_size = vmm_page_size
+        self.verify = verify
+        # --verify stage selection; trace prints per-rank markers per op.
+        self.verify_stages = set(
+            x.strip() for x in (verify_stages or
+                                ('plan', 'dispatch', 'grad_reduce',
+                                 'prefetch', 'combine'))
+            if x.strip())
+        self.verify_trace = verify_trace
+        # --pf-overlap: async prefetch on a side stream, sync dispatch, join.
+        self.pf_overlap = pf_overlap
+        self.pf_stream = torch.npu.Stream() if pf_overlap else None
         self.buffer = Buffer(S, H, K, E, R, num_sms=num_sms, group=group,
-                             use_udma=use_udma, explicitly_destroy=True)
+                             use_udma=use_udma, dedup_mode=dedup_mode,
+                             vmm_page_size=self.vmm_page_size,
+                             explicitly_destroy=True)
         self.ctx = self.buffer._require_ctx()
         # Pre-allocate the plan + outputs once (test_planning.py pattern): the
         # timed ops reuse these instead of allocating per call.
@@ -180,7 +320,8 @@ class MoonEPRunner:
         self._weight_chunks = []
         for _ in range(3):
             self._weight_chunks.append(
-                make_symmetric_experts(self.local_rank, R, E, H, hp, self.B))
+                make_symmetric_experts(self.local_rank, R, E, H, hp, self.B,
+                                       page_size=self.vmm_page_size))
         self.remote_experts = []       # 3 logical [E, H, hp] home-weight views
         self.prefetch_buffers = []     # 3 local [B, H, hp] prefetch slots
         g = torch.Generator(device=dev).manual_seed(5000 + self.rank)
@@ -191,6 +332,36 @@ class MoonEPRunner:
                 torch.randn(self.epn, H, hp, dtype=torch.bfloat16,
                             device=dev, generator=g))
         torch.npu.synchronize()
+
+        # --verify grad_reduce needs two extra fp32 chunks; with the default
+        # small matrix they are only MiB-scale. Allocate only when that stage
+        # runs.
+        self._grad_chunks = []
+        self.expert_grads = None
+        self.reduce_buffers = None
+        self._need_grad_chunks = verify and ('grad_reduce' in
+                                             self.verify_stages)
+        if self._need_grad_chunks:
+            gH, ghp = self.verify_grad_H, self.verify_grad_hp
+            assert gH % 128 == 0 and ghp % 128 == 0, (
+                f'grad_reduce verify needs H ({gH}) and hp ({ghp}) multiples '
+                f'of 128')
+            # A MiB-scale chunk would waste 1 GiB per allocation under a 1g
+            # policy, so small-mode chunks pin 2 MiB pages
+            # (an explicit --vmm-page-size still wins; mixing is supported).
+            if self.verify_grad_shape == 'small':
+                grad_page_size = self.vmm_page_size or VMM_PAGE_SIZE_2M
+            else:
+                grad_page_size = self.vmm_page_size
+            self._grad_chunks.append(
+                create_vmm_physical([self.epn, gH, ghp], torch.float32,
+                                    local_rank,
+                                    page_size=grad_page_size)[0])
+            self._grad_chunks.append(
+                create_vmm_physical([self.B, gH, ghp], torch.float32,
+                                    local_rank,
+                                    page_size=grad_page_size)[0])
+            torch.npu.synchronize()
 
     def _prepare_shmem_views(self):
         """After init_with_buffer: map Buffer comm chunks and weight chunks to symmetric tensors."""
@@ -209,6 +380,9 @@ class MoonEPRunner:
             self.prefetch_buffers.append(create_sym_tensor_from_ptr(
                 sym_base + self.epn * row_bytes,
                 [self.B, H, hp], torch.bfloat16, dev))
+        if self._need_grad_chunks:
+            self.expert_grads = sym_tensor(self._grad_chunks[0])
+            self.reduce_buffers = sym_tensor(self._grad_chunks[1])
 
     def prepare(self, topk, tpe, hidden, weights):
         self.hidden, self.weights = hidden, weights
@@ -222,7 +396,17 @@ class MoonEPRunner:
                         build_dedup_map=True)
         # Byte accounting from the plan's slot table (global expert ids).
         etc_cpu = self.plan.experts_to_copy.cpu()   # [R, B] int32, -1 = idle
-        self.max_recv = int((etc_cpu >= 0).sum(dim=1).max().item())
+        valid = etc_cpu >= 0
+        # ingress: experts this rank pulls in (hottest consumer).
+        self.max_recv = int(valid.sum(dim=1).max().item())
+        # egress: home rows served to other ranks; exclude local reads.
+        owners = torch.div(etc_cpu.clamp_min(0), self.epn, rounding_mode='floor')
+        dst_ranks = torch.arange(self.R).view(self.R, 1).expand_as(etc_cpu)
+        remote = valid & (owners != dst_ranks)
+        self.max_send = int(
+            torch.bincount(owners[remote].reshape(-1),
+                           minlength=self.R).max().item()
+        ) if bool(remote.any()) else 0
         self.shard_view = self.ctx['hidden_buf_local']
         self.weights_view = self.ctx['weights_buf_local'].view(torch.float32)
         torch.npu.synchronize()
@@ -232,26 +416,48 @@ class MoonEPRunner:
         launch_planning(self.ctx, self._topk_flat, self.tpe,
                         self.cu_seqlens, self.plan)
 
-    def _prefetch(self):
+    def _prefetch(self, rank_barriers=True):
         # Low-level launch_prefetch per weight tensor (gate/up/down), pulling
         # this rank's plan row into the local [B, H, hp] slots. Avoids
         # Buffer.prefetch_weight's full [E+B, H, hp] pools, which need an E+B
         # VMM the current shmem implementation does not support.
+        # rank_barriers=False drops both barriers; home weights are static and
+        # slots are never consumed, so the event join suffices.
         local_experts = self.plan.experts_to_copy[self.rank].contiguous()
         for remote_expert, slot_buf in zip(self.remote_experts,
                                            self.prefetch_buffers):
             launch_prefetch(remote_expert, slot_buf, local_experts,
-                            num_sms=self.num_sms)
+                            num_sms=self.num_sms, rank_barriers=rank_barriers)
 
     def prefetch(self):
         # launch_prefetch has no cross-rank sync of its own; pair it with a
         # small sync so timed iterations stay serialized across ranks.
         self._prefetch()
 
+    def _prefetch_async_start(self):
+        """Fork prefetch on the side stream and return its event.
+
+        The side stream waits for the current stream, then the caller joins
+        the event. Mirrors prefetch_projections(async_finish=True,
+        rank_barriers=False).
+        """
+        cur = torch.npu.current_stream()
+        self.pf_stream.wait_stream(cur)
+        with torch.npu.stream(self.pf_stream):
+            self._prefetch(rank_barriers=False)
+        return self.pf_stream.record_event()
+
     def dispatch_fwd(self):
-        # full fwd (low-level): planning + dispatch + epilogue, then prefetch.
+        # full fwd (low-level): planning + dispatch + epilogue + prefetch.
         launch_planning(self.ctx, self._topk_flat, self.tpe,
                         self.cu_seqlens, self.plan)
+        if self.pf_overlap:
+            # Async prefetch on the side stream, sync dispatch, then join.
+            done = self._prefetch_async_start()
+            launch_dispatch(self.ctx, self.hidden, self.weights, self.plan,
+                            build_dedup_map=True)
+            done.wait(torch.npu.current_stream())
+            return
         launch_dispatch(self.ctx, self.hidden, self.weights, self.plan,
                         build_dedup_map=True)
         self._prefetch()
@@ -259,6 +465,12 @@ class MoonEPRunner:
     def dispatch_bwd(self):
         # bwd: saved plan (no planning, no dedup builder); the backward expert
         # GEMMs need the same weights, so prefetch again.
+        if self.pf_overlap:
+            done = self._prefetch_async_start()
+            launch_dispatch(self.ctx, self.hidden, None, self.plan,
+                            build_dedup_map=False)
+            done.wait(torch.npu.current_stream())
+            return
         launch_dispatch(self.ctx, self.hidden, None, self.plan,
                         build_dedup_map=False)
         self._prefetch()
@@ -273,9 +485,367 @@ class MoonEPRunner:
         launch_combine(self.ctx, self.output_sh, self.plan,
                        output_sk=self.output_sk)
 
+    # --verify checks
+
+    def _verify_stage_boundary(self):
+        """Drain this rank and fence ranks between verify stages.
+
+        HCCL is collective-safe even if a previous stage failed.
+        """
+        torch.npu.synchronize()
+        dist.barrier(group=self.group)
+
+    def _trace(self, msg):
+        if self.verify_trace:
+            print(f'[rank {self.rank}] {msg}', flush=True)
+
+    def verify_precision(self, hidden, weights):
+        """Run the selected checks once, after ``prepare()``.
+
+        Returns True iff all run checks pass on every rank. ``--verify-stages``
+        selects stages; ``--verify-trace`` prints per-rank markers. Stage order
+        is fixed (plan, dispatch, grad_reduce, prefetch, combine), independent
+        of the order the stages were listed in.
+        """
+        ok = True
+        if 'plan' in self.verify_stages:
+            self._trace('verify plan: start')
+            ok = self._verify_plan() and ok
+            self._trace('verify plan: done')
+            self._verify_stage_boundary()
+        if 'dispatch' in self.verify_stages:
+            self._trace('verify dispatch: start')
+            ok = self._verify_dispatch() and ok
+            self._trace('verify dispatch: done')
+            self._verify_stage_boundary()
+        if 'grad_reduce' in self.verify_stages:
+            self._trace('verify grad_reduce: start')
+            ok = self._verify_grad_reduce() and ok
+            self._trace('verify grad_reduce: done')
+            self._verify_stage_boundary()
+        if 'prefetch' in self.verify_stages:
+            self._trace('verify prefetch: start')
+            ok = self._verify_prefetch() and ok
+            self._trace('verify prefetch: done')
+            self._verify_stage_boundary()
+        if 'combine' in self.verify_stages:
+            self._trace('verify combine: start')
+            ok = self._verify_combine(hidden, weights) and ok
+            self._trace('verify combine: done')
+        return ok
+
+    def _sync_ranks(self):
+        """Drain the local device, then rendezvous with the peer ranks."""
+        torch.npu.synchronize()
+        ShmemRuntime.barrier(group=self.group)
+
+    def _all_gather_stack(self, tensor):
+        """Collect this rank's tensor from every rank -> host ``[R, *shape]``."""
+        parts = [torch.empty_like(tensor) for _ in range(self.R)]
+        dist.all_gather(parts, tensor.contiguous(), group=self.group)
+        return torch.stack(parts).cpu()
+
+    def _verify_plan(self):
+        """Check the planning kernel against the torch planning reference.
+
+        The reference model is vectorized (``_verify_reference``): it rebuilds
+        the greedy MaxVio allocation, the prefetch layout and the per-route
+        ``dst``/duplicate encoding from the gathered routing, then compares
+        every active plan field (``dst`` / ``cu_seqlens`` / ``experts_to_copy``
+        / ``dup_*``). ``zero_fill_ranges`` and ``remote_stats`` are not written
+        by the Ascend planning kernel and are unused downstream, so they are
+        not checked. Slot coverage, rank capacity, per-expert token
+        conservation and the semantic duplicate table are checked as well, so
+        a bad balance policy, prefetch selection, segment layout or dedup
+        encoding all fail here.
+        """
+        dev = f"npu:{self.local_rank}"
+        R, S, K, E = self.R, self.S, self.K, self.E
+        NvS = int(self.ctx['NvS'])
+
+        # Fresh planning: the kernel is collective, so all ranks call it.
+        self.planning()
+        self._sync_ranks()
+
+        topk_all = self._all_gather_stack(self.topk.reshape(S, K))
+        tpe_all = self._all_gather_stack(self.tpe)
+        dst_all = self._all_gather_stack(self.plan.dst).to(torch.int64)
+        cu_all = self._all_gather_stack(self.cu_seqlens)
+        etc_all = self._all_gather_stack(self.plan.experts_to_copy)
+        # Derive the routing counts from top-k alone: the plan model then
+        # depends only on the tensor planning actually consumes, and the
+        # comparison below also validates the tokens_per_expert input.
+        tpe_from_topk = torch.stack([
+            torch.bincount(topk_all[r].reshape(-1), minlength=E)
+            for r in range(R)
+        ])
+        try:
+            exp = plan_expectation(
+                topk_all, tpe_from_topk, rank=self.rank, NvS=NvS,
+                dedup_mode=self.dedup_mode,
+                ranks_per_server=RANKS_PER_SERVER,
+            )
+        except Exception as exc:  # local reference model; deterministic per rank
+            return _report_ok(f'plan            (model error: {exc!r})', False,
+                              self.rank, self.group, dev)
+
+        # Decode the kernel's dst to recover the plan's own allocation and slot
+        # usage: this checks the balance policy/segment layout independently of
+        # the exact dst comparison below.
+        kernel_raw = torch.where(dst_all >= 0, dst_all, -dst_all - 1)
+        kernel_dest = kernel_raw // NvS
+        kernel_loff = kernel_raw - kernel_dest * NvS
+        valid_dest = bool(((kernel_dest >= 0) & (kernel_dest < R)).all())
+        if valid_dest:
+            alloc_routes = torch.bincount(
+                topk_all.reshape(-1) * R + kernel_dest.reshape(-1),
+                minlength=E * R).view(E, R)
+            local = kernel_dest == self.rank
+            slots = torch.bincount(kernel_loff[local], minlength=NvS)
+            capacity = bool((alloc_routes.sum(0) == NvS).all())
+            slots_ok = slots.numel() == NvS and bool((slots == 1).all())
+        else:
+            # A broken dst can point outside [0, R); skip the derived checks
+            # (the exact dst comparison reports the failure) instead of
+            # indexing out of range.
+            alloc_routes = torch.full((E, R), -1, dtype=torch.int64)
+            slots = torch.zeros(NvS, dtype=torch.int64)
+            capacity, slots_ok = False, False
+
+        dedup_pairs_plan, dedup_counts_plan, dedup_errors = plan_dedup_pairs(
+            self.plan.dup_groups.cpu(), self.plan.dup_loffs.cpu(),
+            self.plan.dup_counts.cpu(), NvS,
+            R=R, dedup_mode=self.dedup_mode,
+            ranks_per_server=RANKS_PER_SERVER)
+
+        checks = {
+            'routing': torch.equal(tpe_all.to(torch.int64), tpe_from_topk),
+            'alloc': torch.equal(alloc_routes, exp.alloc),
+            'capacity': capacity,
+            'dst': torch.equal(dst_all, exp.dst),
+            'cu_seqlens': torch.equal(cu_all, exp.cu_seqlens),
+            'prefetch': torch.equal(etc_all,
+                                   exp.experts_to_copy.expand_as(etc_all)),
+            'slots': slots_ok,
+            'dedup': (not dedup_errors
+                      and torch.equal(dedup_counts_plan, exp.dedup_counts)
+                      and torch.equal(dedup_pairs_plan, exp.dedup_pairs)),
+        }
+        ok = all(checks.values())
+        detail = ' '.join(f'{name}={"ok" if passed else "FAIL"}'
+                          for name, passed in checks.items())
+        if dedup_errors:
+            detail += f' [{"; ".join(dedup_errors[:2])}]'
+        if not checks['dst']:
+            detail += f' dst_bad={int((dst_all != exp.dst).sum())}'
+        if not checks['alloc']:
+            detail += f' alloc_bad={int((alloc_routes != exp.alloc).sum())}'
+        if not checks['slots']:
+            detail += (f' slot_bad={int((slots != 1).sum())}'
+                       f' covered={int(slots.sum())}/{NvS}')
+        if not checks['cu_seqlens']:
+            detail += f' cu_bad={int((cu_all != exp.cu_seqlens).sum())}'
+        if not checks['prefetch']:
+            bad = int((etc_all
+                       != exp.experts_to_copy.expand_as(etc_all)).sum())
+            detail += f' pf_bad={bad}'
+        return _report_ok(f'plan            ({detail})', ok, self.rank,
+                          self.group, dev)
+
+    def _verify_dispatch(self):
+        """Check the dispatch kernel output against the plan-derived slots.
+
+        The expected slot payload is built from the gathered ``dst``: every
+        route decodes to ``(dest_rank, loff)``, so the destination rank's
+        ``loff`` slot must hold that route's weight and the hidden row of its
+        token (duplicates store their own weight but share the token's hidden
+        row through the epilogue). Weights are compared exactly; hidden rows
+        are compared through a per-row fingerprint (sum / abs-sum / ramp-dot /
+        sum of squares), so no full weight-sized gather is needed. Both
+        benchmark dispatch paths are exercised: ``dispatch_fwd`` (hidden +
+        weights) and ``dispatch_bwd`` (hidden only, saved plan).
+        """
+        dev = f"npu:{self.local_rank}"
+        S, K = self.S, self.K
+        NvS = int(self.ctx['NvS'])
+
+        self.planning()
+        launch_dispatch(self.ctx, self.hidden, self.weights, self.plan,
+                        build_dedup_map=True)
+        self._sync_ranks()
+
+        dst_all = self._all_gather_stack(self.plan.dst)
+        weights_all = self._all_gather_stack(self.weights.reshape(S, K))
+        hidden_fp_all = self._all_gather_stack(row_fingerprint(self.hidden))
+        try:
+            exp = dispatch_expectation(dst_all, weights_all, hidden_fp_all,
+                                       rank=self.rank, NvS=NvS)
+        except Exception as exc:  # local reference model; deterministic per rank
+            return _report_ok(f'dispatch fwd    (model error: {exc!r})', False,
+                              self.rank, self.group, dev)
+
+        actual_w = self.weights_view.cpu()
+        actual_fp = row_fingerprint(self.shard_view).cpu()
+        rel = ((actual_fp - exp.hidden_fp).abs()
+               / (exp.hidden_fp.abs() + 1.0)).max().item() if NvS else 0.0
+        fwd = {
+            'slots': exp.covered == NvS and exp.collisions == 0,
+            'weights': torch.equal(actual_w, exp.weight),
+            'hidden': rel <= _HIDDEN_FP_RTOL,
+        }
+        ok_fwd = all(fwd.values())
+        detail = (f'slots={exp.covered}/{NvS} collisions={exp.collisions} '
+                  f'weights={"ok" if fwd["weights"] else "FAIL"} '
+                  f'hidden_fp_rel={rel:.3g}')
+        if not fwd['weights']:
+            detail += f' w_bad={int((actual_w != exp.weight).sum())}'
+        ok_fwd = _report_ok(f'dispatch fwd    ({detail})', ok_fwd, self.rank,
+                            self.group, dev)
+
+        # dispatch_bwd: saved plan, hidden only (the weights buffer is stale
+        # here, so only the payload is checked).
+        launch_dispatch(self.ctx, self.hidden, None, self.plan,
+                        build_dedup_map=False)
+        self._sync_ranks()
+        actual_fp_b = row_fingerprint(self.shard_view).cpu()
+        rel_b = ((actual_fp_b - exp.hidden_fp).abs()
+                 / (exp.hidden_fp.abs() + 1.0)).max().item() if NvS else 0.0
+        ok_bwd = _report_ok(
+            f'dispatch bwd    (hidden_fp_rel={rel_b:.3g})',
+            rel_b <= _HIDDEN_FP_RTOL, self.rank, self.group, dev)
+        return ok_fwd and ok_bwd
+
+    def _verify_combine(self, hidden, weights):
+        dev = f"npu:{self.local_rank}"
+        # c_f: no expert math, so the K routes sum to K * hidden.
+        self.combine_fwd()
+        torch.npu.synchronize()
+        golden_h = (hidden.float() * float(self.K)).to(torch.bfloat16)
+        a_abs, a_rel, a_bad = _precision_stats(self.output_sh, golden_h)
+        ok_h = _report_ok(
+            f'combine hidden  (max_abs={a_abs:.4g} max_rel={a_rel:.4g} '
+            f'bad={a_bad})', a_bad == 0, self.rank, self.group, dev)
+
+        # c_b: route-weight gather must reproduce the original [S, K] weights.
+        self.combine_bwd()
+        torch.npu.synchronize()
+        w_abs, w_rel, w_bad = _precision_stats(self.output_sk, weights)
+        ok_w = _report_ok(
+            f'combine weights (max_abs={w_abs:.4g} max_rel={w_rel:.4g} '
+            f'bad={w_bad})', w_bad == 0, self.rank, self.group, dev)
+        return ok_h and ok_w
+
+    def _verify_prefetch(self):
+        dev = f"npu:{self.local_rank}"
+        SENT = -123.0
+        # Fingerprint home rows (sum + abs-sum) and all_gather, so any rank can
+        # validate a slot without moving full weights.
+        fp = torch.zeros(3, self.epn, 2, dtype=torch.float32, device=dev)
+        for c, chunk in enumerate(self._weight_chunks):
+            home = chunk[:self.epn].float()
+            fp[c, :, 0] = home.sum(dim=(1, 2))
+            fp[c, :, 1] = home.abs().sum(dim=(1, 2))
+        gathered = [torch.empty_like(fp) for _ in range(self.R)]
+        dist.all_gather(gathered, fp, group=self.group)
+        home_fp = torch.stack(gathered)  # [R, 3, epn, 2] indexed by owner rank
+
+        for slot in self.prefetch_buffers:
+            slot.fill_(SENT)
+        torch.npu.synchronize()
+        ShmemRuntime.barrier(group=self.group)
+        self._prefetch()
+        torch.npu.synchronize()
+        ShmemRuntime.barrier(group=self.group)
+
+        plan_row = self.plan.experts_to_copy[self.rank].cpu()  # [B]
+        ncell = float(self.H * self.hp)
+        ok = True
+        worst = 0.0
+        for c in range(3):
+            slots = self.prefetch_buffers[c].float()
+            s_sum = slots.sum(dim=(1, 2))
+            s_abs = slots.abs().sum(dim=(1, 2))
+            for b in range(self.B):
+                e = int(plan_row[b])
+                if e < 0:
+                    exp_sum, exp_abs = SENT * ncell, abs(SENT) * ncell
+                else:
+                    owner, le = e // self.epn, e % self.epn
+                    exp_sum = home_fp[owner, c, le, 0].item()
+                    exp_abs = home_fp[owner, c, le, 1].item()
+                rel = max(abs(s_sum[b].item() - exp_sum) / (abs(exp_sum) + 1.0),
+                          abs(s_abs[b].item() - exp_abs) / (exp_abs + 1.0))
+                worst = max(worst, rel)
+                if rel > 1e-4:
+                    ok = False
+        return _report_ok(f'prefetch slots  (worst rel fp diff={worst:.3g})',
+                          ok, self.rank, self.group, dev)
+
+    def _verify_grad_reduce(self):
+        dev = f"npu:{self.local_rank}"
+        # Use the verification matrix (small by default), not the model shape:
+        # the kernel only sees the flattened hidden*projection row.
+        H, hp, B = self.verify_grad_H, self.verify_grad_hp, self.B
+        # Fill own chunks with known exact fp32 values.
+        for le in range(self.epn):
+            self.expert_grads[le].copy_(_grad_value_row(le, H, hp, dev))
+        for b in range(B):
+            self.reduce_buffers[b].copy_(_slot_value_row(self.rank, b, H, hp, dev))
+        # Fence with HCCL, not the shmem barrier: the kernel uses the same
+        # cann-shmem counter internally. npu.sync drains local fills; HCCL
+        # then orders peers.
+        torch.npu.synchronize()
+        dist.barrier(group=self.group)
+
+        plan = self.plan.experts_to_copy.contiguous()  # [R, B] int32, global ids
+        self._trace(f'grad_reduce: LAUNCH (max_recv={self.max_recv} '
+                    f'max_send={self.max_send})')
+        launch_grad_reduce(self.expert_grads, self.reduce_buffers, plan,
+                           rank=self.rank, num_sms=self.num_sms,
+                           meta_buf=None, meta_stride=0, barrier_off=0,
+                           grid_sync_bar=None)
+        self._trace('grad_reduce: launched, syncing...')
+        torch.npu.synchronize()
+        self._trace('grad_reduce: sync OK')
+        dist.barrier(group=self.group)
+
+        plan_cpu = plan.cpu()
+        # Expected: pristine row + all peer contributions targeting this rank.
+        contrib = [[] for _ in range(self.epn)]
+        for src in range(self.R):
+            for b in range(B):
+                e = int(plan_cpu[src, b])
+                if e >= 0:
+                    le = e - self.rank * self.epn
+                    if 0 <= le < self.epn:
+                        contrib[le].append((src, b))
+        grads_ok, worst = True, 0.0
+        for le in range(self.epn):
+            exp = _grad_value_row(le, H, hp, dev)
+            for (src, b) in contrib[le]:
+                exp += _slot_value_row(src, b, H, hp, dev)
+            ae = (self.expert_grads[le] - exp).abs().max().item()
+            worst = max(worst, ae)
+            if not torch.allclose(self.expert_grads[le], exp, rtol=0, atol=1e-3):
+                grads_ok = False
+        # Consumed slots zeroed; idle slots untouched.
+        zero_ok, unchanged_ok = True, True
+        for b in range(B):
+            if int(plan_cpu[self.rank, b]) >= 0:
+                if bool((self.reduce_buffers[b] != 0).any().item()):
+                    zero_ok = False
+            elif not torch.equal(self.reduce_buffers[b],
+                                 _slot_value_row(self.rank, b, H, hp, dev)):
+                unchanged_ok = False
+        ok = grads_ok and zero_ok and unchanged_ok
+        return _report_ok(
+            f'grad_reduce     (matrix={H}x{hp} grads={grads_ok} '
+            f'zero={zero_ok} unchanged={unchanged_ok} max_abs={worst:.4g})',
+            ok, self.rank, self.group, dev)
+
     def destroy(self):
-        # Release this runner's 3 weight VMM chunks via the inverse VMM ops.
-        for chunk in self._weight_chunks:
+        # Release this runner's VMM chunks via the inverse VMM ops.
+        for chunk in self._weight_chunks + self._grad_chunks:
             alloc = getattr(chunk, '_vmm_allocation', None)
             if alloc is not None:
                 alloc.destroy()
@@ -288,37 +858,38 @@ class MoonEPRunner:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    add_engine_args(ap)
+    add_common_bench_arg(ap)
+    add_num_sms_arg(ap, default=32)
     ap.add_argument('--libs', nargs='+', default=['moonep'], choices=['moonep'],
                     help='Libraries to benchmark (Ascend: only moonep).')
-    ap.add_argument('--out', default='bench_vs_results.csv',
-                    help='CSV output path (rank 0). Default: %(default)s')
-    ap.add_argument('--plot', default=None,
-                    help='If set, save the stacked-bar figure to this path '
-                         '(rank 0 only).')
-    ap.add_argument('--maxvios', default='0.2,1,10,20',
-                    help='Comma-separated target MaxVio values; the lognormal '
-                         'sigma is reverse-solved for each (default: %(default)s)')
-    ap.add_argument('--experts', type=int, default=1024)
-    ap.add_argument('--hidden', type=int, default=3584)
-    ap.add_argument('--topk', type=int, default=16)
-    ap.add_argument('--hp', type=int, default=3072,
-                    help='Expert weight inner dim H\' (MoE intermediate size) '
-                         'for the MoonEP prefetch op (default: %(default)s)')
-    ap.add_argument('--num-sms', type=int, default=32)
-    ap.add_argument('--warmup', type=int, default=20)
-    ap.add_argument('--iters', type=int, default=50)
-    ap.add_argument('--ip-port', default=None,
-                    help='shmem DEFAULT-bootstrap ip_port URL for the '
-                         'buffer-backed shmem init ("tcp://<rank0_ip>:<port>" '
-                         'or "tcp6://[ipv6]:<port>"). Required for multi-node; '
-                         'when omitted in a multi-node launch it is derived '
-                         'from MASTER_ADDR/MASTER_PORT (port + 1). Single-node '
-                         'launches keep the UID bootstrap and ignore this.')
-    ap.add_argument('--no-cudagraph', dest='cudagraph', action='store_false',
-                    help='Use the eager timing loop instead of CUDA-graph '
-                         'capture (CUDA-graph removes per-launch host overhead).')
-    ap.set_defaults(cudagraph=True)
+    add_out_arg(ap, default='bench_vs_results.csv')
+    add_plot_arg(ap)
+    add_maxvios_arg(ap)
+    add_shape_args(ap, experts=1024, hidden=3584, topk=16, hp=3072)
+    add_ip_port_arg(ap)
+    add_cudagraph_arg(ap)
+    ap.add_argument('--pf-overlap', action='store_true',
+                    help='Overlap async prefetch (no rank barriers) with sync '
+                         'dispatch; the standalone pf number is unchanged.')
+    ap.add_argument('--verify', action='store_true',
+                    help='Run correctness checks before timing (plan, dispatch, '
+                         'combine, prefetch, grad_reduce) plus a latency sanity '
+                         'check.')
+    ap.add_argument('--verify-stages', default='plan,dispatch,grad_reduce,'
+                    'prefetch,combine',
+                    help='Comma list of checks to run: plan, dispatch, '
+                         'grad_reduce, prefetch, combine '
+                         '(default: %(default)s).')
+    ap.add_argument('--verify-trace', action='store_true',
+                    help='Print per-rank markers around each verify op.')
+    add_dedup_mode_arg(ap)
+    ap.add_argument('--verify-grad-shape', choices=('small', 'model'),
+                    default='small',
+                    help='Matrix shape for the --verify grad_reduce check. '
+                         'The kernel consumes only the flattened H*Hp row, so '
+                         'small (128x256) covers the same plan/accumulate/zero '
+                         'paths at ~1/400 of the symmetric-heap cost; model '
+                         'uses --hidden/--hp (default: %(default)s).')
     args = ap.parse_args()
 
     rank, world_size, local_rank = setup()
@@ -334,6 +905,17 @@ def main():
         f'E ({E}) must be divisible by world_size (EP size) {R}')
     B = E // R
     targets = [float(x) for x in args.maxvios.split(',')]
+    if args.dedup_mode == 'server':
+        # Server dedup needs the UDMA dispatch/combine kernels and a complete
+        # 8-rank board; the kernel ABI is compiled for 8 ranks per server.
+        if args.engine != 'urma':
+            ap.error('--dedup-mode server requires --engine urma')
+        if R % RANKS_PER_SERVER != 0:
+            ap.error(f'--dedup-mode server requires world_size divisible by '
+                     f'{RANKS_PER_SERVER}, got {R}')
+        if K < 2:
+            ap.error('--dedup-mode server requires K >= 2 to exercise the '
+                     'intra-server forwarding path')
 
     # Multi-node detection: under torchrun, WORLD_SIZE > LOCAL_WORLD_SIZE
     # (procs per node) means multi-node.
@@ -344,8 +926,26 @@ def main():
     # descriptors registered) -> init (single-node UID bootstrap / multi-node
     # ip_port bootstrap) -> _prepare_shmem_views maps symmetric tensors.
     runner = MoonEPRunner(group, R, S, K, E, H, args.num_sms, local_rank,
-                          hp=args.hp, use_udma=use_udma)
+                          hp=args.hp, use_udma=use_udma,
+                          pf_overlap=args.pf_overlap, verify=args.verify,
+                          verify_stages=args.verify_stages.split(','),
+                          verify_trace=args.verify_trace,
+                          dedup_mode=args.dedup_mode,
+                          vmm_page_size=(None if args.vmm_page_size == 'default'
+                                         else args.vmm_page_size),
+                          verify_grad_shape=args.verify_grad_shape)
     if not ShmemRuntime.is_initialized():
+        _shmem_mode = ("ip_port" if (args.ip_port is not None or multi_node) else "buffer")
+        log_init(
+            "shmem",
+            "init start: mode=%s ip_port=%s enable_udma=%s engine=%s "
+            "vmm_page=%s R=%d NvS=S*K=%d H=%d E=%d B=epn=%d"
+            % (_shmem_mode,
+               args.ip_port or "<derived from MASTER_ADDR + port+1>",
+               use_udma, args.engine, args.vmm_page_size,
+               R, S * K, H, E, B),
+        )
+        _t_shmem = time.time()
         if args.ip_port is not None or multi_node:
             # Multi-node: ip_port/DEFAULT bootstrap; when ip_port is omitted it
             # is derived from MASTER_ADDR/MASTER_PORT (port + 1, see
@@ -354,7 +954,16 @@ def main():
                                            enable_udma=use_udma)
         else:
             ShmemRuntime.init_with_buffer(group=group, enable_udma=use_udma)
+        log_init("shmem", "init done in %.2fs" % (time.time() - _t_shmem))
+    else:
+        log_init("shmem", "already initialized, skipping bootstrap")
+    log_init("shmem", "prepare_shmem_views start")
     runner._prepare_shmem_views()
+    log_init("shmem", "prepare_shmem_views done")
+
+    if rank == 0 and args.pf_overlap:
+        print('=== --pf-overlap: async prefetch + sync dispatch ===',
+              flush=True)
 
     rows = []
     try:
@@ -385,6 +994,11 @@ def main():
                                  generator=g)
 
             runner.prepare(topk, tpe, hidden, weights)
+
+            # Correctness self-check.
+            if args.verify:
+                runner.verify_precision(hidden, weights)
+
             d_f = time_op(runner.dispatch_fwd, group, rank, args.warmup,
                           args.iters, cudagraph=args.cudagraph)
             d_b = time_op(runner.dispatch_bwd, group, rank, args.warmup,
@@ -397,25 +1011,46 @@ def main():
                               args.iters, cudagraph=args.cudagraph)
             pf = time_op(runner.prefetch, group, rank, args.warmup, args.iters,
                          cudagraph=args.cudagraph)
-            pf_gbps = (3 * runner.max_recv * H * runner.hp * 2
-                       / (pf * 1e-6) / 1e9) if pf > 0 else 0.0
-            rows.append(dict(lib='moonep', ep=R, E=E, H=H, K=K, sigma=sigma,
+            # Report ingress (experts pulled) and egress (rows served).
+            pf_bytes = 3 * H * runner.hp * 2
+            pf_in_gbps = (runner.max_recv * pf_bytes / (pf * 1e-6) / 1e9) \
+                if pf > 0 else 0.0
+            pf_out_gbps = (runner.max_send * pf_bytes / (pf * 1e-6) / 1e9) \
+                if pf > 0 else 0.0
+
+            if args.verify and rank == 0:
+                perf_ok = all(math.isfinite(x) and x > 0 for x in
+                              (d_f, d_b, c_f, c_b, plan_us, pf))
+                subset_ok = plan_us <= d_f * 1.05
+                verdict = 'PASS' if (perf_ok and subset_ok) else 'WARN'
+                print(f'[Verify] perf sanity: positive/finite={perf_ok} '
+                      f'plan<=d_f={subset_ok} (plan {plan_us:.1f} us <= '
+                      f'd_f {d_f:.1f} us) -> {verdict}', flush=True)
+
+            rows.append(dict(lib='moonep', dedup=args.dedup_mode, ep=R, E=E, H=H, K=K,
+                             vmm_page_size=args.vmm_page_size,
+                             sigma=sigma,
                              target_maxvio=target, maxvio=maxvio,
                              plan_us=plan_us, pf_us=pf,
+                             max_recv=runner.max_recv, max_send=runner.max_send,
                              d_f_us=d_f, d_b_us=d_b, c_f_us=c_f, c_b_us=c_b,
+                             pf_in_gbps=pf_in_gbps, pf_out_gbps=pf_out_gbps,
                              d_f_gbps=gbps(S, K, H, d_f),
                              d_b_gbps=gbps(S, K, H, d_b),
                              c_f_gbps=gbps(S, K, H, c_f),
                              c_b_gbps=gbps(S, K, H, c_b)))
             if rank == 0:
-                print(f'{"moonep":>8} ep={R} E={E} H={H} K={K} sigma={sigma:.5f}: '
+                print(f'{"moonep":>8} dedup={args.dedup_mode} ep={R} E={E} '
+                      f'H={H} K={K} sigma={sigma:.5f}: '
                       f'maxvio={maxvio:6.2f} | '
                       f'plan {plan_us:6.1f} us ({plan_us / d_f * 100:4.1f}%) | '
                       f'd_f {d_f:7.1f} us ({gbps(S, K, H, d_f):5.0f} GB/s) | '
                       f'd_b {d_b:7.1f} us ({gbps(S, K, H, d_b):5.0f} GB/s) | '
                       f'c_f {c_f:7.1f} us ({gbps(S, K, H, c_f):5.0f} GB/s) | '
                       f'c_b {c_b:7.1f} us ({gbps(S, K, H, c_b):5.0f} GB/s) | '
-                      f'pf {pf:6.1f} us ({pf_gbps:4.0f} GB/s, '
+                      f'pf {pf:6.1f} us (in {pf_in_gbps:4.0f} / '
+                      f'out {pf_out_gbps:4.0f} GB/s, '
+                      f'recv={runner.max_recv} send={runner.max_send}, '
                       f'{pf / d_f * 100:4.1f}%)', flush=True)
             del hidden, weights
     finally:
