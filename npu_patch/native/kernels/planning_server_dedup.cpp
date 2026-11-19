@@ -6,6 +6,7 @@
 #include "simt_api/common_functions.h"
 #include "simt_api/device_atomic_functions.h"
 #include "simt_api/device_sync_functions.h"
+#include "simt_api/device_warp_functions.h"
 
 #include "ascend_moonep/kernels/launch.h"
 #include "ascend_moonep/kernels/types.h"
@@ -3839,7 +3840,7 @@ extern "C" ASCEND_MOONEP_EXPORT void planning_server_dedup_kernel_do(
 namespace CombineExecutionPlanning {
 
 // ---- Begin combine planning SIMT functions ----
-// Internal vector functions of planning_server_dedup_kernel, NOT separately launched kernels.
+// Internal vector functions of planning_kernel, NOT separately launched kernels.
 // All SIMT stores target private UB. Packed GM tables are still written by MTE3.
 constexpr uint32_t kPlanSimtTokens = 64U;
 constexpr uint32_t kPlanSimtColumns = 21U;
@@ -3890,7 +3891,9 @@ __simt_callee__ inline void DecodeCombineTokensSimt(
         }
         if (server ? peer / 8U == rank / 8U : peer == rank) {
             if (primary) {
-                ++primaries; representative = address; representativePeer = peer;
+                ++primaries;
+                representative = address;
+                representativePeer = peer;
             } else {
                 row[16U + suppressed++] = address;
                 ownSuppressed += uint32_t(peer == rank);
@@ -3901,8 +3904,11 @@ __simt_callee__ inline void DecodeCombineTokensSimt(
     const bool remote = !(server && source / 8U == rank / 8U);
     const bool group = suppressed && representativePeer == rank;
     const uint32_t lane = server ? representativePeer % 8U : 0U;
-    row[32] = representative; row[33] = representativePeer;
-    row[34] = ownRepresentative; row[35] = own; row[36] = suppressed;
+    row[32] = representative;
+    row[33] = representativePeer;
+    row[34] = ownRepresentative;
+    row[35] = own;
+    row[36] = suppressed;
     prefix[t] = own;
     prefix[64U + t] = uint32_t(group);
     prefix[128U + t] = finalBase;
@@ -3956,6 +3962,7 @@ __simt_callee__ inline void EmitCombineTokensSimt(
         tx[pos + 3U] = isHead && remote ? suppressed + 1U : 1U;
     }
 }
+
 // Three prefix phases: eight independent chunks per column; chunk carries;
 // then add each carry. Every phase is separated by a full VF block barrier.
 __simt_callee__ inline void CombineChunkPrefixSimt(
@@ -3965,11 +3972,13 @@ __simt_callee__ inline void CombineChunkPrefixSimt(
         uint32_t sum = 0U;
         for (uint32_t t = begin; t < begin + 8U; ++t) {
             const uint32_t count = prefix[col * 64U + t];
-            prefix[col * 64U + t] = sum; sum += count;
+            prefix[col * 64U + t] = sum;
+            sum += count;
         }
         chunks[job] = sum;
     }
 }
+
 __simt_callee__ inline void CombineChunkCarrySimt(
     __ubuf__ uint32_t* chunks, __ubuf__ uint32_t* totals) {
     const uint32_t col = threadIdx.x;
@@ -3978,10 +3987,12 @@ __simt_callee__ inline void CombineChunkCarrySimt(
     totals[32U + col] = sum;
     for (uint32_t chunk = 0U; chunk < 8U; ++chunk) {
         const uint32_t count = chunks[col * 8U + chunk];
-        chunks[col * 8U + chunk] = sum; sum += count;
+        chunks[col * 8U + chunk] = sum;
+        sum += count;
     }
     totals[col] = sum;
 }
+
 __simt_callee__ inline void CombineApplyCarrySimt(
     __ubuf__ uint32_t* prefix, __ubuf__ uint32_t* chunks) {
     const uint32_t t = threadIdx.x;
@@ -4011,21 +4022,441 @@ __simt_vf__ __launch_bounds__(64) inline void BuildCombineSliceSimt(
                               tokens, n, rank, source, server);
 }
 
-__simt_vf__ __launch_bounds__(64) inline void AdjustCombineRowsSimt(
+namespace WideCombinePlan {
+// One VF per 256-token task; shared table ordering and record ABI are unchanged.
+constexpr uint32_t kPlanSimtTokens = 256U;
+constexpr uint32_t kPlanSimtColumns = 21U;
+constexpr uint32_t kPlanDecodedUb = 16384U;
+constexpr uint32_t kPlanPrefixUb = 81920U;
+constexpr uint32_t kPlanTotalsUb = 54400U;
+constexpr uint32_t kPlanChunksUb = 54784U;
+// Warp scans reuse the retired chunk arena for one packed tile summary.
+constexpr uint32_t kPlanStatsUb = kPlanChunksUb;
+constexpr uint32_t kStatsWords = 64U;
+constexpr uint32_t kWarpLanes = 32U;
+constexpr uint32_t kTileWarps = kPlanSimtTokens / kWarpLanes;
+constexpr uint32_t kServerRanks = 8U;
+// Odd column pitch keeps the cooperative transpose from repeating the same
+// UB offsets at power-of-two top-k strides. The contributor arena is dead
+// until Decode and its block join complete, so no extra UB/HBM is needed.
+constexpr uint32_t kTransposeTopK = 16U;
+constexpr uint32_t kTransposedPitch = kPlanSimtTokens + 1U;
+enum CountColumn : uint32_t {
+    kTxCount = 0U,kGroupCount,kFinalBaseCount,kDirectCount,
+    kScratchBegin,kRelayBegin = kScratchBegin + kServerRanks,
+    kErrorCount = kRelayBegin + kServerRanks
+};
+constexpr uint32_t kCountBegin = 32U,kRelayOffsetsBegin = 56U;
+constexpr uint32_t kLaneStatsBegin = 16U,kLaneStatsWords = 4U;
+static_assert(kPlanStatsUb + kStatsWords * sizeof(uint32_t) <= kPlanChunksUb + 21U * 32U * sizeof(uint32_t));
+constexpr uint32_t kPlanTxUb = 104448U;
+constexpr uint32_t kPlanContributorUb = kPlanTxUb;
+constexpr uint32_t kPlanRemoteTxUb = 169984U;
+constexpr uint32_t kPlanRelayUb = 174080U;
+static_assert(kPlanContributorUb + kTransposeTopK * kTransposedPitch * sizeof(int32_t) <= kPlanRemoteTxUb);
+static_assert(kPlanDecodedUb + 256U * 37U * 4U <= kPlanTotalsUb);
+static_assert(kPlanTotalsUb + 64U * 4U <= kPlanChunksUb);
+static_assert(kPlanChunksUb + 21U * 32U * 4U <= 65536U);
+static_assert(kPlanPrefixUb + 21U * 256U * 4U <= kPlanTxUb);
+static_assert(kPlanTxUb + 256U * 16U * 16U == kPlanRemoteTxUb);
+static_assert(kPlanRemoteTxUb + 256U * 16U == kPlanRelayUb);
+static_assert(kPlanRelayUb + (256U * 16U + 8U * 4U) * 8U <= 216U * 1024U);
+// Each tile contains <= 256 * 16 routes. Two independent counters fit in
+// one word even after summing the whole tile, so a shuffle can scan both.
+constexpr uint32_t kFieldBits = 16U, kFieldMask = (1U << kFieldBits) - 1U;
+constexpr uint32_t kTxGroupPair = 0U, kFinalErrorPair = 1U, kRelayPairBegin = 2U;
+constexpr uint32_t kCounterPairs = kRelayPairBegin + kServerRanks;
+static_assert(kPlanSimtTokens * kTransposeTopK <= kFieldMask);
+static_assert(kPlanStatsUb + (kStatsWords + kCounterPairs * kTileWarps) * sizeof(uint32_t) <= 65536U);
+
+__simt_callee__ inline uint32_t PackedTokenPrefix(
+    __ubuf__ uint32_t* prefix, __ubuf__ uint32_t* warpBases,
+    uint32_t column, uint32_t pair, uint32_t token) {
+    return prefix[column * kPlanSimtTokens + token] + warpBases[pair * kTileWarps + token / kWarpLanes];
+}
+// A source publishes a compact route tile for each destination server.
+// A token header holds its first packed route, number of routes in this
+// server and number of active routes in earlier servers (Final base).
+namespace ServerPacket {
+constexpr uint32_t kCountBits = 5U, kCountMask = (1U << kCountBits) - 1U;
+constexpr uint32_t kOffsetShift = 2U * kCountBits;
+constexpr uint32_t kInvalidRoute = 1U << 31U;
+constexpr uint32_t kHeaderBanksUb = 208U * 1024U;
+static_assert(kPlanRelayUb + (kPlanSimtTokens * 16U + kServerRanks * 4U) * 8U <= kHeaderBanksUb);
+static_assert(kHeaderBanksUb + 2U * kPlanSimtTokens * sizeof(uint32_t) <= 216U * 1024U);
+static_assert((kPlanSimtTokens * 16U << kOffsetShift) < kInvalidRoute);
+__simt_vf__ __launch_bounds__(256) inline void Pack(
+    __ubuf__ int32_t* routes, __ubuf__ uint32_t* headers, __ubuf__ int32_t* output,
+    __ubuf__ uint32_t* warps, uint32_t tokens, uint32_t k, uint32_t n,
+    uint32_t r, uint32_t source, uint32_t domain) {
+    const uint32_t token = threadIdx.x, lane = token % kWarpLanes, warp = token / kWarpLanes;
+    const uint32_t begin = domain * kServerRanks * n;
+    const uint32_t sourceBegin = (source / kServerRanks) * kServerRanks * n;
+    const uint32_t serverRows = kServerRanks * n;
+    uint32_t mask = 0U, count = 0U, before = 0U, error = 0U;
+    if (token < tokens) {
+        for (uint32_t j = 0U; j < k; ++j) {
+            const int32_t encoded = routes[token * k + j];
+            const uint32_t bits = static_cast<uint32_t>(encoded);
+            const bool forwarded = (bits & 0xc0000000U) == 0x80000000U;
+            const uint32_t address = forwarded ? bits & 0x3fffffffU : encoded >= 0 ? bits : ~bits;
+            if (uint64_t(address) >= uint64_t(n) * r) error = kInvalidRoute;
+            const bool active = encoded >= 0 || forwarded || address - sourceBegin < serverRows;
+            before += uint32_t(active && address < begin);
+            if (address - begin < serverRows) {
+                mask |= 1U << j;
+                ++count;
+            }
+        }
+    }
+    uint32_t sum = count;
+    for (uint32_t delta = 1U; delta < kWarpLanes; delta *= 2U) {
+        const uint32_t previous = asc_shfl_up(sum, delta, kWarpLanes);
+        if (lane >= delta) sum += previous;
+    }
+    if (lane == kWarpLanes - 1U) warps[warp] = sum;
+    asc_syncthreads();
+    if (token < kTileWarps) {
+        const uint32_t rows = warps[token];
+        uint32_t prefix = rows;
+        for (uint32_t delta = 1U; delta < kTileWarps; delta *= 2U) {
+            const uint32_t previous = asc_shfl_up(prefix, delta, kWarpLanes);
+            if (token >= delta) prefix += previous;
+        }
+        warps[token] = prefix - rows;
+    }
+    asc_syncthreads();
+    if (token >= tokens) return;
+    uint32_t out = warps[warp] + sum - count;
+    headers[token] = (out << kOffsetShift) | (before << kCountBits) | count | error;
+    for (uint32_t j = 0U; j < k; ++j)
+        if (mask & (1U << j)) output[out++] = routes[token * k + j];
+}
+} // namespace ServerPacket
+// A token contributes to at most one relay lane. Keep its counts with the
+// decoding thread until the warp scan consumes them.
+struct TokenCounts {
+    uint32_t tx, groups, finalBase, direct, errors;
+    uint32_t relayLane, contributorRows, relayRows;
+};
+// One thread decodes one token. Keep only our active rows and our domain's
+// suppressed members; representative order is the original top-k order.
+__simt_callee__ inline TokenCounts DecodeCombineTokensSimt(
+    __ubuf__ int32_t* routes, __ubuf__ uint32_t* decoded,
+    uint32_t tokens, uint32_t k,
+    uint32_t n, uint32_t r, uint32_t rank, uint32_t source, uint32_t server,
+    bool transposed = false, __ubuf__ uint32_t* headers = nullptr) {
+    const uint32_t t = threadIdx.x;
+    if (t >= tokens) return {};
+    auto row = decoded + t * 37U;
+    uint32_t own = 0U, suppressed = 0U, primaries = 0U, finalBase = 0U;
+    uint32_t representative = 0U, representativePeer = 0U, ownRepresentative = 0U;
+    uint32_t ownSuppressed = 0U, error = 0U;
+    const uint32_t header = headers ? headers[t] : 0U;
+    const uint32_t entries = headers ? header & ServerPacket::kCountMask : k;
+    const uint32_t first = headers ? (header & ~ServerPacket::kInvalidRoute) >> ServerPacket::kOffsetShift : t * k;
+    finalBase = (header >> ServerPacket::kCountBits) & ServerPacket::kCountMask;
+    error = uint32_t((header & ServerPacket::kInvalidRoute) != 0U);
+    const uint32_t ownBegin = rank * n, ownEnd = ownBegin + n;
+    const uint32_t domainBegin = (server ? rank / 8U * 8U : rank) * n;
+    const uint32_t domainEnd = domainBegin + (server ? 8U : 1U) * n;
+    const uint32_t sourceBegin = source / 8U * 8U * n, sourceEnd = sourceBegin + 8U * n;
+    for (uint32_t j = 0U; j < entries; ++j) {
+        const int32_t encoded = routes[transposed ? j * kTransposedPitch + t : first + j];
+        const uint32_t bits = static_cast<uint32_t>(encoded);
+        const bool forwarded = (bits & 0xc0000000U) == 0x80000000U;
+        const uint32_t address = forwarded ? bits & 0x3fffffffU :
+            encoded >= 0 ? bits : ~bits;
+        const bool ownRank = address >= ownBegin && address < ownEnd;
+        const bool primary = encoded >= 0 || forwarded;
+        const bool active = primary || (server && address >= sourceBegin && address < sourceEnd);
+        error |= uint32_t(uint64_t(address) >= uint64_t(n) * r);
+        finalBase += uint32_t(active && address < ownBegin);
+        if (ownRank && active) {
+            if (primary) ownRepresentative = own;
+            row[own++] = address - ownBegin;
+        }
+        if (address >= domainBegin && address < domainEnd) {
+            if (primary) {
+                ++primaries;
+                representative = address;
+            } else {
+                row[16U + suppressed++] = address;
+                ownSuppressed += uint32_t(ownRank);
+            }
+        }
+    }
+    representativePeer = primaries ? representative / n : 0U;
+    error |= uint32_t(suppressed && primaries != 1U);
+    const bool remote = !(server && source / 8U == rank / 8U);
+    const bool group = suppressed && representativePeer == rank;
+    const uint32_t lane = server ? representativePeer % 8U : 0U;
+    row[32] = representative;
+    row[33] = representativePeer;
+    row[34] = ownRepresentative;
+    row[35] = own;
+    row[36] = suppressed;
+    const bool relay = remote && suppressed;
+    return {own, uint32_t(group), finalBase, own - uint32_t(remote && group),
+            error | uint32_t(remote && own > 1U), lane,
+            relay ? suppressed + 1U : 0U,
+            relay ? ownSuppressed + uint32_t(representativePeer == rank) : 0U};
+}
+
+__simt_callee__ inline void EmitCombineTokensSimt(
+    __ubuf__ uint32_t* decoded, __ubuf__ uint32_t* prefix,
+    __ubuf__ uint32_t* totals, __ubuf__ uint32_t* tx,
+    __ubuf__ uint32_t* contributors, __ubuf__ uint32_t* relays,
+    uint32_t tokens, uint32_t n, uint32_t rank, uint32_t source, uint32_t server, __ubuf__ uint32_t* warpBases = nullptr) {
+    const uint32_t t = threadIdx.x;
+    if (t >= tokens) return;
+    auto row = decoded + t * 37U;
+    const uint32_t representative = row[32], peer = row[33];
+    const uint32_t ownRepresentative = row[34], own = row[35], suppressed = row[36];
+    const bool group = suppressed && peer == rank;
+    const bool remote = !(server && source / 8U == rank / 8U);
+    const uint32_t lane = server ? peer % 8U : 0U;
+    const uint32_t txGroup = warpBases ? PackedTokenPrefix(prefix, warpBases, kTxCount, kTxGroupPair, t) : 0U;
+    const uint32_t txIndex = warpBases ? (txGroup & kFieldMask) : prefix[t];
+    const uint32_t groupIndex = warpBases ? (txGroup >> kFieldBits) : prefix[kGroupCount * kPlanSimtTokens + t];
+    uint32_t head = 0U;
+    if (remote && suppressed) {
+        const uint32_t relay = warpBases ? PackedTokenPrefix(prefix, warpBases, kScratchBegin + lane, kRelayPairBegin + lane, t) : 0U;
+        head = warpBases ? (relay & kFieldMask) : prefix[(kScratchBegin + lane) * kPlanSimtTokens + t];
+        uint32_t request = warpBases ? (relay >> kFieldBits) :
+            prefix[(kRelayBegin + lane) * kPlanSimtTokens + t] - totals[kCountBegin + kRelayBegin + lane];
+        for (uint32_t member = 0U; member <= suppressed; ++member) {
+            const uint32_t address = member ? row[16U + member - 1U] : representative;
+            if (peer == rank) {
+                const uint32_t pos = (head - totals[32U + 4U + lane] + member) * 4U;
+                contributors[pos] = member ? 0U : txIndex + ownRepresentative;
+                contributors[pos + 1U] = member ? 0U : suppressed + 1U;
+                contributors[pos + 2U] = server ? address : address % n;
+                contributors[pos + 3U] = 0U;
+            }
+            if (address >= rank * n && address - rank * n < n) {
+                const uint32_t pos = totals[56U + lane] * 2U + request++ * 2U;
+                relays[pos] = address - rank * n;
+                relays[pos + 1U] = head + member;
+            }
+        }
+    }
+    for (uint32_t j = 0U; j < own; ++j) {
+        const bool isHead = group && j == ownRepresentative;
+        const uint32_t pos = (txIndex - totals[32] + j) * 4U;
+        tx[pos] = row[j];
+        tx[pos + 1U] = isHead ? groupIndex : 0xffffffffU;
+        tx[pos + 2U] = isHead && remote ? head : 0xffffffffU;
+        tx[pos + 3U] = isHead && remote ? suppressed + 1U : 1U;
+    }
+}
+
+// Three prefix phases: eight independent chunks per column; chunk carries;
+// then add each carry. Every phase is separated by a full VF block barrier.
+__simt_callee__ inline void CombineChunkPrefixSimt(
+    __ubuf__ uint32_t* prefix, __ubuf__ uint32_t* chunks) {
+    for (uint32_t job = threadIdx.x; job < 21U * 32U; job += 256U) {
+        const uint32_t col = job / 32U, begin = (job % 32U) * 8U;
+        uint32_t sum = 0U;
+        for (uint32_t t = begin; t < begin + 8U; ++t) {
+            const uint32_t count = prefix[col * kPlanSimtTokens + t];
+            prefix[col * kPlanSimtTokens + t] = sum;
+            sum += count;
+        }
+        chunks[job] = sum;
+    }
+}
+
+__simt_callee__ inline void CombineChunkCarrySimt(
+    __ubuf__ uint32_t* chunks, __ubuf__ uint32_t* totals) {
+    const uint32_t col = threadIdx.x;
+    if (col >= 21U) return;
+    uint32_t sum = totals[col];
+    totals[32U + col] = sum;
+    for (uint32_t chunk = 0U; chunk < 32U; ++chunk) {
+        const uint32_t count = chunks[col * 32U + chunk];
+        chunks[col * 32U + chunk] = sum;
+        sum += count;
+    }
+    totals[col] = sum;
+}
+
+__simt_callee__ inline void CombineApplyCarrySimt(
+    __ubuf__ uint32_t* prefix, __ubuf__ uint32_t* chunks, __ubuf__ uint32_t* totals) {
+    const uint32_t t = threadIdx.x;
+    for (uint32_t col = 0U; col < 21U; ++col)
+        prefix[col * kPlanSimtTokens + t] += chunks[col * 32U + t / 8U];
+    if (t < 8U) {
+        uint32_t begin = 0U;
+        for (uint32_t lane = 0U; lane < t; ++lane)
+            begin += (totals[12U + lane] - totals[32U + 12U + lane] + 3U) & ~3U;
+        totals[56U + t] = begin;
+    }
+}
+
+__simt_vf__ __launch_bounds__(256) inline void BuildCombineSliceSimt(
+    __ubuf__ int32_t* routes, __ubuf__ uint32_t* decoded,
+    __ubuf__ uint32_t* prefix, __ubuf__ uint32_t* totals,
+    __ubuf__ uint32_t* chunks, __ubuf__ uint32_t* tx,
+    __ubuf__ uint32_t* contributors, __ubuf__ uint32_t* relays,
+    uint32_t tokens, uint32_t k, uint32_t n, uint32_t r,
+    uint32_t rank, uint32_t source, uint32_t server) {
+    const TokenCounts counts = DecodeCombineTokensSimt(routes, decoded, tokens, k, n, r, rank, source, server);
+    const uint32_t t = threadIdx.x;
+    prefix[kTxCount * kPlanSimtTokens + t] = counts.tx;
+    prefix[kGroupCount * kPlanSimtTokens + t] = counts.groups;
+    prefix[kFinalBaseCount * kPlanSimtTokens + t] = counts.finalBase;
+    prefix[kDirectCount * kPlanSimtTokens + t] = counts.direct;
+    prefix[kErrorCount * kPlanSimtTokens + t] = counts.errors;
+    for (uint32_t lane = 0U; lane < kServerRanks; ++lane) {
+        prefix[(kScratchBegin + lane) * kPlanSimtTokens + t] = lane == counts.relayLane ? counts.contributorRows : 0U;
+        prefix[(kRelayBegin + lane) * kPlanSimtTokens + t] = lane == counts.relayLane ? counts.relayRows : 0U;
+    }
+    asc_syncthreads();
+    CombineChunkPrefixSimt(prefix, chunks);
+    asc_syncthreads();
+    CombineChunkCarrySimt(chunks, totals);
+    asc_syncthreads();
+    CombineApplyCarrySimt(prefix, chunks, totals);
+    asc_syncthreads();
+    // Uniform test AFTER all barriers, including inactive tail threads.
+    // Never emit records from invalid routes; host reports the error after VF.
+    if (!totals[20U])
+        EmitCombineTokensSimt(decoded, prefix, totals, tx, contributors, relays,
+                              tokens, n, rank, source, server);
+}
+
+// One warp owns 32 consecutive tokens. All eight warps scan the same
+// pair at once; only their eight totals go through a second prefix scan.
+__simt_callee__ inline void ScanTokenWarps(
+    __ubuf__ uint32_t* prefix, __ubuf__ uint32_t* warpBases, const TokenCounts& counts, bool localSource) {
+    const uint32_t token = threadIdx.x, lane = token % kWarpLanes, warp = token / kWarpLanes;
+    const uint32_t pairs = localSource ? kRelayPairBegin : kCounterPairs;
+    for (uint32_t pair = 0U; pair < pairs; ++pair) {
+        uint32_t count = 0U;
+        if (pair == kTxGroupPair) count = counts.tx | (counts.groups << kFieldBits);
+        else if (pair == kFinalErrorPair) count = counts.finalBase | (counts.errors << kFieldBits);
+        else if (pair == kRelayPairBegin + counts.relayLane)
+            count = counts.contributorRows | (counts.relayRows << kFieldBits);
+        uint32_t sum = count;
+        for (uint32_t delta = 1U; delta < kWarpLanes; delta *= 2U) {
+            const uint32_t before = asc_shfl_up(sum, delta, kWarpLanes);
+            if (lane >= delta) sum += before;
+        }
+        if (pair == kTxGroupPair) prefix[kTxCount * kPlanSimtTokens + token] = sum - count;
+        else if (pair == kRelayPairBegin + counts.relayLane && counts.contributorRows)
+            prefix[(kScratchBegin + counts.relayLane) * kPlanSimtTokens + token] = sum - count;
+        if (lane + 1U == kWarpLanes) warpBases[pair * kTileWarps + warp] = sum;
+    }
+}
+
+__simt_callee__ inline void FinishWarpBases(
+    __ubuf__ uint32_t* warpBases, __ubuf__ uint32_t* totals, bool localSource) {
+    const uint32_t thread = threadIdx.x, pair = thread / kTileWarps, warp = thread % kTileWarps;
+    if (pair >= kCounterPairs) return;
+    const uint32_t count = localSource && pair >= kRelayPairBegin ? 0U : warpBases[thread];
+    uint32_t sum = count;
+    for (uint32_t delta = 1U; delta < kTileWarps; delta *= 2U) {
+        const uint32_t before = asc_shfl_up(sum, delta, kWarpLanes);
+        if (warp >= delta) sum += before;
+    }
+    warpBases[thread] = sum - count;
+    if (warp != kTileWarps - 1U) return;
+    const uint32_t lo = sum & kFieldMask, hi = sum >> kFieldBits;
+    if (pair == kTxGroupPair) {
+        totals[kTxCount] = lo;
+        totals[kGroupCount] = hi;
+        totals[kDirectCount] = localSource ? lo : lo - hi;
+        totals[kCountBegin + kTxCount] = 0U;
+    } else if (pair == kFinalErrorPair) {
+        totals[kFinalBaseCount] = lo;
+        totals[kErrorCount] = hi;
+    } else {
+        const uint32_t lane = pair - kRelayPairBegin;
+        totals[kScratchBegin + lane] = lo;
+        totals[kRelayBegin + lane] = hi;
+        totals[kCountBegin + kScratchBegin + lane] = 0U;
+    }
+}
+
+__simt_callee__ inline void BuildRelayOffsetsSimt(__ubuf__ uint32_t* totals) {
+    const uint32_t lane = threadIdx.x;
+    if (lane >= kServerRanks) return;
+    uint32_t offset = 0U;
+    for (uint32_t previous = 0U; previous < lane; ++previous)
+        offset += (totals[kRelayBegin + previous] + 3U) & ~3U;
+    totals[kRelayOffsetsBegin + lane] = offset;
+}
+
+__simt_callee__ inline void PackTileStatsSimt(
+    __ubuf__ uint32_t* totals, __ubuf__ uint32_t* stats) {
+    const uint32_t word = threadIdx.x;
+    if (word >= kStatsWords) return;
+    uint32_t value = 0U;
+    if (word < kScratchBegin) value = totals[word];
+    else if (word >= kLaneStatsBegin && word < kLaneStatsBegin + kServerRanks * kLaneStatsWords) {
+        const uint32_t lane = (word - kLaneStatsBegin) / kLaneStatsWords;
+        const uint32_t field = (word - kLaneStatsBegin) % kLaneStatsWords;
+        if (field < 2U) value = totals[(field == 0U ? kScratchBegin : kRelayBegin) + lane];
+    }
+    stats[word] = value;
+}
+
+template <uint32_t FixedTopK>
+__simt_vf__ __launch_bounds__(256) inline void BuildCombineSliceWarpSimt(
+    __ubuf__ int32_t* routes, __ubuf__ uint32_t* decoded,
+    __ubuf__ uint32_t* prefix, __ubuf__ uint32_t* totals,
+    __ubuf__ uint32_t* stats, __ubuf__ uint32_t* tx,
+    __ubuf__ uint32_t* contributors, __ubuf__ uint32_t* relays,
+    uint32_t tokens, uint32_t k, uint32_t n, uint32_t r,
+    uint32_t rank, uint32_t source, uint32_t server, __ubuf__ uint32_t* headers) {
+    auto input = routes;
+    if constexpr (FixedTopK != 0U) {
+        auto columns = reinterpret_cast<__ubuf__ int32_t*>(contributors);
+        for (uint32_t index = threadIdx.x; index < tokens * FixedTopK; index += kPlanSimtTokens) {
+            const uint32_t token = index / FixedTopK, route = index % FixedTopK;
+            columns[route * kTransposedPitch + token] = routes[index];
+        }
+        asc_syncthreads();
+        input = columns;
+    }
+    const TokenCounts counts = DecodeCombineTokensSimt(input, decoded, tokens,
+        FixedTopK ? FixedTopK : k, n, r, rank, source, server, FixedTopK != 0U, headers);
+    const bool localSource = server && source / kServerRanks == rank / kServerRanks;
+    auto warpBases = stats + kStatsWords;
+    ScanTokenWarps(prefix, warpBases, counts, localSource);
+    asc_syncthreads();
+    FinishWarpBases(warpBases, totals, localSource);
+    asc_syncthreads();
+    BuildRelayOffsetsSimt(totals);
+    asc_syncthreads();
+    if (!totals[kErrorCount])
+        EmitCombineTokensSimt(decoded, prefix, totals, tx, contributors, relays, tokens, n, rank, source, server, warpBases);
+    // Stats and emitted records are disjoint; all totals are already stable.
+    PackTileStatsSimt(totals, stats);
+}
+} // namespace WideCombinePlan
+
+__simt_callee__ inline void AdjustCombineRow(
+    __ubuf__ uint32_t* row, uint32_t kind,
+    uint32_t txBase, uint32_t groupBase, uint32_t scratchBase) {
+    if (kind == 0U) {
+        if (row[1U] != 0xffffffffU) row[1U] += groupBase;
+        if (row[2U] != 0xffffffffU) row[2U] += scratchBase;
+    } else if (kind == 1U) {
+        if (row[1U]) row[0U] += txBase;
+    } else row[1U] += scratchBase;
+}
+
+__simt_vf__ __launch_bounds__(256) inline void AdjustCombineRowsSimt(
     __ubuf__ uint32_t* rows, uint32_t size, uint32_t kind,
     uint32_t txBase, uint32_t groupBase, uint32_t scratchBase) {
     const uint32_t j = threadIdx.x;
-    if (j >= size) return;
-    const uint32_t off = j * (kind == 2U ? 2U : 4U);
-    if (kind == 0U) {
-        if (rows[off + 1U] != 0xffffffffU) rows[off + 1U] += groupBase;
-        if (rows[off + 2U] != 0xffffffffU) rows[off + 2U] += scratchBase;
-    } else if (kind == 1U) {
-        if (rows[off + 1U]) rows[off] += txBase;
-    } else rows[off + 1U] += scratchBase;
+    if (j < size) AdjustCombineRow(rows + j * (kind == 2U ? 2U : 4U),
+        kind, txBase, groupBase, scratchBase);
 }
 
-__simt_vf__ __launch_bounds__(32) inline void PrefixCombineTaskStatsSimt(
+__simt_callee__ inline void PrefixCombineTaskStats(
     __ubuf__ uint32_t* stats, __ubuf__ uint32_t* totals,
     uint32_t tiles, uint32_t width) {
     const uint32_t col = threadIdx.x;
@@ -4040,6 +4471,50 @@ __simt_vf__ __launch_bounds__(32) inline void PrefixCombineTaskStatsSimt(
         sum += row[field];
     }
     totals[col] = sum;
+}
+
+namespace CombineCountPublication {
+constexpr uint32_t kRecordWords = 16U, kWordBytes = sizeof(uint32_t);
+constexpr uint32_t kTotalsUb = 65536U, kTotalsWords = 32U;
+constexpr uint32_t kSummaryUb = kTotalsUb + kTotalsWords * kWordBytes;
+constexpr uint32_t kSourceRecord = 0U, kGroupRecord = 1U, kLaneRecords = 2U;
+constexpr uint32_t kTxTotal = 0U, kGroupTotal = 1U, kFinalBaseTotal = 2U;
+constexpr uint32_t kDirectTotal = 3U, kLaneTotals = 4U;
+constexpr uint32_t kSourceTx = 0U, kSourceFinalBase = 1U;
+constexpr uint32_t kSourceDirect = 3U, kSourceScratch = 5U;
+static_assert(kSummaryUb + (kLaneRecords + 8U) * kRecordWords * kWordBytes < 80U * 1024U);
+}
+
+__simt_vf__ __launch_bounds__(32) inline void PrefixCombineTaskStatsSimt(
+    __ubuf__ uint32_t* stats, __ubuf__ uint32_t* totals,
+    uint32_t tiles, uint32_t width) {
+    PrefixCombineTaskStats(stats, totals, tiles, width);
+}
+
+__simt_vf__ __launch_bounds__(32) inline void PrefixAndPackCombineTaskStatsSimt(
+    __ubuf__ uint32_t* stats, __ubuf__ uint32_t* totals,
+    __ubuf__ uint32_t* summary, uint32_t tiles, uint32_t width, uint32_t receiverLane) {
+    namespace P = CombineCountPublication;
+    PrefixCombineTaskStats(stats, totals, tiles, width);
+    // Prefix workers publish disjoint totals. Pack only after all are ready.
+    asc_syncthreads();
+    const uint32_t lane = threadIdx.x;
+    for (uint32_t word = lane; word < (P::kLaneRecords + width) * P::kRecordWords; word += 32U)
+        summary[word] = 0U;
+    asc_syncthreads();
+    if (lane == 0U) {
+        auto output = summary + P::kSourceRecord * P::kRecordWords;
+        output[P::kSourceTx] = totals[P::kTxTotal];
+        output[P::kSourceFinalBase] = totals[P::kFinalBaseTotal];
+        output[P::kSourceDirect] = totals[P::kDirectTotal];
+        output[P::kSourceScratch] = totals[P::kLaneTotals + receiverLane];
+    }
+    if (lane == 1U) summary[P::kGroupRecord * P::kRecordWords] = totals[P::kGroupTotal];
+    if (lane < width) {
+        auto output = summary + (P::kLaneRecords + lane) * P::kRecordWords;
+        output[0U] = totals[P::kLaneTotals + lane];
+        output[1U] = totals[P::kLaneTotals + width + lane];
+    }
 }
 
 __simt_vf__ __launch_bounds__(256) inline void CountFinalRoutesSimt(
@@ -4079,17 +4554,20 @@ __simt_callee__ inline void CountFinalChunksSimt(
         if (v >= 0 || forwarded || (server && peer / 8U == rank / 8U)) ++row[peer];
     }
 }
+
 __simt_callee__ inline void PrefixFinalChunksSimt(
     __ubuf__ uint32_t* hist, __ubuf__ uint32_t* cursors, uint32_t r) {
     for (uint32_t peer = threadIdx.x; peer < r; peer += 128U) {
         uint32_t sum = cursors[peer];
         for (uint32_t chunk = 0U; chunk < 32U; ++chunk) {
             const uint32_t off = chunk * (r + 1U) + peer, count = hist[off];
-            hist[off] = sum; sum += count;
+            hist[off] = sum;
+            sum += count;
         }
         cursors[peer] = sum;
     }
 }
+
 __simt_callee__ inline void EmitFinalChunksSimt(
     __ubuf__ int32_t* routes, __ubuf__ uint32_t* hist,
     __ubuf__ uint32_t* packed, uint32_t tokens, uint32_t k,
@@ -4113,6 +4591,7 @@ __simt_callee__ inline void EmitFinalChunksSimt(
         packed[t * 32U] = count;
     }
 }
+
 __simt_vf__ __launch_bounds__(128) inline void BuildFinalRoutesSimt(
     __ubuf__ int32_t* routes, __ubuf__ uint32_t* hist,
     __ubuf__ uint32_t* cursors, __ubuf__ uint32_t* packed,
@@ -4123,6 +4602,756 @@ __simt_vf__ __launch_bounds__(128) inline void BuildFinalRoutesSimt(
     asc_syncthreads();
     EmitFinalChunksSimt(routes, hist, packed, tokens, k, n, r, rank, server);
 }
+
+// A source's packed scratch interval is partitioned into ordered whole-group
+// pages. Its relay row maps to one page interval; no per-row temporary table
+// or remote random gather is needed. Every output writer owns private UB.
+__simt_vf__ __launch_bounds__(1024) inline void MapRingRelayPagesSimt(
+    __ubuf__ uint32_t* pages, __ubuf__ uint32_t* requests,
+    __ubuf__ uint32_t* output, __ubuf__ uint32_t* errors,
+    uint32_t size, uint32_t scratchBegin, uint32_t scratchCount,
+    uint32_t pageCount, uint32_t pageRows) {
+    const uint32_t j = threadIdx.x;
+    if (j == 0U) errors[0] = 0U;
+    asc_syncthreads();
+    if (j < size) {
+        const uint32_t slot = requests[j * 2U + 1U];
+        uint32_t lo = 0U, hi = pageCount;
+        while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2U;
+            if (uint64_t(slot) >= uint64_t(pages[mid * 16U]) + pages[mid * 16U + 1U]) lo = mid + 1U;
+            else hi = mid;
+        }
+        if (slot < scratchBegin || uint64_t(slot) >= uint64_t(scratchBegin) + scratchCount ||
+            lo >= pageCount || slot < pages[lo * 16U] || slot - pages[lo * 16U] >= pageRows) {
+            asc_atomic_add(errors, 1U);
+        } else {
+            output[j * 2U] = lo;
+            output[j * 2U + 1U] = slot - pages[lo * 16U];
+        }
+    }
+}
+
+__simt_vf__ __launch_bounds__(128) inline void ClearRingPagePaddingSimt(
+    __ubuf__ uint32_t* values, uint32_t pages) {
+    for (uint32_t i = threadIdx.x; i < pages * 16U; i += 128U)
+        if (i % 16U >= 4U) values[i] = 0U;
+}
+
+// TX group ordinals already exist after compaction. Gather one packed
+// end/size per group, then validate continuity before scalar page searches.
+// Bounds: TX <=8192 rows (128KiB), groups <=8192 (32KiB), pages16KiB.
+__simt_vf__ __launch_bounds__(256) inline void GatherRingGroupEndsSimt(
+    __ubuf__ uint32_t* tx, __ubuf__ uint32_t* ends,
+    __ubuf__ uint32_t* errors, uint32_t results, uint32_t groups,
+    uint32_t groupBase, uint32_t scratchBegin, uint32_t scratchCount,
+    uint32_t k) {
+    uint32_t error = 0U;
+    for (uint32_t j = threadIdx.x; j < results; j += 256U) {
+        const uint32_t head = tx[j * 4U + 2U];
+        if (head == 0xffffffffU) continue;
+        const uint32_t index = tx[j * 4U + 1U] - groupBase;
+        const uint32_t members = tx[j * 4U + 3U];
+        if (index >= groups || members < 2U || members > k ||
+            head < scratchBegin || uint64_t(head) + members > uint64_t(scratchBegin) + scratchCount) {
+            error = 1U;
+            continue;
+        }
+        ends[index] = ((head - scratchBegin + members) << 5U) | members;
+    }
+    asc_syncthreads();
+    for (uint32_t j = threadIdx.x; j < groups; j += 256U) {
+        const uint32_t end = ends[j] >> 5U, members = ends[j] & 31U;
+        const uint32_t previous = j ? ends[j - 1U] >> 5U : 0U;
+        error |= uint32_t(members < 2U || members > k || end != previous + members ||
+            (j + 1U == groups && end != scratchCount));
+    }
+    if (error) asc_atomic_add(errors, 1U);
+}
+// Source-oriented server planner: decode each local token once, then publish
+// already packed destination buckets. Existing per-source prefixes/compaction
+// and the immutable execution-plan ABI remain unchanged.
+namespace SourceCombinePlanning {
+// All offsets below are uint32 word indices unless the name ends in Bytes/Ub.
+// Decode once per tile; all later stages reuse the address, primary bit and peer.
+constexpr uint32_t kTokens = 128U;
+constexpr uint32_t kBuildThreads = 256U;
+constexpr uint32_t kRanksPerServer = 8U;
+constexpr uint32_t kMaxRanks = 16U;
+constexpr uint32_t kMaxTopK = 16U;
+constexpr uint32_t kMaxServers = kMaxRanks / kRanksPerServer;
+constexpr uint32_t kWordBytes = sizeof(uint32_t);
+constexpr uint32_t kPrimaryBit = 0x80000000U;
+constexpr uint32_t kAddressMask = 0x3fffffffU;
+constexpr uint32_t kInvalid = 0xffffffffU;
+// Source-owned decoding retains128-token tiles through16P.
+constexpr uint32_t kFallbackPeerShift = 32U;
+constexpr uint32_t kFinalPeerShift = 24U;
+
+// Decoded row: [route address/primary, peer, server representative, secondary count].
+constexpr uint32_t kDecodedPeer = kMaxTopK;
+constexpr uint32_t kDecodedRepresentative = kDecodedPeer + kMaxTopK;
+constexpr uint32_t kDecodedSecondaryCount = kDecodedRepresentative + kMaxServers;
+constexpr uint32_t kDecodedWords = kDecodedSecondaryCount + kMaxServers;
+enum TxField : uint32_t { kTxLoff, kTxGroup, kTxScratchHead, kTxMembers, kTxWords };
+enum ContributorField : uint32_t {
+    kContributorTx, kContributorCount, kContributorAddress, kContributorReserved,
+    kContributorWords
+};
+constexpr uint32_t kRelayWords = 2U;
+constexpr uint32_t kFinalWords = 32U; // 128B output descriptor, including count.
+constexpr uint32_t kStatsWords = 64U; // 256B, isolated from neighboring tasks.
+enum StatsField : uint32_t {
+    kStatsTx, kStatsGroups, kStatsFinalBase, kStatsDirect,
+    kStatsTxPrefix, kStatsGroupPrefix
+};
+constexpr uint32_t kLaneStatsBegin = 16U;
+constexpr uint32_t kLaneStatsWords = 4U;
+enum LaneStatsField : uint32_t { kLaneScratch, kLaneRequests, kLaneScratchPrefix, kLaneRequestPrefix };
+// Source-local publication descriptor in the unused tail of each tile record.
+// These fields survive the count-prefix pass, but have no Combine consumer.
+enum PublicationField : uint32_t {
+    kPublishTxBegin = kLaneStatsBegin + kRanksPerServer * kLaneStatsWords,
+    kPublishContributorBegin, kPublishRelayBegin, kPublishRelayCount,
+    kPublicationEnd
+};
+static_assert(kPublicationEnd <= kStatsWords);
+
+
+// Physical prefix columns keep the established TX/group/contributor/relay order.
+// Only remote-server contributor/relay columns are live. Local ones are zero.
+__simt_callee__ inline uint32_t GroupColumn(uint32_t r, uint32_t peer) {
+    return r + peer;
+}
+
+__simt_callee__ inline uint32_t ContributorColumn(uint32_t r, uint32_t peer) {
+    return 2U * r + peer;
+}
+
+__simt_callee__ inline uint32_t RelayColumn(uint32_t r, uint32_t target, uint32_t lane) {
+    return 3U * r + target * kRanksPerServer + lane;
+}
+
+__simt_callee__ inline uint32_t ErrorColumn(uint32_t r) {
+    return (3U + kRanksPerServer) * r;
+}
+
+__simt_callee__ inline uint32_t ColumnCount(uint32_t r) {
+    return ErrorColumn(r) + 1U;
+}
+
+__simt_callee__ inline uint32_t PrefixColumnCount(uint32_t r) {
+    return 2U * r + (r - kRanksPerServer) * (1U + kRanksPerServer) + 1U;
+}
+
+__simt_callee__ inline uint32_t RemotePeer(uint32_t peer, uint32_t source) {
+    const uint32_t localBegin = source / kRanksPerServer * kRanksPerServer;
+    return peer < localBegin ? peer : peer + kRanksPerServer;
+}
+
+__simt_callee__ inline uint32_t CountColumnFromPrefix(uint32_t index, uint32_t r, uint32_t source) {
+    if (index < 2U * r) return index; // All TX and group columns.
+    index -= 2U * r;
+    const uint32_t remoteRanks = r - kRanksPerServer;
+    if (index < remoteRanks) return ContributorColumn(r, RemotePeer(index, source));
+    index -= remoteRanks;
+    if (index < remoteRanks * kRanksPerServer)
+        return RelayColumn(r, RemotePeer(index / kRanksPerServer, source), index % kRanksPerServer);
+    return ErrorColumn(r);
+}
+
+// Prefix storage is dense: TX, group, remote contributor, remote relay,
+// error. Only the small totals vector is expanded to physical consumer columns.
+__simt_callee__ inline uint32_t RemotePeerIndex(uint32_t peer, uint32_t source) {
+    const uint32_t localBegin = source / kRanksPerServer * kRanksPerServer;
+    return peer < localBegin ? peer : peer - kRanksPerServer;
+}
+
+__simt_callee__ inline uint32_t ContributorPrefixColumn(uint32_t r, uint32_t peer, uint32_t source) {
+    return 2U * r + RemotePeerIndex(peer, source);
+}
+
+__simt_callee__ inline uint32_t RelayPrefixColumn(uint32_t r, uint32_t target, uint32_t lane, uint32_t source) {
+    return 2U * r + (r - kRanksPerServer) + RemotePeerIndex(target, source) * kRanksPerServer + lane;
+}
+
+__simt_callee__ inline uint32_t ErrorPrefixColumn(uint32_t r) {
+    return PrefixColumnCount(r) - 1U;
+}
+
+// UB byte layout. The second 8KiB route bank starts at 64KiB; decoded/output
+// regions must retire before it is reused. Prefix and final arenas follow it.
+constexpr uint32_t AlignBytes(uint32_t bytes, uint32_t alignment) {
+    return (bytes + alignment - 1U) / alignment * alignment;
+}
+constexpr uint32_t kSecondRouteBankUb = 64U * 1024U;
+constexpr uint32_t kRouteBankBytes = kTokens * kMaxTopK * kWordBytes;
+constexpr uint32_t kDecodedUb = kRouteBankBytes;
+constexpr uint32_t kTxUb = kDecodedUb + kTokens * kDecodedWords * kWordBytes;
+constexpr uint32_t kContributorUb = kTxUb; // Separate buckets in one output arena.
+constexpr uint32_t kMaxColumns = (3U + kRanksPerServer) * kMaxRanks + 1U;
+constexpr uint32_t kPrefixUb = kSecondRouteBankUb + kRouteBankBytes;
+constexpr uint32_t kMaxPrefixWords = (2U * kMaxRanks +
+    (kMaxRanks - kRanksPerServer) * (1U + kRanksPerServer) + 1U) * kTokens;
+// Derive UB from the active8/16P topology. Retired carry storage and
+// inactive columns leave room for a second TX publication bank.
+struct MetadataUbLayout { uint32_t totals, relay, stats, finalRows, secondTx; };
+__aicore__ inline uint32_t AlignMetadataUb(uint32_t bytes, uint32_t alignment) {
+    return (bytes + alignment - 1U) / alignment * alignment;
+}
+
+__aicore__ inline MetadataUbLayout MakeMetadataUbLayout(uint32_t ranks) {
+    const uint32_t tokens = kTokens;
+    const uint32_t physicalColumns = (3U + kRanksPerServer) * ranks + 1U;
+    const uint32_t prefixColumns = 2U * ranks +
+        (ranks - kRanksPerServer) * (1U + kRanksPerServer) + 1U;
+    const uint32_t totals = kPrefixUb + prefixColumns * tokens * kWordBytes;
+    const uint32_t relay = AlignMetadataUb(totals +
+        (physicalColumns + (2U + kRanksPerServer) * ranks) * kWordBytes, 256U);
+    const uint32_t stats = relay +
+        (tokens * kMaxTopK + 3U * kRanksPerServer * ranks) * kRelayWords * kWordBytes;
+    const uint32_t finalRows = stats + ranks * kStatsWords * kWordBytes;
+    const uint32_t secondTx = AlignMetadataUb(finalRows + tokens * kFinalWords * kWordBytes, 512U);
+    return {totals, relay, stats, finalRows, secondTx};
+}
+// One extra TX head per remote server/token, plus one alignment row per bucket.
+constexpr uint32_t kMaxOutputRows = kTokens * (kMaxTopK + 1U) + 2U * 16U;
+static_assert(kTokens * (kMaxTopK + kMaxServers - 1U) +
+    2U * kMaxRanks <= kMaxOutputRows);
+static_assert(kTxUb + kMaxOutputRows * kTxWords * kWordBytes <= kSecondRouteBankUb);
+
+
+__simt_callee__ inline uint32_t Peer(uint32_t address, uint32_t n, uint32_t nShift) {
+    if (nShift < kFallbackPeerShift) return address >> nShift;
+    return address / n;
+}
+
+__simt_callee__ inline void Decode(
+    __ubuf__ int32_t* routes, __ubuf__ uint32_t* decoded,
+    __ubuf__ uint32_t* prefix, uint32_t tokens, uint32_t k,
+    uint32_t n, uint32_t r, uint32_t source, uint32_t nShift) {
+    const uint32_t t = threadIdx.x;
+    if (t >= kTokens) return;
+    for (uint32_t index = 0U; index < PrefixColumnCount(r); ++index)
+        prefix[index * kTokens + t] = 0U;
+    if (t >= tokens) return;
+    auto row = decoded + t * kDecodedWords;
+    const uint32_t domains = r / kRanksPerServer, local = source / kRanksPerServer;
+    uint32_t representatives[kMaxServers], suppressed[kMaxServers], primaries[kMaxServers];
+    for (uint32_t d = 0U; d < domains; ++d) {
+        representatives[d] = kInvalid;
+        suppressed[d] = 0U;
+        primaries[d] = 0U;
+    }
+    uint32_t error = 0U;
+    for (uint32_t j = 0U; j < k; ++j) {
+        const int32_t v = routes[t * k + j];
+        const uint32_t bits = static_cast<uint32_t>(v);
+        const bool forwarded = (bits & 0xc0000000U) == kPrimaryBit;
+        const uint32_t address = forwarded ? bits & kAddressMask : v >= 0 ? bits : ~bits;
+        const bool primary = v >= 0 || forwarded;
+        row[j] = address | (primary ? kPrimaryBit : 0U);
+        const uint32_t peer = Peer(address, n, nShift);
+        row[kDecodedPeer + j] = peer;
+        if (peer >= r) {error = 1U; continue;}
+        const uint32_t domain = peer / kRanksPerServer;
+        if (primary) {representatives[domain] = j; ++primaries[domain];}
+        else ++suppressed[domain];
+        if (primary || domain == local) ++prefix[peer * kTokens + t];
+    }
+    for (uint32_t domain = 0U; domain < domains; ++domain) {
+        row[kDecodedRepresentative + domain] = representatives[domain];
+        row[kDecodedSecondaryCount + domain] = suppressed[domain];
+        if (!suppressed[domain]) continue;
+        if (primaries[domain] != 1U) {error = 1U; continue;}
+        const uint32_t peer = row[kDecodedPeer + representatives[domain]];
+        prefix[GroupColumn(r, peer) * kTokens + t] = 1U;
+        if (domain == local) continue;
+        prefix[ContributorPrefixColumn(r, peer, source) * kTokens + t] = suppressed[domain] + 1U;
+    }
+    // One route pass for all remote domains; no domain-by-topk re-scan.
+    for (uint32_t j = 0U; j < k; ++j) {
+        const uint32_t target = row[kDecodedPeer + j];
+        if (target >= r) continue;
+        const uint32_t domain = target / kRanksPerServer;
+        if (domain == local || !suppressed[domain] || primaries[domain] != 1U) continue;
+        const uint32_t primaryPeer = row[kDecodedPeer + representatives[domain]];
+        if (target != primaryPeer)
+            ++prefix[RelayPrefixColumn(r, target, primaryPeer % kRanksPerServer, source) * kTokens + t];
+    }
+    prefix[ErrorPrefixColumn(r) * kTokens + t] = error;
+}
+
+// A warp scans one count column in four 32-token runs. Carries stay
+// in registers: no intermediate UB chunk table or carry-application pass.
+constexpr uint32_t kWarpThreads = 32U;
+constexpr uint32_t kTileWarps = kBuildThreads / kWarpThreads;
+__simt_callee__ inline void PrefixColumnsInWarps(
+    __ubuf__ uint32_t* prefix, __ubuf__ uint32_t* totals,
+    uint32_t r, uint32_t source) {
+    const uint32_t lane = threadIdx.x % kWarpThreads;
+    const uint32_t warp = threadIdx.x / kWarpThreads;
+    for (uint32_t col = threadIdx.x; col < ColumnCount(r); col += kBuildThreads) {
+        const uint32_t localServer = source / kRanksPerServer;
+        const bool localContributor = col >= 2U * r && col < 3U * r &&
+            (col - 2U * r) / kRanksPerServer == localServer;
+        const bool localRelay = col >= 3U * r && col < ErrorColumn(r) &&
+            (col - 3U * r) / (kRanksPerServer * kRanksPerServer) == localServer;
+        if (localContributor || localRelay) totals[col] = 0U;
+    }
+    for (uint32_t column = warp; column < PrefixColumnCount(r); column += kTileWarps) {
+        uint32_t carry = 0U;
+        for (uint32_t first = 0U; first < kTokens; first += kWarpThreads) {
+            const uint32_t index = column * kTokens + first + lane;
+            const uint32_t count = prefix[index];
+            uint32_t inclusive = count;
+            for (uint32_t delta = 1U; delta < kWarpThreads; delta *= 2U) {
+                const uint32_t before = asc_shfl_up(inclusive, delta, kWarpThreads);
+                if (lane >= delta) inclusive += before;
+            }
+            prefix[index] = carry + inclusive - count;
+            carry += asc_shfl(inclusive, kWarpThreads - 1U, kWarpThreads);
+        }
+        if (lane == 0U) totals[CountColumnFromPrefix(column, r, source)] = carry;
+    }
+}
+
+// Publication uses a 32-byte aligned MTE source. TX/contributor records are
+// 16 bytes each; relay requests are 8 bytes each. These are row alignments,
+// unrelated to the 1GiB/2MiB VMM allocation page size.
+constexpr uint32_t kPublicationAlignmentBytes = 32U;
+constexpr uint32_t kTxBucketAlignmentRows = kPublicationAlignmentBytes / (kTxWords * kWordBytes);
+constexpr uint32_t kContributorBucketAlignmentRows = kPublicationAlignmentBytes / (kContributorWords * kWordBytes);
+constexpr uint32_t kRelayBucketAlignmentRows = kPublicationAlignmentBytes / (kRelayWords * kWordBytes);
+enum OutputBucketWarp : uint32_t { kTxBucketWarp, kContributorBucketWarp, kRelayBucketWarp };
+
+__simt_callee__ inline uint32_t AlignBucketRows(uint32_t rows, uint32_t alignment) {
+    return (rows + alignment - 1U) & ~(alignment - 1U);
+}
+
+// All lanes participate in the shuffle, including padded peers above r.
+__simt_callee__ inline uint32_t WarpInclusiveCount(uint32_t value) {
+    const uint32_t lane = threadIdx.x % kWarpThreads;
+    for (uint32_t step = 1U; step < kWarpThreads; step *= 2U) {
+        const uint32_t previous = asc_shfl_up(value, step, kWarpThreads);
+        if (lane >= step) value += previous;
+    }
+    return value;
+}
+
+__simt_callee__ inline void BuildOutputBuckets(__ubuf__ uint32_t* totals, uint32_t r) {
+    const uint32_t warp = threadIdx.x / kWarpThreads;
+    const uint32_t peer = threadIdx.x % kWarpThreads;
+    const uint32_t columns = ColumnCount(r);
+    const bool validPeer = peer < r;
+    if (warp == kTxBucketWarp) {
+        const uint32_t rows = validPeer ? AlignBucketRows(totals[peer], kTxBucketAlignmentRows) : 0U;
+        const uint32_t inclusive = WarpInclusiveCount(rows);
+        if (validPeer) totals[columns + peer] = inclusive - rows;
+    } else if (warp == kContributorBucketWarp) {
+        const uint32_t txRows = validPeer ? AlignBucketRows(totals[peer], kTxBucketAlignmentRows) : 0U;
+        const uint32_t contributorRows = validPeer ?
+            AlignBucketRows(totals[ContributorColumn(r, peer)], kContributorBucketAlignmentRows) : 0U;
+        const uint32_t txInclusive = WarpInclusiveCount(txRows);
+        const uint32_t contributorInclusive = WarpInclusiveCount(contributorRows);
+        const uint32_t txTotal = asc_shfl(txInclusive, kWarpThreads - 1U, kWarpThreads);
+        if (validPeer)
+            totals[columns + r + peer] = txTotal + contributorInclusive - contributorRows;
+    } else if (warp == kRelayBucketWarp) {
+        // Eight dense lane segments form one destination bucket. Only the
+        // complete bucket needs 32-byte alignment for its MTE source address.
+        uint32_t rows = 0U;
+        if (validPeer) {
+            for (uint32_t lane = 0U; lane < kRanksPerServer; ++lane)
+                rows += totals[RelayColumn(r, peer, lane)];
+        }
+        const uint32_t paddedRows = AlignBucketRows(rows, kRelayBucketAlignmentRows);
+        uint32_t offset = WarpInclusiveCount(paddedRows) - paddedRows;
+        if (validPeer) {
+            for (uint32_t lane = 0U; lane < kRanksPerServer; ++lane) {
+                const uint32_t bucket = peer * kRanksPerServer + lane;
+                totals[columns + 2U * r + bucket] = offset;
+                offset += totals[RelayColumn(r, peer, lane)];
+            }
+        }
+    }
+}
+
+__simt_callee__ inline void Emit(
+    __ubuf__ uint32_t* decoded, __ubuf__ uint32_t* prefix,
+    __ubuf__ uint32_t* totals, __ubuf__ uint32_t* tx,
+    __ubuf__ uint32_t* contributors, __ubuf__ uint32_t* relays,
+    uint32_t tokens, uint32_t k, uint32_t n, uint32_t r, uint32_t source, __ubuf__ uint32_t* finalRows, bool buildFinal) {
+    const uint32_t t = threadIdx.x, cols = ColumnCount(r);
+    if (t >= tokens || totals[ErrorColumn(r)]) return;
+    auto row = decoded + t * kDecodedWords;
+    const uint32_t local = source / kRanksPerServer;
+    auto finalRow = finalRows + t * kFinalWords;
+    uint32_t finalCount = 0U;
+    if (buildFinal) for (uint32_t word = 0U; word < kFinalWords; ++word) finalRow[word] = 0U;
+    uint32_t ordinal[kMaxRanks];
+    for (uint32_t peer = 0U; peer < r; ++peer) ordinal[peer] = 0U;
+    for (uint32_t j = 0U; j < k; ++j) {
+        const uint32_t address = row[j] & kAddressMask, peer = row[kDecodedPeer + j], domain = peer / kRanksPerServer;
+        const bool primary = (row[j] & kPrimaryBit) != 0U;
+        if (!primary && domain != local) continue;
+        const uint32_t index = prefix[peer * kTokens + t] + ordinal[peer]++;
+        const bool head = primary && row[kDecodedSecondaryCount + domain] && row[kDecodedRepresentative + domain] == j;
+        const uint32_t pos = (totals[cols + peer] + index) * 4U;
+        tx[pos + kTxLoff] = address - peer * n;
+        tx[pos + kTxGroup] = head ? prefix[GroupColumn(r, peer) * kTokens + t] : kInvalid;
+        tx[pos + kTxScratchHead] = head && domain != local ? prefix[ContributorPrefixColumn(r, peer, source) * kTokens + t] : kInvalid;
+        tx[pos + kTxMembers] = head && domain != local ? row[kDecodedSecondaryCount + domain] + 1U : 1U;
+        if (buildFinal) {
+            finalRow[1U + finalCount++] = peer == source ? kPrimaryBit | (address - peer * n) :
+                (peer << kFinalPeerShift) | index;
+        }
+    }
+    if (buildFinal) finalRow[0] = finalCount;
+    for (uint32_t domain = 0U; domain < r / kRanksPerServer; ++domain) {
+        if (domain == local || !row[kDecodedSecondaryCount + domain]) continue;
+        const uint32_t representative = row[kDecodedRepresentative + domain];
+        const uint32_t peer = row[kDecodedPeer + representative], lane = peer % kRanksPerServer;
+        const uint32_t head = prefix[ContributorPrefixColumn(r, peer, source) * kTokens + t];
+        uint32_t member = 0U, seen[kRanksPerServer] = {};
+        // Primary first, then secondary routes in original top-k order.
+        for (uint32_t turn = 0U; turn <= k; ++turn) {
+            const uint32_t j = turn ? turn - 1U : representative;
+            if (turn && ((row[j] & kPrimaryBit) || row[kDecodedPeer + j] / kRanksPerServer != domain)) continue;
+            const uint32_t address = row[j] & kAddressMask, target = row[kDecodedPeer + j];
+            const uint32_t c = (totals[cols + r + peer] + head + member) * 4U;
+            contributors[c + kContributorTx] = member ? 0U : prefix[peer * kTokens + t];
+            contributors[c + kContributorCount] = member ? 0U : row[kDecodedSecondaryCount + domain] + 1U;
+            contributors[c + kContributorAddress] = address;
+            contributors[c + kContributorReserved] = 0U;
+            if (target != peer) {
+                const uint32_t pos = (totals[cols + 2U * r + target * kRanksPerServer + lane] +
+                    prefix[RelayPrefixColumn(r, target, lane, source) * kTokens + t] + seen[target % kRanksPerServer]++) * 2U;
+                relays[pos] = address - target * n;
+                relays[pos + 1U] = head + member;
+            }
+            ++member;
+        }
+    }
+}
+
+__simt_callee__ inline void WriteStats(
+    __ubuf__ uint32_t* totals, __ubuf__ uint32_t* stats, uint32_t r, uint32_t source) {
+    for (uint32_t i = threadIdx.x; i < r * kStatsWords; i += kBuildThreads) stats[i] = 0U;
+    asc_syncthreads();
+    const uint32_t peer = threadIdx.x;
+    if (peer >= r) return;
+    auto row = stats + peer * kStatsWords;
+    row[kStatsTx] = totals[peer];
+    row[kStatsGroups] = totals[GroupColumn(r, peer)];
+    uint32_t before = 0U;
+    for (uint32_t p = 0U; p < peer; ++p) before += totals[p];
+    row[kStatsFinalBase] = before;
+    row[kStatsDirect] = totals[peer] - (peer / kRanksPerServer != source / kRanksPerServer ? totals[r + peer] : 0U);
+    uint32_t requests = 0U;
+    for (uint32_t lane = 0U; lane < kRanksPerServer; ++lane) {
+        row[kLaneStatsBegin + lane * kLaneStatsWords + kLaneScratch] = totals[2U * r + peer / kRanksPerServer * kRanksPerServer + lane];
+        const uint32_t count = totals[RelayColumn(r, peer, lane)];
+        row[kLaneStatsBegin + lane * kLaneStatsWords + kLaneRequests] = count;
+        requests += count;
+    }
+    const uint32_t buckets = ColumnCount(r);
+    row[kPublishTxBegin] = totals[buckets + peer];
+    row[kPublishContributorBegin] = totals[buckets + r + peer];
+    row[kPublishRelayBegin] = totals[buckets + 2U * r + peer * kRanksPerServer];
+    row[kPublishRelayCount] = requests;
+}
+
+__simt_vf__ __launch_bounds__(256) inline void Build(
+    __ubuf__ int32_t* routes, __ubuf__ uint32_t* decoded,
+    __ubuf__ uint32_t* prefix,
+    __ubuf__ uint32_t* totals, __ubuf__ uint32_t* tx,
+    __ubuf__ uint32_t* contributors, __ubuf__ uint32_t* relays,
+    __ubuf__ uint32_t* stats, __ubuf__ uint32_t* finalRows, uint32_t tokens, uint32_t k,
+    uint32_t n, uint32_t r, uint32_t source, uint32_t nShift, bool buildFinal) {
+    Decode(routes, decoded, prefix, tokens, k, n, r, source, nShift);
+    asc_syncthreads();
+    PrefixColumnsInWarps(prefix, totals, r, source);
+    asc_syncthreads();
+    BuildOutputBuckets(totals, r);
+    asc_syncthreads();
+    Emit(decoded, prefix, totals, tx, contributors, relays, tokens, k, n, r, source, finalRows, buildFinal);
+    // Emit reads prefix/decoded but WriteStats is disjoint; bucket totals stable.
+    WriteStats(totals, stats, r, source);
+}
+} // namespace SourceCombinePlanning
+
+__simt_vf__ __launch_bounds__(64) inline void PrefixSourceFinalCountsSimt(
+    __ubuf__ uint32_t* counts, uint32_t tiles, uint32_t r) {
+    const uint32_t peer = threadIdx.x;
+    if (peer < r) {
+        uint32_t sum = 0U;
+        for (uint32_t tile = 0U; tile < tiles; ++tile) {
+            const uint32_t count = counts[tile * r + peer];
+            counts[tile * r + peer] = sum;
+            sum += count;
+        }
+        counts[tiles * r + peer] = sum;
+    }
+    asc_syncthreads();
+    if (peer == 0U) {
+        uint32_t before = 0U;
+        for (uint32_t p = 0U; p < r; ++p) {
+            const uint32_t total = counts[tiles * r + p];
+            counts[tiles * r + p] = before;
+            before += total;
+        }
+    }
+}
+
+__simt_vf__ __launch_bounds__(128) inline void FixSourceFinalRoutesSimt(
+    __ubuf__ uint32_t* rows, __ubuf__ uint32_t* prefix,
+    uint32_t tokens, uint32_t tile, uint32_t tiles, uint32_t r) {
+    const uint32_t t = threadIdx.x;
+    if (t >= tokens) return;
+    auto row = rows + t * 32U;
+    for (uint32_t j = 1U; j <= row[0]; ++j) {
+        const uint32_t value = row[j];
+        if (!(value & 0x80000000U)) {
+            const uint32_t peer = value >> 24U;
+            row[j] = (value & 0x00ffffffU) + prefix[tile * r + peer] + prefix[tiles * r + peer];
+        }
+    }
+}
+
+__simt_callee__ inline void CompactDenseRelayLanes(
+    __ubuf__ uint32_t* input, __ubuf__ uint32_t* output,
+    __ubuf__ uint32_t* lanes) {
+    const uint32_t lane = threadIdx.x / 32U, thread = threadIdx.x % 32U;
+    auto desc = lanes + lane * 8U;
+    for (uint32_t j = thread; j < desc[1]; j += 32U) {
+        const uint32_t from = (desc[0] + j) * 2U, to = (desc[2] + j) * 2U;
+        output[to] = input[from];
+        output[to + 1U] = input[from + 1U] + desc[3];
+    }
+}
+namespace SourceCompactLayout {
+constexpr uint32_t kWordBytes = sizeof(uint32_t);
+constexpr uint32_t kThreads = 256U;
+constexpr uint32_t kLanes = SourceCombinePlanning::kRanksPerServer;
+constexpr uint32_t kMaxRows = SourceCombinePlanning::kTokens * SourceCombinePlanning::kMaxTopK;
+constexpr uint32_t kMaxTxContributorRows = SourceCombinePlanning::kMaxOutputRows;
+constexpr uint32_t kRowWords = SourceCombinePlanning::kTxWords;
+constexpr uint32_t kRelayWords = SourceCombinePlanning::kRelayWords;
+constexpr uint32_t kLaneWords = 8U;
+constexpr uint32_t kMetadataWords = 16U;
+enum LaneField : uint32_t { kPackedBegin, kCount, kOutputBegin, kScratchBase, kDestinationBegin };
+constexpr uint32_t AlignUb(uint32_t bytes, uint32_t alignment) {
+    return (bytes + alignment - 1U) / alignment * alignment;
+}
+// TX and contributors share a bounded arena: a token contributes at most K
+// rows plus one group head. Separate banks protect every in-flight MTE3 source.
+constexpr uint32_t kTxUb = 0U;
+constexpr uint32_t kRelayInputUb = kMaxTxContributorRows * kRowWords * kWordBytes;
+constexpr uint32_t kRelayOutputUb = kRelayInputUb + kMaxRows * kRelayWords * kWordBytes;
+constexpr uint32_t kMaxRelayOutputRows = kMaxRows + kLanes * 4U;
+constexpr uint32_t kLaneDescriptorsUb = kRelayOutputUb + kMaxRelayOutputRows * kRelayWords * kWordBytes;
+constexpr uint32_t kBankBytes = AlignUb(kLaneDescriptorsUb + kLanes * kLaneWords * kWordBytes, 512U);
+constexpr uint32_t kBankCount = 2U;
+constexpr uint32_t kRangesUb = AlignUb(kBankCount * kBankBytes, 4096U);
+constexpr uint32_t kSourcesUb = kRangesUb + kLanes * SourceCombinePlanning::kMaxRanks * kMetadataWords * kWordBytes;
+constexpr uint32_t kGroupsUb = kSourcesUb + SourceCombinePlanning::kMaxRanks * kMetadataWords * kWordBytes;
+constexpr uint32_t kTaskStatsUb = kGroupsUb + SourceCombinePlanning::kMaxRanks * kMetadataWords * kWordBytes;
+constexpr uint32_t kTaskStatsWords = SourceCombinePlanning::kStatsWords;
+constexpr uint32_t kCachedStatsUb = AlignUb(kTaskStatsUb + kTaskStatsWords * kWordBytes, 4096U);
+static_assert(kCachedStatsUb + 256U * kTaskStatsWords * kWordBytes <= 216U * 1024U);
+}
+// Shared record transform for both source-owned and receiver-scanned tiles.
+// Bounds and UB lifetimes belong to their respective PS callers.
+namespace CombineCompactFormat {
+constexpr uint32_t kThreads = 256U;
+constexpr uint32_t kRowWords = 4U;
+}
+
+__simt_vf__ __launch_bounds__(256) inline void CompactCombineTablesSimt(
+    __ubuf__ uint32_t* tx, __ubuf__ uint32_t* contributors,
+    __ubuf__ uint32_t* relayInput, __ubuf__ uint32_t* relayOutput,
+    __ubuf__ uint32_t* lanes, uint32_t txCount, uint32_t contributorCount,
+    uint32_t txBase, uint32_t groupBase, uint32_t scratchBase) {
+    for (uint32_t row = threadIdx.x; row < txCount; row += CombineCompactFormat::kThreads)
+        AdjustCombineRow(tx + row * CombineCompactFormat::kRowWords, 0U, txBase, groupBase, scratchBase);
+    for (uint32_t row = threadIdx.x; row < contributorCount; row += CombineCompactFormat::kThreads)
+        AdjustCombineRow(contributors + row * CombineCompactFormat::kRowWords, 1U, txBase, groupBase, scratchBase);
+    CompactDenseRelayLanes(relayInput, relayOutput, lanes);
+}
+namespace ReceiverCompactLayout {
+constexpr uint32_t kSourceBatchRanks = 64U;
+constexpr uint32_t kTileTokens = 256U;
+constexpr uint32_t kMaxTopK = SourceCombinePlanning::kMaxTopK;
+constexpr uint32_t kWordBytes = sizeof(uint32_t);
+constexpr uint32_t kRowWords = SourceCombinePlanning::kTxWords;
+constexpr uint32_t kRelayWords = SourceCombinePlanning::kRelayWords;
+constexpr uint32_t kLanes = SourceCombinePlanning::kRanksPerServer;
+constexpr uint32_t kRecordWords = 16U;
+constexpr uint32_t kStatsWords = SourceCombinePlanning::kStatsWords;
+constexpr uint32_t kMaxCachedTasks = 256U;
+// A remote group adds at most one TX head per token. TX and contributor
+// counts are coupled, so one shared arena needs K+1 rows, not two K arenas.
+constexpr uint32_t kMaxTxContributorRows = kTileTokens * (kMaxTopK + 1U) + 2U;
+constexpr uint32_t kMaxRelayRows = kTileTokens * kMaxTopK + kLanes * 4U;
+constexpr uint32_t kTxUb = 0U;
+constexpr uint32_t kRelayUb = kMaxTxContributorRows * kRowWords * kWordBytes;
+constexpr uint32_t kLanesUb = kRelayUb + kMaxRelayRows * kRelayWords * kWordBytes;
+// Common tiles use two small banks. A rare full-capacity tile uses the
+// whole working arena after both banks retire; metadata stays outside either.
+// A bank holds half of one worst-case tile's route rows. This is only
+// a capacity threshold: every tile still processes all 256 tokens. Larger
+// live counts select the full-capacity buffer instead of truncating data.
+constexpr uint32_t kFastRouteRows = kTileTokens * kMaxTopK / 2U;
+constexpr uint32_t kFastTxContributorRows = kFastRouteRows;
+// Each independently padded lane adds at most three rows.
+constexpr uint32_t kFastRelayRows = kFastRouteRows + kLanes * 3U;
+constexpr uint32_t kFastRelayUb = kFastTxContributorRows * kRowWords * kWordBytes;
+constexpr uint32_t kFastLanesUb = kFastRelayUb + kFastRelayRows * kRelayWords * kWordBytes;
+constexpr uint32_t kFastBankBytes = SourceCompactLayout::AlignUb(kFastLanesUb +
+    kLanes * SourceCompactLayout::kLaneWords * kWordBytes, 512U);
+constexpr uint32_t kBankCount = 2U;
+constexpr uint32_t kLargeBufferBytes = kLanesUb + kLanes * SourceCompactLayout::kLaneWords * kWordBytes;
+constexpr uint32_t kTwoBankBytes = kBankCount * kFastBankBytes;
+constexpr uint32_t kWorkingBytes = kTwoBankBytes > kLargeBufferBytes ? kTwoBankBytes : kLargeBufferBytes;
+constexpr uint32_t kRangesUb = SourceCompactLayout::AlignUb(kWorkingBytes, 4096U);
+constexpr uint32_t kSourcesUb = kRangesUb + kLanes * kSourceBatchRanks * kRecordWords * kWordBytes;
+constexpr uint32_t kGroupsUb = kSourcesUb + kSourceBatchRanks * kRecordWords * kWordBytes;
+constexpr uint32_t kTaskStatsUb = kGroupsUb + kSourceBatchRanks * kRecordWords * kWordBytes;
+constexpr uint32_t kCachedStatsUb = SourceCompactLayout::AlignUb(kTaskStatsUb + kStatsWords * kWordBytes, 4096U);
+static_assert(kCachedStatsUb + kMaxCachedTasks * kStatsWords * kWordBytes <= 216U * 1024U);
+}
+// Prefix only the compact, already counted metadata; no route decoding.
+namespace CombineSourcePrefix {
+constexpr uint32_t kRecordWords = 16U;
+constexpr uint32_t kSourceBatchRanks = 64U;
+constexpr uint32_t kServerRanks = 8U;
+constexpr uint32_t kWordBytes = sizeof(uint32_t);
+constexpr uint32_t kSourceWords = kSourceBatchRanks * kRecordWords;
+constexpr uint32_t kRangeWords = kServerRanks * kSourceWords;
+constexpr uint32_t kStatsUb = 0U;
+constexpr uint32_t kSourcesUb = kStatsUb + kRangeWords * kWordBytes;
+constexpr uint32_t kGroupsUb = kSourcesUb + kSourceWords * kWordBytes;
+constexpr uint32_t kRangesUb = kGroupsUb + kSourceWords * kWordBytes;
+constexpr uint32_t kWarpThreads = 32U;
+constexpr uint32_t kThreads = kServerRanks * kWarpThreads;
+enum CarryField : uint32_t { kRunningScratch, kRunningRequests, kRunningResults, kRunningGroups, kCarryWords };
+constexpr uint32_t kCarryUb = kRangesUb + kRangeWords * kWordBytes;
+constexpr uint32_t kErrorsUb = kCarryUb + kServerRanks * kCarryWords * kWordBytes;
+static_assert(kErrorsUb + kServerRanks * kWordBytes <= 216U * 1024U);
+
+enum StatsField : uint32_t { kScratchCount, kRequestCount, kScratchBase, kRequestBase };
+enum SourceField : uint32_t { kTxCount, kFinalBase, kTxBase, kDirectCount, kSourceScratchBase };
+constexpr uint32_t kGroupBase = 1U;
+// One warp owns one server lane. Consecutive sources are prefix-scanned
+// with shuffles, while four running totals carry across UB source windows.
+__simt_vf__ __launch_bounds__(256) inline void Build(
+    __ubuf__ uint32_t* stats, __ubuf__ uint32_t* sources,
+    __ubuf__ uint32_t* groups, __ubuf__ uint32_t* ranges,
+    __ubuf__ uint32_t* carry, __ubuf__ uint32_t* errors,
+    uint32_t sourceCount, uint32_t receiverLane, uint32_t n) {
+    const uint32_t lane = threadIdx.x / kWarpThreads;
+    const uint32_t thread = threadIdx.x % kWarpThreads;
+    auto state = carry + lane * kCarryWords;
+    uint32_t scratch = state[kRunningScratch], requests = state[kRunningRequests];
+    uint32_t results = state[kRunningResults], groupBase = state[kRunningGroups];
+    uint32_t error = 0U;
+    for (uint32_t first = 0U; first < sourceCount; first += kWarpThreads) {
+        const uint32_t source = first + thread;
+        const bool active = source < sourceCount;
+        const uint32_t index = (lane * sourceCount + source) * kRecordWords;
+        const uint32_t scratchCount = active ? stats[index + kScratchCount] : 0U;
+        const uint32_t requestCount = active ? stats[index + kRequestCount] : 0U;
+        const uint32_t txCount = active && lane == receiverLane ? sources[source * kRecordWords + kTxCount] : 0U;
+        const uint32_t groupCount = active && lane == receiverLane ? groups[source * kRecordWords] : 0U;
+        uint32_t scratchSum = scratchCount, requestSum = requestCount;
+        uint32_t txSum = txCount, groupSum = groupCount;
+        for (uint32_t delta = 1U; delta < kWarpThreads; delta *= 2U) {
+            const uint32_t previousScratch = asc_shfl_up(scratchSum, delta, kWarpThreads);
+            const uint32_t previousRequest = asc_shfl_up(requestSum, delta, kWarpThreads);
+            const uint32_t previousTx = asc_shfl_up(txSum, delta, kWarpThreads);
+            const uint32_t previousGroup = asc_shfl_up(groupSum, delta, kWarpThreads);
+            if (thread >= delta) {
+                scratchSum += previousScratch;
+                requestSum += previousRequest;
+                txSum += previousTx;
+                groupSum += previousGroup;
+            }
+        }
+        if (active) {
+            const uint32_t scratchBase = scratch + scratchSum - scratchCount;
+            const uint32_t requestBase = requests + requestSum - requestCount;
+            error |= uint32_t(scratchCount > n ||
+                uint64_t(scratch) + scratchSum > uint64_t(kServerRanks) * n ||
+                uint64_t(requests) + requestSum > n);
+            stats[index + kScratchBase] = scratchBase;
+            stats[index + kRequestBase] = requestBase;
+            ranges[index] = requestBase;
+            ranges[index + 1U] = requestCount;
+            if (lane == receiverLane) {
+                error |= uint32_t(uint64_t(results) + txSum > n);
+                sources[source * kRecordWords + kTxBase] = results + txSum - txCount;
+                sources[source * kRecordWords + kSourceScratchBase] = scratchBase;
+                groups[source * kRecordWords + kGroupBase] = groupBase + groupSum - groupCount;
+            }
+        }
+        scratch += asc_shfl(scratchSum, kWarpThreads - 1U, kWarpThreads);
+        requests += asc_shfl(requestSum, kWarpThreads - 1U, kWarpThreads);
+        results += asc_shfl(txSum, kWarpThreads - 1U, kWarpThreads);
+        groupBase += asc_shfl(groupSum, kWarpThreads - 1U, kWarpThreads);
+    }
+    for (uint32_t delta = 1U; delta < kWarpThreads; delta *= 2U) {
+        const uint32_t previous = asc_shfl_up(error, delta, kWarpThreads);
+        if (thread >= delta) error |= previous;
+    }
+    if (thread == kWarpThreads - 1U) {
+        state[kRunningScratch] = scratch;
+        state[kRunningRequests] = requests;
+        state[kRunningResults] = results;
+        state[kRunningGroups] = groupBase;
+        errors[lane] = error;
+    }
+}
+} // namespace CombineSourcePrefix
+
+namespace CombineRingPrefix {
+constexpr uint32_t kMaxRanks = 1024U;
+constexpr uint32_t kThreads = 256U;
+constexpr uint32_t kRecordWords = 16U;
+constexpr uint32_t kResultCount = 0U, kDirectCount = 3U, kScratchCount = 5U;
+constexpr uint32_t kPageCount = 6U, kPageBase = 7U, kReservedBegin = 8U;
+constexpr uint32_t kCountsUb = 0U;
+constexpr uint32_t kErrorsUb = kMaxRanks * kRecordWords * sizeof(uint32_t);
+static_assert(kErrorsUb + kMaxRanks * sizeof(uint32_t) <= 216U * 1024U);
+
+// Threads stride over source records up to the supported world-size limit. Prefix inputs remain immutable, so all
+// lanes can scan the small UB snapshot without barriers or GM scalar loads.
+__simt_vf__ __launch_bounds__(256) inline void Build(
+    __ubuf__ uint32_t* counts, __ubuf__ uint32_t* errors,
+    uint32_t ranks, uint32_t rank, uint32_t server,
+    uint32_t pageCapacity, uint32_t n) {
+    for (uint32_t source = threadIdx.x; source < ranks; source += blockDim.x) {
+        auto row = counts + source * kRecordWords;
+        uint64_t pages = 0U, groups = 0U;
+        for (uint32_t previous = 0U; previous < source; ++previous) {
+            auto input = counts + previous * kRecordWords;
+            pages += input[kPageCount];
+            groups += uint64_t(input[kResultCount]) - input[kDirectCount];
+        }
+        const bool local = server && source / 8U == rank / 8U;
+        const uint32_t heads = row[kResultCount] - row[kDirectCount];
+        const uint32_t invalid = uint32_t(
+            int32_t(row[kResultCount]) < 0 || int32_t(row[kDirectCount]) < 0 ||
+            row[kDirectCount] > row[kResultCount] || int32_t(row[kPageCount]) < 0 ||
+            (local && (heads != 0U || row[kScratchCount] != 0U)) ||
+            pages + row[kPageCount] > pageCapacity || groups + heads > n);
+        row[kPageBase] = uint32_t(pages);
+        for (uint32_t word = kReservedBegin; word < kRecordWords; ++word) row[word] = 0U;
+        errors[source] = invalid;
+    }
+}
+} // namespace CombineRingPrefix
+
 // ---- End combine planning SIMT functions ----
 
 using namespace ascend_moonep;
@@ -4172,9 +5401,9 @@ __aicore__ inline bool Primary(int32_t v) {
 
 struct CombinePlanBuilder {
     __gm__ uint8_t* ws;
-    // groups/dups/counts remain launch-ABI inputs for existing callers; the
-    // combine metadata builder derives all its tables from published dst.
-    const __gm__ int32_t *dst, *groups, *dups, *counts;
+    // Duplicate tensors belong to the original Dispatch plan. This builder
+    // reads dst; unused duplicate pointers need not be stored in every instance.
+    const __gm__ int32_t* dst;
     CombinePutLayout p;
     uint32_t n, h, k, r, rank, core;
     bool server;
@@ -4184,7 +5413,7 @@ struct CombinePlanBuilder {
     struct TokenRoutes {
         uint32_t raw[16], peer[16], members[16];
         bool primary[16], active[16];
-        uint32_t suppressed[16], suppressedCount, ownSuppressed;
+        uint32_t suppressed[16], suppressedCount;
     };
 
     __aicore__ __gm__ int32_t* Meta(uint64_t base, uint64_t index) {
@@ -4195,11 +5424,19 @@ struct CombinePlanBuilder {
             return reinterpret_cast<__gm__ int32_t*>(plan + q.relay_ranges + index * 64U);
         return reinterpret_cast<__gm__ int32_t*>(ws + base + index * 64U);
     }
-    __aicore__ uint32_t Width() const { return server ? 8U : 1U; }
-    __aicore__ uint32_t Lane(uint32_t peer) const { return server ? peer % 8U : 0U; }
+
+    __aicore__ uint32_t Width() const {
+        return server ? 8U : 1U;
+    }
+
+    __aicore__ uint32_t Lane(uint32_t peer) const {
+        return server ? peer % 8U : 0U;
+    }
+
     __aicore__ bool LocalSource(uint32_t source) const {
         return server && source / 8U == rank / 8U;
     }
+
     __aicore__ bool LocalDomain(uint32_t peer) const {
         return server ? peer / 8U == rank / 8U : peer == rank;
     }
@@ -4221,30 +5458,34 @@ struct CombinePlanBuilder {
             writerPending = false;
         }
     }
+
     __aicore__ PlanWriter Writer(uint32_t ubOffset, uint64_t table,
                                 uint64_t first, uint32_t words) {
         return {Ub<uint32_t>(ubOffset, 64U * words),
                 reinterpret_cast<__gm__ uint32_t*>(plan + table) + first * words,
                 words, 0U, ubOffset, 0U};
     }
+
     // During planning relay_hidden has no live payload (Init fences the previous
     // invocation). Use it as source-private staging, then compact only valid rows.
     // Each source owns N TX rows, N contributors and Width()*N relay requests.
     // This removes the count-only route pass, without changing any output order.
     __aicore__ bool UseStagedPlan() const {
-        const bool staged = r <= 128U &&
-            uint64_t(r) * (32U + 8U * Width()) <= uint64_t(h) * 16U;
-        if (staged && uint64_t(r) * n * (32U + 8U * Width()) > p.weights - p.relay_hidden)
-            aclshmemi_kernel_abort("combine planning phase pool too small rank=%u\n", rank);
-        return staged;
+        const uint64_t bytesPerSourceRow = 32U + 8U * Width();
+        // Reuse only the existing payload phase pool. Large worlds that do not
+        // fit keep the count/replay path; no rank-specific cutoff or extra HBM.
+        return uint64_t(r) * bytesPerSourceRow <= uint64_t(h) * 16U &&
+            uint64_t(r) * n * bytesPerSourceRow <= p.weights - p.relay_hidden;
     }
+
     __aicore__ uint64_t StagedTable(uint32_t kind, uint32_t source,
                                    uint32_t lane = 0U) const {
         const uint64_t segment = uint64_t(r) * n * 16U;
         return kind == 0U ? uint64_t(source) * n * 16U :
                kind == 1U ? segment + uint64_t(source) * n * 16U :
-               2U * segment + (uint64_t(lane) * r + source) * n * 8U;
+               2U * segment + (UseSourcePlan() ? uint64_t(source) : uint64_t(lane) * r + source) * n * 8U;
     }
+
     __aicore__ PlanWriter StagedWriter(uint32_t ubOffset, uint32_t kind,
                                       uint32_t source, uint32_t lane = 0U) {
         const uint32_t words = kind == 2U ? 2U : 4U;
@@ -4252,6 +5493,7 @@ struct CombinePlanBuilder {
                 reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden +
                     StagedTable(kind, source, lane)), words, 0U, ubOffset, 0U};
     }
+
     __aicore__ void FinishWriter(PlanWriter& w) {
         if (!w.count) return;
         WaitWriter();
@@ -4265,15 +5507,19 @@ struct CombinePlanBuilder {
         w.bank ^= 1U;
         w.buf = Ub<uint32_t>(w.ubOffset + w.bank * 65536U, 64U * w.words);
     }
+
     __aicore__ void Append(PlanWriter& w, uint32_t a, uint32_t b,
                            uint32_t c = 0U, uint32_t d = 0U) {
         const uint32_t off = w.count * w.words;
-        w.buf.SetValue(off, a); w.buf.SetValue(off + 1U, b);
+        w.buf.SetValue(off, a);
+        w.buf.SetValue(off + 1U, b);
         if (w.words == 4U) {
-            w.buf.SetValue(off + 2U, c); w.buf.SetValue(off + 3U, d);
+            w.buf.SetValue(off + 2U, c);
+            w.buf.SetValue(off + 3U, d);
         }
         if (++w.count == 64U) FinishWriter(w);
     }
+
     template <typename T>
     __aicore__ inline void Copy(__gm__ T* to, const __gm__ T* from, uint32_t size) {
         auto buf = Ub<T>(0, kTile);
@@ -4287,6 +5533,7 @@ struct CombinePlanBuilder {
             WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
         }
     }
+
     __aicore__ void ClearReadyFlags() {
         // Same 8-byte fields as before, NOT a memset of the padded ready arena.
         // A strided MTE transfer replaces thousands of scalar store+DCCI pairs.
@@ -4295,17 +5542,23 @@ struct CombinePlanBuilder {
         Duplicate(zero, int32_t(0), 8192U);
         SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        const uint64_t end = p.magic + uint64_t(kCores) * 512U;
+        // Only current payload consumers need initialization. Legacy
+        // relay/reduce/weight ready slots remain reserved but have no readers.
         const uint64_t stride = uint64_t(coreCount) * 512U;
-        for (uint64_t off = p.relay_ready + uint64_t(core) * 512U; off < end;) {
-            const uint64_t left = (end - 1U - off) / stride + 1U;
-            const uint32_t count = left < 1024U ? static_cast<uint32_t>(left) : 1024U;
-            GlobalTensor<int32_t> gm;
-            gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(ws + off));
-            DataCopyExtParams cp{static_cast<uint16_t>(count), 8U, 0U,
-                                 static_cast<uint32_t>(stride - 8U), 0U};
-            DataCopyPad(gm, zero, cp);
-            off += uint64_t(count) * stride;
+        const uint64_t firstFlags[] = {p.final_ready, p.magic};
+        const uint32_t flagCounts[] = {2U * r, kCores};
+        for (uint32_t range = 0U; range < 2U; ++range) {
+            const uint64_t end = firstFlags[range] + uint64_t(flagCounts[range]) * 512U;
+            for (uint64_t off = firstFlags[range] + uint64_t(core) * 512U; off < end;) {
+                const uint64_t left = (end - 1U - off) / stride + 1U;
+                const uint32_t count = left < 1024U ? static_cast<uint32_t>(left) : 1024U;
+                GlobalTensor<int32_t> gm;
+                gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(ws + off));
+                DataCopyExtParams cp{static_cast<uint16_t>(count), 8U, 0U,
+                                     static_cast<uint32_t>(stride - 8U), 0U};
+                DataCopyPad(gm, zero, cp);
+                off += uint64_t(count) * stride;
+            }
         }
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
         WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
@@ -4324,21 +5577,87 @@ struct CombinePlanBuilder {
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
         WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     }
+
     __aicore__ void Init() {
         aclshmemx_sync_vec_all(); // exclude an earlier plan/payload using this workspace
         // Once per plan, never once per combine. No reverse/group table clears.
         ClearReadyFlags();
-        for (uint32_t s = core; s < r; s += coreCount) {
-            auto flag = reinterpret_cast<__gm__ uint64_t*>(
-                ws + p.source_input_ready + uint64_t(s) * 512U);
-            *flag = 0U; Flush(flag);
-        }
-        if (core == 0U) {
-            auto flag = reinterpret_cast<__gm__ uint64_t*>(ws + p.final_gate);
-            *flag = 0U; Flush(flag);
+
+    }
+
+    // These retired symmetric payload tables have no Planning writes. Keep
+    // routes and headers separate: a full 1024P world uses exactly 128 * N
+    // route words, which fits relay_send without inflating sparse tail tiles.
+    __aicore__ bool UseServerPackets() const {
+        // Keep source-owned planning when it is eligible. Other tiled server plans
+        // publish one packet per destination server if both workspace tables fit.
+        if (!server || r % WideCombinePlan::kServerRanks || UseSourcePlan() || !UseTiledPlan())
+            return false;
+        const uint64_t domains = r / WideCombinePlan::kServerRanks;
+        return domains * n * sizeof(int32_t) <= p.relay_publish - p.relay_send &&
+            domains * (n / k) * sizeof(uint32_t) <= p.source_counts - p.final_map;
+    }
+
+    __aicore__ __gm__ uint32_t* PublishedHeaders(uint32_t domain, uint32_t firstToken) {
+        return reinterpret_cast<__gm__ uint32_t*>(ws + p.final_map) + uint64_t(domain) * (n / k) + firstToken;
+    }
+
+    __aicore__ __gm__ int32_t* PublishedEntries(uint32_t domain, uint32_t firstRow) {
+        return reinterpret_cast<__gm__ int32_t*>(ws + p.relay_send) + uint64_t(domain) * n + firstRow;
+    }
+
+    __aicore__ uint32_t PacketRows(uint32_t lastHeader) const {
+        namespace P = WideCombinePlan::ServerPacket;
+        return ((lastHeader & ~P::kInvalidRoute) >> P::kOffsetShift) + (lastHeader & P::kCountMask);
+    }
+
+    __aicore__ void PublishServerPackets() {
+        namespace W = WideCombinePlan;
+        const uint32_t domains = r / W::kServerRanks, tiles = SourceTiles();
+        const uint32_t rowsPerTile = W::kPlanSimtTokens * k;
+        auto routes = Ub<int32_t>(0U, rowsPerTile);
+        auto headers = Ub<uint32_t>(16384U, W::kPlanSimtTokens);
+        auto entries = Ub<int32_t>(32768U, rowsPerTile);
+        auto warps = Ub<uint32_t>(53248U, W::kTileWarps);
+        // Adjacent domains consume the same source tile. Give each core a
+        // contiguous portion of the packets so that it can retain routes in UB.
+        const uint64_t packets = uint64_t(tiles) * domains;
+        const uint32_t begin = packets * core / coreCount;
+        const uint32_t end = packets * (core + 1U) / coreCount;
+        uint32_t loadedTile = tiles;
+        for (uint32_t task = begin; task < end; ++task) {
+            const uint32_t tile = task / domains, domain = task % domains, first = tile * rowsPerTile;
+            const uint32_t rows = n - first < rowsPerTile ? n - first : rowsPerTile;
+            const uint32_t tokens = rows / k;
+            if (tile != loadedTile) {
+                SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                Load(routes, dst + first, rows);
+                SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                loadedTile = tile;
+            }
+            asc_vf_call<W::ServerPacket::Pack>(dim3(W::kPlanSimtTokens),
+                (__ubuf__ int32_t*)routes.GetPhyAddr(), (__ubuf__ uint32_t*)headers.GetPhyAddr(),
+                (__ubuf__ int32_t*)entries.GetPhyAddr(), (__ubuf__ uint32_t*)warps.GetPhyAddr(),
+                tokens, k, n, r, rank, domain);
+            SetFlag<HardEvent::V_S>(EVENT_ID0);
+            WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            const uint32_t used = PacketRows(headers.GetValue(tokens - 1U));
+            if (used > rows) aclshmemi_kernel_abort("combine server packet capacity\n");
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            Store(PublishedHeaders(domain, first / k), headers, tokens);
+            if (used) Store(PublishedEntries(domain, first), entries, used);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
         }
     }
+
     __aicore__ void PublishRoutes() {
+        // Source-owned metadata and Final descriptors read only this rank's
+        // immutable dst. Receiver-scanned fallbacks still publish peer routes.
+        if (UseSourceFinalPlan()) return;
         // TileXR-style published base routes. Reuse the retired reverse_send
         // arena, but pack int32 routes contiguously (not 64-byte records).
         auto published = reinterpret_cast<__gm__ int32_t*>(ws + p.reverse_send);
@@ -4346,14 +5665,17 @@ struct CombinePlanBuilder {
             const uint32_t size = n - first < kTile ? n - first : kTile;
             Copy(published + first, dst + first, size);
         }
+        if (UseServerPackets()) PublishServerPackets();
         PipeBarrier<PIPE_ALL>();
         DataSyncBarrier<MemDsbT::DDR>();
         aclshmemx_sync_vec_all(); // publish completion and ready initialization on every rank
     }
+
     __aicore__ LocalTensor<int32_t> LoadRoutes(uint32_t source, uint32_t first,
                                              uint32_t size) {
         auto local = reinterpret_cast<__gm__ int32_t*>(ws + p.reverse_send);
-        auto remote = reinterpret_cast<__gm__ int32_t*>(aclshmem_ptr(local, source));
+        const __gm__ int32_t* remote = UseSourceFinalPlan() && source == rank
+            ? dst : reinterpret_cast<__gm__ int32_t*>(aclshmem_ptr(local, source));
         auto routes = Ub<int32_t>(0U, kTile);
         SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
         WaitFlag<HardEvent::S_MTE2>(EVENT_ID0); // previous scalar route reads retired
@@ -4362,16 +5684,22 @@ struct CombinePlanBuilder {
         WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
         return routes;
     }
+
     // The retired relay_publish arena is 8*N*64 bytes: it holds R complete
     // int32 route arrays for R<=128. No workspace/plan ABI or allocation change.
     // Larger topologies retain the original second remote read.
-    __aicore__ bool CacheRoutesEnabled() const { return r <= 128U; }
+    __aicore__ bool CacheRoutesEnabled() const {
+        return r <= 128U;
+    }
+
     __aicore__ void PrefetchRoutes(uint32_t source, uint32_t first, uint32_t size,
                                    uint32_t bank, bool cached) {
         // Also fences a previous route-cache store before its UB bank is reused.
         WaitWriter();
         const __gm__ int32_t* from;
-        if (cached && CacheRoutesEnabled()) {
+        if (UseSourceFinalPlan() && source == rank) {
+            from = dst;
+        } else if (cached && CacheRoutesEnabled()) {
             from = reinterpret_cast<__gm__ int32_t*>(ws + p.relay_publish) +
                    uint64_t(source) * n;
         } else {
@@ -4384,10 +5712,12 @@ struct CombinePlanBuilder {
         Load(Ub<int32_t>(bank * 65536U, kTile), from + first, size);
         SetFlag<HardEvent::MTE2_S>(event);
     }
+
     __aicore__ LocalTensor<int32_t> AwaitRoutes(uint32_t bank) {
         WaitFlag<HardEvent::MTE2_S>(bank == 0U ? EVENT_ID0 : EVENT_ID1);
         return Ub<int32_t>(bank * 65536U, kTile);
     }
+
     __aicore__ void CacheRoutes(uint32_t source, uint32_t first, uint32_t size,
                                 LocalTensor<int32_t> routes) {
         if (!CacheRoutesEnabled()) return;
@@ -4399,11 +5729,11 @@ struct CombinePlanBuilder {
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
         writerPending = true;
     }
+
     __aicore__ void DecodeToken(LocalTensor<int32_t> routes, uint32_t offset,
                                uint32_t source, TokenRoutes& token) {
         uint32_t primaries = 0U, representative = 0U;
         token.suppressedCount = 0U;
-        token.ownSuppressed = 0U;
         for (uint32_t j = 0U; j < k; ++j) {
             const int32_t encoded = routes.GetValue(offset + j);
             token.raw[j] = Raw(encoded);
@@ -4415,10 +5745,12 @@ struct CombinePlanBuilder {
                 (server && token.peer[j] / 8U == source / 8U);
             token.members[j] = 1U;
             if (LocalDomain(token.peer[j])) {
-                if (token.primary[j]) { ++primaries; representative = j; }
+                if (token.primary[j]) {
+                    ++primaries;
+                    representative = j;
+                }
                 else {
                     token.suppressed[token.suppressedCount++] = j;
-                    if (token.peer[j] == rank) ++token.ownSuppressed;
                 }
             }
         }
@@ -4430,6 +5762,7 @@ struct CombinePlanBuilder {
         if (token.suppressedCount)
             token.members[representative] += token.suppressedCount;
     }
+
     // Count directly from K encoded routes. Do not materialize TokenRoutes or
     // traverse its arrays again; the full decoding is needed only by the fill.
     __aicore__ void CountToken(LocalTensor<int32_t> routes, uint32_t offset,
@@ -4447,9 +5780,15 @@ struct CombinePlanBuilder {
             const bool primary = Primary(encoded);
             const bool active = primary || (server && peer / 8U == source / 8U);
             if (active && peer < rank) ++finalBase;
-            if (active && peer == rank) { ++results; ++direct; }
+            if (active && peer == rank) {
+                ++results;
+                ++direct;
+            }
             if (LocalDomain(peer)) {
-                if (primary) { ++primaries; representative = peer; }
+                if (primary) {
+                    ++primaries;
+                    representative = peer;
+                }
                 else { ++suppressed; ownSuppressed += peer == rank; }
             }
         }
@@ -4466,9 +5805,18 @@ struct CombinePlanBuilder {
             requests[lane] += ownSuppressed + uint32_t(representative == rank);
         }
     }
+
+    // Rotate the read order, keeping the physical source in all plan indices.
+    // In a synchronized sweep receivers now read different peers at each step.
+    __aicore__ uint32_t ReceiverSource(uint32_t step) const {
+        const uint32_t peer = rank + step;
+        return peer < r ? peer : peer - r;
+    }
+
     __aicore__ void CountSources(bool synchronize = true) {
         const uint32_t pageRows = (kTile / k) * k;
-        for (uint32_t source = core; source < r; source += coreCount) {
+        for (uint32_t step = core; step < r; step += coreCount) {
+            const uint32_t source = ReceiverSource(step);
             uint32_t results = 0U, finalBase = 0U, direct = 0U, groupCount = 0U;
             uint32_t scratch[8] = {}, requests[8] = {};
             PrefetchRoutes(source, 0U, n < pageRows ? n : pageRows, 0U, false);
@@ -4488,23 +5836,102 @@ struct CombinePlanBuilder {
             }
             WaitWriter();
             auto sc = Meta(p.source_counts, source);
-            sc[0] = results; sc[1] = finalBase; sc[2] = 0;
-            sc[3] = direct; sc[4] = 0; sc[5] = scratch[Lane(rank)]; sc[6] = 0;
+            sc[0] = results;
+            sc[1] = finalBase;
+            sc[2] = 0;
+            sc[3] = direct;
+            sc[4] = 0;
+            sc[5] = scratch[Lane(rank)];
+            sc[6] = 0;
             Flush(sc);
             auto gc = Meta(p.counts_send, source);
-            gc[0] = groupCount; gc[1] = 0; Flush(gc);
+            gc[0] = groupCount;
+            gc[1] = 0;
+            Flush(gc);
             for (uint32_t lane = 0U; lane < Width(); ++lane) {
                 // Planner-only local stats: {scratchCount, requestCount,
                 // scratchPrefix, requestPrefix}; no remote metadata PUT.
                 auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source);
-                stats[0] = scratch[lane]; stats[1] = requests[lane];
-                stats[2] = 0; stats[3] = 0; Flush(stats);
+                stats[0] = scratch[lane];
+                stats[1] = requests[lane];
+                stats[2] = 0;
+                stats[3] = 0;
+                Flush(stats);
             }
         }
         DataSyncBarrier<MemDsbT::DDR>();
         if (synchronize) aclshmemi_sync_core<true>();
     }
+
+    // Each UB snapshot contains at most kSourceBatchRanks consecutive sources
+    // from all eight lanes. GM keeps the full-world stride; UB is densely packed.
+    __aicore__ void LoadSourceWindow(LocalTensor<uint32_t> out,
+        const __gm__ uint32_t* input, uint32_t sources) {
+        GlobalTensor<uint32_t> gm;
+        gm.SetGlobalBuffer(const_cast<__gm__ uint32_t*>(input));
+        constexpr uint32_t recordBytes = CombineSourcePrefix::kRecordWords * sizeof(uint32_t);
+        DataCopyExtParams copy{CombineSourcePrefix::kServerRanks, sources * recordBytes, (r - sources) * recordBytes, 0U, 0U};
+        DataCopyPadExtParams<uint32_t> pad{false, 0U, 0U, 0U};
+        DataCopyPad(out, gm, copy, pad);
+    }
+
+    __aicore__ void StoreSourceWindow(__gm__ uint32_t* output,
+        LocalTensor<uint32_t> input, uint32_t sources) {
+        GlobalTensor<uint32_t> gm;
+        gm.SetGlobalBuffer(output);
+        constexpr uint32_t recordBytes = CombineSourcePrefix::kRecordWords * sizeof(uint32_t);
+        DataCopyExtParams copy{CombineSourcePrefix::kServerRanks, sources * recordBytes, 0U, (r - sources) * recordBytes, 0U};
+        DataCopyPad(gm, input, copy);
+    }
+
+    __aicore__ bool TryBuildSourcePrefixesSimt() {
+        namespace P = CombineSourcePrefix;
+        if (!server) return false;
+        if (core == 0U) {
+            auto carry = Ub<uint32_t>(P::kCarryUb, P::kServerRanks * P::kCarryWords);
+            auto errors = Ub<uint32_t>(P::kErrorsUb, P::kServerRanks);
+            Duplicate(carry, uint32_t(0), P::kServerRanks * P::kCarryWords);
+            for (uint32_t begin = 0U; begin < r; begin += P::kSourceBatchRanks) {
+                const uint32_t count = r - begin < P::kSourceBatchRanks ? r - begin : P::kSourceBatchRanks;
+                const uint32_t words = count * P::kRecordWords;
+                const uint32_t rangeWords = P::kServerRanks * words;
+                auto stats = Ub<uint32_t>(P::kStatsUb, rangeWords);
+                auto sources = Ub<uint32_t>(P::kSourcesUb, words);
+                auto groups = Ub<uint32_t>(P::kGroupsUb, words);
+                auto ranges = Ub<uint32_t>(P::kRangesUb, rangeWords);
+                Duplicate(ranges, uint32_t(0), rangeWords);
+                SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                LoadSourceWindow(stats, reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_ranges_send) + begin * P::kRecordWords, count);
+                Load(sources, reinterpret_cast<__gm__ uint32_t*>(plan + q.source_counts) + begin * P::kRecordWords, words);
+                Load(groups, reinterpret_cast<__gm__ uint32_t*>(ws + p.counts_send) + begin * P::kRecordWords, words);
+                SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                asc_vf_call<P::Build>(dim3(P::kThreads), (__ubuf__ uint32_t*)stats.GetPhyAddr(),
+                    (__ubuf__ uint32_t*)sources.GetPhyAddr(), (__ubuf__ uint32_t*)groups.GetPhyAddr(),
+                    (__ubuf__ uint32_t*)ranges.GetPhyAddr(), (__ubuf__ uint32_t*)carry.GetPhyAddr(),
+                    (__ubuf__ uint32_t*)errors.GetPhyAddr(), count, Lane(rank), n);
+                SetFlag<HardEvent::V_S>(EVENT_ID0);
+                WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                for (uint32_t lane = 0U; lane < P::kServerRanks; ++lane)
+                    if (errors.GetValue(lane)) aclshmemi_kernel_abort("combine source prefix capacity\n");
+                SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                StoreSourceWindow(reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_ranges_send) + begin * P::kRecordWords, stats, count);
+                StoreSourceWindow(reinterpret_cast<__gm__ uint32_t*>(plan + q.relay_ranges) + begin * P::kRecordWords, ranges, count);
+                Store(reinterpret_cast<__gm__ uint32_t*>(plan + q.source_counts) + begin * P::kRecordWords, sources, words);
+                Store(reinterpret_cast<__gm__ uint32_t*>(ws + p.counts_send) + begin * P::kRecordWords, groups, words);
+                SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            }
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemi_sync_core<true>();
+        return true;
+    }
+
     __aicore__ void BuildSourcePrefixes() {
+        if (TryBuildSourcePrefixesSimt()) return;
         for (uint32_t laneIndex = core; laneIndex < Width(); laneIndex += coreCount) {
             uint32_t scratch = 0U, requests = 0U, results = 0U, groups = 0U;
             for (uint32_t source = 0U; source < r; ++source) {
@@ -4514,24 +5941,36 @@ struct CombinePlanBuilder {
                     uint64_t(scratch) + stats[0] > 8ULL * n ||
                     uint64_t(requests) + stats[1] > n)
                     aclshmemi_kernel_abort("combine plan scratch/relay capacity rank=%u source=%u\n", rank, source);
-                stats[2] = scratch; stats[3] = requests; Flush(stats);
+                stats[2] = scratch;
+                stats[3] = requests;
+                Flush(stats);
                 auto range = Meta(p.relay_ranges, uint64_t(laneIndex) * r + source);
-                range[0] = requests; range[1] = stats[1]; Flush(range);
+                range[0] = requests;
+                range[1] = stats[1];
+                Flush(range);
                 if (laneIndex == Lane(rank)) {
-                    auto sc = Meta(p.source_counts, source); Flush(sc);
+                    auto sc = Meta(p.source_counts, source);
+                    Flush(sc);
                     if (uint64_t(results) + sc[0] > n)
                         aclshmemi_kernel_abort("combine plan tx capacity rank=%u\n", rank);
-                    sc[2] = results; sc[4] = scratch; Flush(sc);
+                    sc[2] = results;
+                    sc[4] = scratch;
+                    Flush(sc);
                     results += sc[0];
-                    auto gc = Meta(p.counts_send, source); Flush(gc);
-                    gc[1] = groups; groups += gc[0]; Flush(gc);
+                    auto gc = Meta(p.counts_send, source);
+                    Flush(gc);
+                    gc[1] = groups;
+                    groups += gc[0];
+                    Flush(gc);
                 }
-                scratch += stats[0]; requests += stats[1];
+                scratch += stats[0];
+                requests += stats[1];
             }
         }
         DataSyncBarrier<MemDsbT::DDR>();
         aclshmemi_sync_core<true>();
     }
+
     __aicore__ void WriteMember(uint32_t ingress, uint32_t head, uint32_t txIndex,
         uint32_t count, uint32_t member, uint32_t address, uint32_t* requests,
         PlanWriter& contributors, PlanWriter* relays) {
@@ -4546,6 +5985,7 @@ struct CombinePlanBuilder {
             Append(relays[lane], address % n, head + member);
         }
     }
+
     // Fused decode/count/emit for the staged path. Most top-k routes belong to
     // other servers: retain only this rank's active rows and our domain's
     // suppressed contributors, instead of populating and revisiting K-wide
@@ -4573,7 +6013,9 @@ struct CombinePlanBuilder {
             }
             if (LocalDomain(peer)) {
                 if (primary) {
-                    ++primaries; representative = address; representativePeer = peer;
+                    ++primaries;
+                    representative = address;
+                    representativePeer = peer;
                 } else {
                     suppressedRows[suppressedCount++] = address;
                 }
@@ -4595,7 +6037,9 @@ struct CombinePlanBuilder {
                                 count, member + 1U, suppressedRows[member], requests, contributors, relays);
                 scratch[lane] += count;
                 if (representativePeer == rank) {
-                    head = groupHead; members = count; --direct;
+                    head = groupHead;
+                    members = count;
+                    --direct;
                 }
             }
         }
@@ -4606,12 +6050,17 @@ struct CombinePlanBuilder {
         }
         txIndex += ownCount;
     }
+
     __aicore__ void BuildCombineMetadata(bool staged = false, bool synchronize = true) {
         const uint32_t pageRows = (kTile / k) * k;
-        for (uint32_t source = core; source < r; source += coreCount) {
+        for (uint32_t step = core; step < r; step += coreCount) {
+            const uint32_t source = ReceiverSource(step);
             auto sc = Meta(p.source_counts, source);
             auto gc = Meta(p.counts_send, source);
-            if (!staged) { Flush(sc); Flush(gc); }
+            if (!staged) {
+                Flush(sc);
+                Flush(gc);
+            }
             uint32_t txIndex = staged ? 0U : sc[2], groupIndex = staged ? 0U : gc[1];
             uint32_t finalBase = 0U, direct = 0U;
             uint32_t scratch[8] = {}, requests[8] = {};
@@ -4625,7 +6074,9 @@ struct CombinePlanBuilder {
             for (uint32_t lane = 0U; lane < Width(); ++lane) {
                 auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source);
                 if (!staged) {
-                    Flush(stats); scratch[lane] = stats[2]; requests[lane] = stats[3];
+                    Flush(stats);
+                    scratch[lane] = stats[2];
+                    requests[lane] = stats[3];
                 }
                 relays[lane] = staged ? StagedWriter(34816U + lane * 512U, 2U, source, lane) :
                     Writer(34816U + lane * 512U, q.relay_send,
@@ -4677,14 +6128,24 @@ struct CombinePlanBuilder {
             for (uint32_t lane = 0U; lane < Width(); ++lane) FinishWriter(relays[lane]);
             WaitWriter();
             if (staged) {
-                sc[0] = txIndex; sc[1] = finalBase; sc[2] = 0;
-                sc[3] = direct; sc[4] = 0; sc[5] = scratch[Lane(rank)]; sc[6] = 0;
+                sc[0] = txIndex;
+                sc[1] = finalBase;
+                sc[2] = 0;
+                sc[3] = direct;
+                sc[4] = 0;
+                sc[5] = scratch[Lane(rank)];
+                sc[6] = 0;
                 Flush(sc);
-                gc[0] = groupIndex; gc[1] = 0; Flush(gc);
+                gc[0] = groupIndex;
+                gc[1] = 0;
+                Flush(gc);
                 for (uint32_t lane = 0U; lane < Width(); ++lane) {
                     auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source);
-                    stats[0] = scratch[lane]; stats[1] = requests[lane];
-                    stats[2] = 0; stats[3] = 0; Flush(stats);
+                    stats[0] = scratch[lane];
+                    stats[1] = requests[lane];
+                    stats[2] = 0;
+                    stats[3] = 0;
+                    Flush(stats);
                 }
                 continue;
             }
@@ -4705,11 +6166,37 @@ struct CombinePlanBuilder {
     // otherwise leaves a 2-vs-1 (64P) / 3-vs-2 (128P) tail with 56 cores.
     // Temporary record capacity remains N/source: tile t starts at t*256*K.
     // Prefixes restore exact source/token order; no unordered atomic appends.
-    __aicore__ uint32_t SourceTiles() const { return (n / k + 255U) / 256U; }
+    __aicore__ bool UseSourcePlan() const {
+        return server && r <= SourceCombinePlanning::kMaxRanks && r % 8U == 0U && n / k >= 256U && UseStagedPlan();
+    }
+
+    __aicore__ uint32_t TaskTokens() const {
+        return UseSourcePlan() ? 128U : 256U;
+    }
+
+    __aicore__ uint32_t SourceTiles() const {
+        return (n / k + TaskTokens() - 1U) / TaskTokens();
+    }
+    // Each AIV writes only its actual TX, contributor and relay rows. A
+    // private slice avoids atomics. Size it for a worst-case concentration
+    // of the entire plan on one AIV, plus per-tile DMA alignment. Smaller
+    // phase pools use the existing dense staging or count/replay fallback.
+    uint64_t tileStageStride = 0U, tileStageUsed = 0U;
+    static constexpr uint32_t kStageOffsetLow = 6U, kStageOffsetHigh = 7U;
+    __aicore__ void InitTileStaging() {
+        if (!server || UseSourcePlan() || SourceTiles() <= 1U) return;
+        const uint64_t tilesPerCore = (uint64_t(r) * SourceTiles() + coreCount - 1U) / coreCount;
+        constexpr uint64_t rowBytes = 16U + 8U * 16U + 8U * 8U;
+        constexpr uint64_t alignmentPerTile = 2U * 16U + 8U * 3U * 8U;
+        const uint64_t stride = CombinePutAlign(uint64_t(n) * rowBytes + tilesPerCore * alignmentPerTile);
+        if (stride <= (p.weights - p.relay_hidden) / coreCount) tileStageStride = stride;
+    }
+
     __aicore__ bool UseTiledPlan() const {
-        return UseStagedPlan() && SourceTiles() > 1U &&
+        return (tileStageStride || UseStagedPlan()) && SourceTiles() > 1U &&
                uint64_t(r) * SourceTiles() * 256U <= uint64_t(n) * 512U;
     }
+
     __aicore__ __gm__ uint32_t* TileStats(uint32_t task) {
         // relay_publish is otherwise used only by the mutually exclusive
         // fallback route cache. Each task owns isolated cachelines (256B).
@@ -4717,12 +6204,58 @@ struct CombinePlanBuilder {
         // [16+4*lane..+3]: scratch/request counts and their tile prefixes.
         return reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_publish + uint64_t(task) * 256U);
     }
-    __aicore__ void PrefetchTask(uint32_t task, uint32_t bank) {
-        const uint32_t source = task / SourceTiles();
-        const uint32_t first = (task % SourceTiles()) * 256U * k;
-        const uint32_t size = n - first < 256U * k ? n - first : 256U * k;
-        PrefetchRoutes(source, first, size, bank, false);
+    struct PacketRead {
+        __gm__ int32_t* payload;
+        uint32_t prefetched;
+    };
+    PacketRead packetReads[2] = {};
+    __aicore__ LocalTensor<uint32_t> PacketHeaders(uint32_t bank) const {
+        namespace W = WideCombinePlan;
+        return Ub<uint32_t>(W::ServerPacket::kHeaderBanksUb + bank * W::kPlanSimtTokens * sizeof(uint32_t),
+            W::kPlanSimtTokens);
     }
+
+    __aicore__ void PrefetchTask(uint32_t step, uint32_t tiles, uint32_t rowsPerTile, uint32_t bank, bool filtered) {
+        namespace W = WideCombinePlan;
+        const uint32_t source = ReceiverSource(step / tiles), tile = step % tiles;
+        const uint32_t first = tile * rowsPerTile;
+        const uint32_t size = n - first < rowsPerTile ? n - first : rowsPerTile;
+        if (!filtered) {
+            PrefetchRoutes(source, first, size, bank, false);
+            return;
+        }
+        const uint32_t domain = rank / W::kServerRanks;
+        auto headers = reinterpret_cast<__gm__ uint32_t*>(aclshmem_ptr(PublishedHeaders(domain, first / k), source));
+        auto payload = reinterpret_cast<__gm__ int32_t*>(aclshmem_ptr(PublishedEntries(domain, first), source));
+        // Prefetch two average shares alongside the headers. Skewed tiles
+        // fetch the exact remainder after reading the last token's header.
+        const uint32_t domains = r / W::kServerRanks;
+        const uint32_t estimate = ((2U * size + domains - 1U) / domains + 7U) & ~7U;
+        const uint32_t preview = estimate < size ? estimate : size;
+        packetReads[bank] = {payload, preview};
+        const event_t event = bank ? EVENT_ID1 : EVENT_ID0;
+        SetFlag<HardEvent::S_MTE2>(event);
+        WaitFlag<HardEvent::S_MTE2>(event);
+        Load(PacketHeaders(bank), headers, size / k);
+        Load(Ub<int32_t>(bank * 65536U, preview), payload, preview);
+        SetFlag<HardEvent::MTE2_S>(event);
+    }
+
+    __aicore__ void CompletePacketRead(uint32_t bank, uint32_t size) {
+        const uint32_t rows = PacketRows(PacketHeaders(bank).GetValue(size / k - 1U));
+        if (rows > size) aclshmemi_kernel_abort("invalid combine server packet length\n");
+        const auto read = packetReads[bank];
+        if (rows <= read.prefetched) return;
+        const uint32_t missing = rows - read.prefetched;
+        const event_t event = bank ? EVENT_ID1 : EVENT_ID0;
+        SetFlag<HardEvent::S_MTE2>(event);
+        WaitFlag<HardEvent::S_MTE2>(event);
+        Load(Ub<int32_t>(bank * 65536U + read.prefetched * sizeof(int32_t), missing),
+            read.payload + read.prefetched, missing);
+        SetFlag<HardEvent::MTE2_S>(event);
+        WaitFlag<HardEvent::MTE2_S>(event);
+    }
+
     __aicore__ void StoreSimtRows(uint32_t kind, uint32_t source, uint32_t lane,
         uint32_t first, uint32_t column, uint32_t ubOffset) {
         auto totals = Ub<uint32_t>(kPlanTotalsUb, 64U);
@@ -4734,9 +6267,10 @@ struct CombinePlanBuilder {
             StagedTable(kind, source, lane)) + uint64_t(first + begin) * words;
         // All output UB ranges are disjoint and VF is already retired. Queue
         // every nonempty table, then one completion covers the entire slice.
-        Store(out, Ub<uint32_t>(ubOffset, 64U * 16U * words), count * words);
+        Store(out, Ub<uint32_t>(ubOffset, count * words), count * words);
         writerPending = true;
     }
+
     __aicore__ void StageTaskSimt(LocalTensor<int32_t> routes, uint32_t source,
                                   uint32_t first, uint32_t size) {
         auto decoded = Ub<uint32_t>(kPlanDecodedUb, 64U * 40U);
@@ -4775,31 +6309,301 @@ struct CombinePlanBuilder {
         }
         WaitWriter();
     }
+
+    template <uint32_t FixedTopK>
+    __aicore__ void LaunchWideWarp(LocalTensor<int32_t> routes, LocalTensor<uint32_t> totals,
+        uint32_t txUb, uint32_t tokens, uint32_t source, __ubuf__ uint32_t* headers) {
+        namespace W = WideCombinePlan;
+        asc_vf_call<W::BuildCombineSliceWarpSimt<FixedTopK>>(dim3(256),
+            (__ubuf__ int32_t*)routes.GetPhyAddr(),
+            (__ubuf__ uint32_t*)Ub<uint32_t>(W::kPlanDecodedUb, 256U * 37U).GetPhyAddr(),
+            (__ubuf__ uint32_t*)Ub<uint32_t>(W::kPlanPrefixUb, 21U * 256U).GetPhyAddr(),
+            (__ubuf__ uint32_t*)totals.GetPhyAddr(),
+            (__ubuf__ uint32_t*)Ub<uint32_t>(W::kPlanStatsUb, W::kStatsWords).GetPhyAddr(),
+            (__ubuf__ uint32_t*)Ub<uint32_t>(txUb, 1U).GetPhyAddr(),
+            (__ubuf__ uint32_t*)Ub<uint32_t>(W::kPlanContributorUb, 1U).GetPhyAddr(),
+            (__ubuf__ uint32_t*)Ub<uint32_t>(W::kPlanRelayUb, 1U).GetPhyAddr(),
+            tokens, k, n, r, rank, source, static_cast<uint32_t>(server), headers);
+    }
+
+    __aicore__ void StorePackedTile(LocalTensor<uint32_t> counts, uint32_t txUb,
+        uint32_t source, uint32_t first) {
+        namespace W = WideCombinePlan;
+        const uint32_t tx = counts.GetValue(W::kTxCount);
+        const uint32_t contributors = counts.GetValue(W::kScratchBegin + Lane(rank));
+        const uint32_t lastLane = W::kServerRanks - 1U;
+        const uint32_t relayRows = counts.GetValue(W::kRelayOffsetsBegin + lastLane) +
+            ((counts.GetValue(W::kRelayBegin + lastLane) + 3U) & ~3U);
+        const uint32_t contributorStart = (tx + 1U) & ~1U;
+        const uint32_t relayStartWords = (contributorStart + ((contributors + 1U) & ~1U)) * 4U;
+        const uint32_t bytes = (relayStartWords + relayRows * 2U) * sizeof(uint32_t);
+        if (tileStageUsed + bytes > tileStageStride) aclshmemi_kernel_abort("combine tile stage overflow\n");
+        const uint64_t offset = core * tileStageStride + tileStageUsed;
+        tileStageUsed += bytes;
+        auto out = reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden + offset);
+        if (tx) Store(out, Ub<uint32_t>(txUb, tx * 4U), tx * 4U);
+        if (contributors) Store(out + contributorStart * 4U,
+            Ub<uint32_t>(W::kPlanContributorUb, contributors * 4U), contributors * 4U);
+        if (relayRows) Store(out + relayStartWords, Ub<uint32_t>(W::kPlanRelayUb, relayRows * 2U), relayRows * 2U);
+        auto stats = Ub<uint32_t>(W::kPlanStatsUb, W::kStatsWords);
+        stats.SetValue(kStageOffsetLow, static_cast<uint32_t>(offset));
+        stats.SetValue(kStageOffsetHigh, static_cast<uint32_t>(offset >> 32U));
+        SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+        Store(TileStats(source * SourceTiles() + first / (TaskTokens() * k)), stats, W::kStatsWords);
+        writerPending = true;
+    }
+
+    __aicore__ void StageTaskWide(LocalTensor<int32_t> routes, uint32_t source,
+                                  uint32_t first, uint32_t size, __ubuf__ uint32_t* headers) {
+        namespace W = WideCombinePlan;
+        const uint32_t tokens = size / k;
+        if (tokens > 256U) aclshmemi_kernel_abort("combine wide token capacity\n");
+        const uint32_t txUb = LocalSource(source) ? W::kPlanTxUb : W::kPlanRemoteTxUb;
+        auto totals = Ub<uint32_t>(W::kPlanTotalsUb, 64U);
+        const bool packedWarp = server;
+        if (!packedWarp) for (uint32_t col = 0U; col < W::kPlanSimtColumns; ++col) totals.SetValue(col, 0U);
+        WaitWriter();
+        SetFlag<HardEvent::S_V>(EVENT_ID0);
+        WaitFlag<HardEvent::S_V>(EVENT_ID0);
+        if (packedWarp) {
+            if (!headers && k == W::kTransposeTopK)
+                LaunchWideWarp<W::kTransposeTopK>(routes, totals, txUb, tokens, source, headers);
+            else LaunchWideWarp<0U>(routes, totals, txUb, tokens, source, headers);
+        } else {
+            asc_vf_call<W::BuildCombineSliceSimt>(dim3(256),
+                (__ubuf__ int32_t*)routes.GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(W::kPlanDecodedUb, 256U * 37U).GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(W::kPlanPrefixUb, 21U * 256U).GetPhyAddr(),
+                (__ubuf__ uint32_t*)totals.GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(W::kPlanChunksUb, 21U * 32U).GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(txUb, 1U).GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(W::kPlanContributorUb, 1U).GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(W::kPlanRelayUb, 1U).GetPhyAddr(),
+                tokens, k, n, r, rank, source, static_cast<uint32_t>(server));
+        }
+        SetFlag<HardEvent::V_S>(EVENT_ID0);
+        WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        if (totals.GetValue(20U)) aclshmemi_kernel_abort("combine wide invalid route counts rank=%u source=%u\n", rank, source);
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        if (tileStageStride) {
+            StorePackedTile(totals, txUb, source, first);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            WaitWriter();
+            return;
+        }
+        // StoreSimtRows reads the same totals ABI; supply the wide totals below.
+        for (uint32_t kind = 0U; kind < 2U + Width(); ++kind) {
+            const uint32_t lane = kind >= 2U ? kind - 2U : 0U;
+            const uint32_t column = kind == 0U ? 0U : kind == 1U ? 4U + Lane(rank) : 12U + lane;
+            const uint32_t count = totals.GetValue(column);
+            if (!count) continue;
+            const uint32_t words = kind >= 2U ? 2U : 4U;
+            const uint32_t ub = kind == 0U ? txUb : kind == 1U ? W::kPlanContributorUb :
+                W::kPlanRelayUb + totals.GetValue(56U + lane) * 8U;
+            auto out = reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden +
+                StagedTable(kind >= 2U ? 2U : kind, source, lane)) + uint64_t(first) * words;
+            Store(out, Ub<uint32_t>(ub, count * words), count * words);
+            writerPending = true;
+        }
+        if (packedWarp) {
+            const uint32_t tile = first / (TaskTokens() * k);
+            Store(TileStats(source * SourceTiles() + tile), Ub<uint32_t>(W::kPlanStatsUb, W::kStatsWords), W::kStatsWords);
+            writerPending = true;
+        }
+        if (writerPending) SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitWriter();
+    }
+
+    __aicore__ bool UseSourceFinalPlan() const {
+        return UseSourcePlan() && SourceTiles() < 128U && uint64_t(SourceTiles() + 1U) * r <= n;
+    }
+
+    __aicore__ void FinishSourceFinalRoutes() {
+        const uint32_t tiles = SourceTiles(), words = (tiles + 1U) * r;
+        auto matrix = Ub<uint32_t>(0U, words);
+        auto saved = reinterpret_cast<__gm__ uint32_t*>(ws + p.reverse_send);
+        if (core == 0U) {
+            SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            Load(matrix, saved, tiles * r);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            asc_vf_call<PrefixSourceFinalCountsSimt>(dim3(64), (__ubuf__ uint32_t*)matrix.GetPhyAddr(), tiles, r);
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            Store(saved, matrix, words);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemi_sync_core<true>();
+        SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+        WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+        Load(matrix, saved, words);
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        auto rows = Ub<uint32_t>(32768U, 128U * 32U);
+        for (uint32_t first = core * 128U; first < n / k; first += coreCount * 128U) {
+            const uint32_t count = n / k - first < 128U ? n / k - first : 128U;
+            auto output = reinterpret_cast<__gm__ uint32_t*>(plan + q.final_routes) + uint64_t(first) * 32U;
+            SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            Load(rows, output, count * 32U);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            asc_vf_call<FixSourceFinalRoutesSimt>(dim3(128),
+                (__ubuf__ uint32_t*)rows.GetPhyAddr(), (__ubuf__ uint32_t*)matrix.GetPhyAddr(),
+                count, first / TaskTokens(), tiles, r);
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            Store(output, rows, count * 32U);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemi_sync_core<true>();
+    }
+
+    __aicore__ uint32_t SourcePeerShift() const {
+        if (!n || (n & (n - 1U))) return 32U;
+        uint32_t shift = 0U, value = n;
+        while (value > 1U) {value >>= 1U; ++shift;}
+        return shift;
+    }
+
+    __aicore__ void PrefetchSourceTask(uint32_t tile, uint32_t bank) {
+        PrefetchRoutes(rank, tile * 128U * k,
+            n - tile * 128U * k < 128U * k ? n - tile * 128U * k : 128U * k, bank, false);
+    }
+
+    __aicore__ void BuildSourceTiledMetadata() {
+        namespace U = SourceCombinePlanning;
+        const uint32_t tiles = SourceTiles(), columns = (3U + U::kRanksPerServer) * r + 1U;
+        const uint32_t peerShift = SourcePeerShift();
+        const bool buildFinal = UseSourceFinalPlan();
+        const auto ub = U::MakeMetadataUbLayout(r);
+        const bool overlapTx = true;
+        const uint32_t metadataEnd = ub.finalRows + TaskTokens() * U::kFinalWords * U::kWordBytes;
+        const uint32_t txEnd = overlapTx ? ub.secondTx + U::kMaxOutputRows * U::kTxWords * U::kWordBytes : metadataEnd;
+        if (metadataEnd > 216U * 1024U || txEnd > 216U * 1024U)
+            aclshmemi_kernel_abort("combine source publication UB capacity\n");
+        bool txPending[2] = {false, false}, sharedPending = false;
+        // Event1 owns shared Relay/Stats/Final; events2/3 own TX banks.
+
+        if (core < tiles) PrefetchSourceTask(core, 0U);
+        for (uint32_t tile = core; tile < tiles; tile += coreCount) {
+            const uint32_t first = tile * TaskTokens() * k, bank = (tile / coreCount) & 1U;
+            const uint32_t size = n - first < TaskTokens() * k ? n - first : TaskTokens() * k;
+            const uint32_t txBank = overlapTx ? bank : 0U;
+            const uint32_t txUb = txBank ? ub.secondTx : U::kTxUb;
+            const event_t txEvent = txBank ? EVENT_ID3 : EVENT_ID2;
+            auto routes = AwaitRoutes(bank);
+            if (tile + coreCount < tiles) PrefetchSourceTask(tile + coreCount, bank ^ 1U);
+            WaitWriter();
+            if (sharedPending) {WaitFlag<HardEvent::MTE3_S>(EVENT_ID1); sharedPending = false;}
+            if (txPending[txBank]) {WaitFlag<HardEvent::MTE3_S>(txEvent); txPending[txBank] = false;}
+            SetFlag<HardEvent::S_V>(EVENT_ID0);
+            WaitFlag<HardEvent::S_V>(EVENT_ID0);
+            asc_vf_call<U::Build>(dim3(U::kBuildThreads),
+                (__ubuf__ int32_t*)routes.GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(U::kDecodedUb, U::kTokens * U::kDecodedWords).GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(U::kPrefixUb, U::kMaxPrefixWords).GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(ub.totals, columns + 10U * r).GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(txUb, 1U).GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(txUb, 1U).GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(ub.relay, 1U).GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(ub.stats, r * U::kStatsWords).GetPhyAddr(),
+                (__ubuf__ uint32_t*)Ub<uint32_t>(ub.finalRows, U::kTokens * U::kFinalWords).GetPhyAddr(),
+                size / k, k, n, r, rank, peerShift, buildFinal);
+            SetFlag<HardEvent::V_S>(EVENT_ID0);
+            WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            auto totals = Ub<uint32_t>(ub.totals, columns + 10U * r);
+            if (totals.GetValue(11U * r)) aclshmemi_kernel_abort("combine source plan invalid routes\n");
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            for (uint32_t peer = 0U; peer < r; ++peer) {
+                auto remote = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(ws, peer));
+                auto publication = Ub<uint32_t>(ub.stats + peer * U::kStatsWords * U::kWordBytes, U::kStatsWords);
+                const uint32_t requests = publication.GetValue(U::kPublishRelayCount);
+                if (requests > size) aclshmemi_kernel_abort("combine dense relay source capacity\n");
+                if (requests) Store(reinterpret_cast<__gm__ uint32_t*>(remote + p.relay_hidden + StagedTable(2U, rank)) + uint64_t(first) * 2U,
+                    Ub<uint32_t>(ub.relay + publication.GetValue(U::kPublishRelayBegin) * 8U, requests * 2U), requests * 2U);
+                Store(reinterpret_cast<__gm__ uint32_t*>(remote + p.relay_publish + uint64_t(rank * tiles + tile) * 256U),
+                    Ub<uint32_t>(ub.stats + peer * 256U, 64U), 64U);
+            }
+            if (buildFinal) {
+                Store(reinterpret_cast<__gm__ uint32_t*>(plan + q.final_routes) + uint64_t(first / k) * 32U,
+                    Ub<uint32_t>(ub.finalRows, U::kTokens * U::kFinalWords), size / k * 32U);
+                GlobalTensor<uint32_t> gm;
+                // Source-final skips PublishRoutes and reads immutable dst, so
+                // reverse_send is already retired. Publish Final counts at
+                // their final prefix location; avoid the later copy/join.
+                gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(ws + p.reverse_send) + uint64_t(tile) * r);
+                DataCopyExtParams cp{static_cast<uint16_t>(r), 4U, 7U, 0U, 0U};
+                DataCopyPad(gm, Ub<uint32_t>(ub.stats, r * U::kStatsWords), cp);
+            }
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID1);
+            sharedPending = true;
+            for (uint32_t peer = 0U; peer < r; ++peer) {
+                auto remote = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(ws, peer));
+                auto publication = Ub<uint32_t>(ub.stats + peer * U::kStatsWords * U::kWordBytes, U::kStatsWords);
+                const uint32_t tx = publication.GetValue(U::kStatsTx);
+                const uint32_t contributors = publication.GetValue(U::kLaneStatsBegin +
+                    (peer % U::kRanksPerServer) * U::kLaneStatsWords + U::kLaneScratch);
+                if (tx) Store(reinterpret_cast<__gm__ uint32_t*>(remote + p.relay_hidden + StagedTable(0U, rank)) + uint64_t(first) * U::kTxWords,
+                    Ub<uint32_t>(txUb + publication.GetValue(U::kPublishTxBegin) * U::kTxWords * U::kWordBytes, tx * U::kTxWords), tx * U::kTxWords);
+                if (contributors) Store(reinterpret_cast<__gm__ uint32_t*>(remote + p.relay_hidden + StagedTable(1U, rank)) + uint64_t(first) * U::kContributorWords,
+                    Ub<uint32_t>(txUb + publication.GetValue(U::kPublishContributorBegin) * U::kContributorWords * U::kWordBytes, contributors * U::kContributorWords), contributors * U::kContributorWords);
+            }
+            SetFlag<HardEvent::MTE3_S>(txEvent);
+            txPending[txBank] = true;
+        }
+        if (sharedPending) WaitFlag<HardEvent::MTE3_S>(EVENT_ID1);
+        if (txPending[0]) WaitFlag<HardEvent::MTE3_S>(EVENT_ID2);
+        if (txPending[1]) WaitFlag<HardEvent::MTE3_S>(EVENT_ID3);
+        DataSyncBarrier<MemDsbT::DDR>();
+    }
+
     __aicore__ void BuildTiledMetadata() {
         const uint32_t tiles = SourceTiles(), tasks = r * tiles;
-        if (core < tasks) PrefetchTask(core, 0U);
-        for (uint32_t task = core; task < tasks; task += coreCount) {
-            const uint32_t source = task / tiles, first = (task % tiles) * 256U * k;
-            const uint32_t size = n - first < 256U * k ? n - first : 256U * k;
-            const uint32_t bank = (task / coreCount) & 1U;
+        const uint32_t rowsPerTile = TaskTokens() * k;
+        const bool filtered = UseServerPackets();
+        if (core < tasks) PrefetchTask(core, tiles, rowsPerTile, 0U, filtered);
+        for (uint32_t step = core; step < tasks; step += coreCount) {
+            const uint32_t source = ReceiverSource(step / tiles);
+            const uint32_t tile = step % tiles;
+            const uint32_t first = tile * rowsPerTile;
+            const uint32_t size = n - first < rowsPerTile ? n - first : rowsPerTile;
+            const uint32_t bank = (step / coreCount) & 1U;
             auto routes = AwaitRoutes(bank);
-            if (task + coreCount < tasks) PrefetchTask(task + coreCount, bank ^ 1U);
+            if (filtered) CompletePacketRead(bank, size);
+            if (step + coreCount < tasks) PrefetchTask(step + coreCount, tiles, rowsPerTile, bank ^ 1U, filtered);
+            if (server) {
+                StageTaskWide(routes, source, first, size, filtered ? (__ubuf__ uint32_t*)PacketHeaders(bank).GetPhyAddr() : nullptr);
+                continue; // The VF already published this tile's stats.
+            }
             StageTaskSimt(routes, source, first, size);
             auto totals = Ub<uint32_t>(kPlanTotalsUb, 64U);
-            auto stats = TileStats(task);
-            stats[0] = totals.GetValue(0U); stats[1] = totals.GetValue(1U);
-            stats[2] = totals.GetValue(2U); stats[3] = totals.GetValue(3U);
+            auto stats = TileStats(source * tiles + tile);
+            stats[0] = totals.GetValue(0U);
+            stats[1] = totals.GetValue(1U);
+            stats[2] = totals.GetValue(2U);
+            stats[3] = totals.GetValue(3U);
             for (uint32_t lane = 0U; lane < Width(); ++lane) {
                 stats[16U + lane * 4U] = totals.GetValue(4U + lane);
                 stats[17U + lane * 4U] = totals.GetValue(12U + lane);
             }
-            Flush(stats); Flush(stats + 16U);
+            Flush(stats);
+            Flush(stats + 16U);
             if (Width() > 4U) Flush(stats + 32U);
         }
         // Caller joins all writers before reading tile statistics. This also
         // permits scan compute time and the load-imbalance wait to be separated.
         DataSyncBarrier<MemDsbT::DDR>();
     }
+
     __aicore__ bool TryBuildTiledSourceCountsSimt() {
         const uint32_t tiles = SourceTiles();
         if (tiles > 256U) return false; // Bounded UB, scalar fallback for huge S.
@@ -4811,33 +6615,68 @@ struct CombinePlanBuilder {
             Load(rows, TileStats(source * tiles), tiles * 64U);
             SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
             WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-            asc_vf_call<PrefixCombineTaskStatsSimt>(dim3(32),
-                (__ubuf__ uint32_t*)rows.GetPhyAddr(),
-                (__ubuf__ uint32_t*)totals.GetPhyAddr(), tiles, Width());
+            const bool packed = server;
+            namespace P = CombineCountPublication;
+            auto summary = Ub<uint32_t>(P::kSummaryUb, (P::kLaneRecords + Width()) * P::kRecordWords);
+            if (packed) {
+                asc_vf_call<PrefixAndPackCombineTaskStatsSimt>(dim3(32),
+                    (__ubuf__ uint32_t*)rows.GetPhyAddr(), (__ubuf__ uint32_t*)totals.GetPhyAddr(),
+                    (__ubuf__ uint32_t*)summary.GetPhyAddr(), tiles, Width(), Lane(rank));
+            } else {
+                asc_vf_call<PrefixCombineTaskStatsSimt>(dim3(32),
+                    (__ubuf__ uint32_t*)rows.GetPhyAddr(),
+                    (__ubuf__ uint32_t*)totals.GetPhyAddr(), tiles, Width());
+            }
             SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
             WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
             Store(TileStats(source * tiles), rows, tiles * 64U);
+            if (packed) {
+                Store(Meta(p.source_counts, source),
+                    Ub<int32_t>(P::kSummaryUb, P::kRecordWords), P::kRecordWords);
+                Store(Meta(p.counts_send, source),
+                    Ub<int32_t>(P::kSummaryUb + P::kRecordWords * P::kWordBytes, P::kRecordWords), P::kRecordWords);
+                GlobalTensor<int32_t> gm;
+                gm.SetGlobalBuffer(Meta(p.relay_ranges_send, source));
+                DataCopyExtParams copy{static_cast<uint16_t>(Width()),
+                    P::kRecordWords * P::kWordBytes, 0U,
+                    (r - 1U) * P::kRecordWords * P::kWordBytes, 0U};
+                DataCopyPad(gm, Ub<int32_t>(P::kSummaryUb + P::kLaneRecords * P::kRecordWords * P::kWordBytes,
+                    Width() * P::kRecordWords), copy);
+                SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                continue;
+            }
             SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
             WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
             SetFlag<HardEvent::V_S>(EVENT_ID0);
             WaitFlag<HardEvent::V_S>(EVENT_ID0);
             auto sc = Meta(p.source_counts, source);
-            sc[0] = totals.GetValue(0U); sc[1] = totals.GetValue(2U); sc[2] = 0;
-            sc[3] = totals.GetValue(3U); sc[4] = 0;
-            sc[5] = totals.GetValue(4U + Lane(rank)); sc[6] = 0; Flush(sc);
+            sc[0] = totals.GetValue(0U);
+            sc[1] = totals.GetValue(2U);
+            sc[2] = 0;
+            sc[3] = totals.GetValue(3U);
+            sc[4] = 0;
+            sc[5] = totals.GetValue(4U + Lane(rank));
+            sc[6] = 0;
+            Flush(sc);
             auto gc = Meta(p.counts_send, source);
-            gc[0] = totals.GetValue(1U); gc[1] = 0; Flush(gc);
+            gc[0] = totals.GetValue(1U);
+            gc[1] = 0;
+            Flush(gc);
             for (uint32_t lane = 0U; lane < Width(); ++lane) {
                 auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source);
                 stats[0] = totals.GetValue(4U + lane);
                 stats[1] = totals.GetValue(4U + Width() + lane);
-                stats[2] = 0; stats[3] = 0; Flush(stats);
+                stats[2] = 0;
+                stats[3] = 0;
+                Flush(stats);
             }
         }
         DataSyncBarrier<MemDsbT::DDR>();
         aclshmemi_sync_core<true>();
         return true;
     }
+
     __aicore__ void BuildTiledSourceCounts() {
         if (TryBuildTiledSourceCountsSimt()) return;
         const uint32_t tiles = SourceTiles();
@@ -4846,57 +6685,368 @@ struct CombinePlanBuilder {
             uint32_t scratch[8] = {}, requests[8] = {};
             for (uint32_t tile = 0U; tile < tiles; ++tile) {
                 auto stats = TileStats(source * tiles + tile);
-                Flush(stats); Flush(stats + 16U);
+                Flush(stats);
+                Flush(stats + 16U);
                 if (Width() > 4U) Flush(stats + 32U);
-                stats[4] = tx; stats[5] = groups;
-                tx += stats[0]; groups += stats[1]; finalBase += stats[2]; direct += stats[3];
+                stats[4] = tx;
+                stats[5] = groups;
+                tx += stats[0];
+                groups += stats[1];
+                finalBase += stats[2];
+                direct += stats[3];
                 for (uint32_t lane = 0U; lane < Width(); ++lane) {
                     const uint32_t off = 16U + lane * 4U;
-                    stats[off + 2U] = scratch[lane]; stats[off + 3U] = requests[lane];
-                    scratch[lane] += stats[off]; requests[lane] += stats[off + 1U];
+                    stats[off + 2U] = scratch[lane];
+                    stats[off + 3U] = requests[lane];
+                    scratch[lane] += stats[off];
+                    requests[lane] += stats[off + 1U];
                 }
-                Flush(stats); Flush(stats + 16U);
+                Flush(stats);
+                Flush(stats + 16U);
                 if (Width() > 4U) Flush(stats + 32U);
             }
             auto sc = Meta(p.source_counts, source);
-            sc[0] = tx; sc[1] = finalBase; sc[2] = 0;
-            sc[3] = direct; sc[4] = 0; sc[5] = scratch[Lane(rank)]; sc[6] = 0;
+            sc[0] = tx;
+            sc[1] = finalBase;
+            sc[2] = 0;
+            sc[3] = direct;
+            sc[4] = 0;
+            sc[5] = scratch[Lane(rank)];
+            sc[6] = 0;
             Flush(sc);
             auto gc = Meta(p.counts_send, source);
-            gc[0] = groups; gc[1] = 0; Flush(gc);
+            gc[0] = groups;
+            gc[1] = 0;
+            Flush(gc);
             for (uint32_t lane = 0U; lane < Width(); ++lane) {
                 auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source);
-                stats[0] = scratch[lane]; stats[1] = requests[lane];
-                stats[2] = 0; stats[3] = 0; Flush(stats);
+                stats[0] = scratch[lane];
+                stats[1] = requests[lane];
+                stats[2] = 0;
+                stats[3] = 0;
+                Flush(stats);
             }
         }
         DataSyncBarrier<MemDsbT::DDR>();
         aclshmemi_sync_core<true>();
     }
+
+    __aicore__ bool CompactSourceTile(uint32_t source, uint32_t first,
+        LocalTensor<uint32_t> tile, uint32_t txBase, uint32_t groupBase, uint32_t scratchBase,
+        uint32_t bank, event_t completionEvent) {
+        namespace C = SourceCompactLayout;
+        namespace P = CombineSourcePrefix;
+        const uint32_t txCount = tile.GetValue(SourceCombinePlanning::kStatsTx);
+        const uint32_t contributorCount = tile.GetValue(SourceCombinePlanning::kLaneStatsBegin + Lane(rank) * SourceCombinePlanning::kLaneStatsWords);
+        const uint32_t bankBase = bank * C::kBankBytes;
+        const uint32_t contributorOffset = (txCount + 1U) & ~1U;
+        if (uint64_t(contributorOffset) + contributorCount > C::kMaxTxContributorRows)
+            aclshmemi_kernel_abort("combine source shared compact capacity\n");
+        auto txRows = Ub<uint32_t>(bankBase + C::kTxUb, C::kMaxTxContributorRows * C::kRowWords);
+        auto contributorRows = txRows[contributorOffset * C::kRowWords];
+        auto relayInput = Ub<uint32_t>(bankBase + C::kRelayInputUb, C::kMaxRows * C::kRelayWords);
+        auto relayOutput = Ub<uint32_t>(bankBase + C::kRelayOutputUb, C::kMaxRelayOutputRows * C::kRelayWords);
+        auto lanes = Ub<uint32_t>(bankBase + C::kLaneDescriptorsUb, C::kLanes * C::kLaneWords);
+        auto ranges = Ub<uint32_t>(SourceCompactLayout::kRangesUb, C::kLanes * r * 16U);
+        uint32_t relayCount = 0U, paddedRows = 0U;
+        for (uint32_t lane = 0U; lane < C::kLanes; ++lane) {
+            const uint32_t stat = SourceCombinePlanning::kLaneStatsBegin + lane * SourceCombinePlanning::kLaneStatsWords;
+            const uint32_t count = LocalSource(source) ? 0U : tile.GetValue(stat + SourceCombinePlanning::kLaneRequests);
+            const uint32_t range = (lane * r + source) * 16U;
+            lanes.SetValue(lane * C::kLaneWords + C::kPackedBegin, relayCount);
+            lanes.SetValue(lane * C::kLaneWords + C::kCount, count);
+            lanes.SetValue(lane * C::kLaneWords + C::kOutputBegin, paddedRows);
+            lanes.SetValue(lane * C::kLaneWords + C::kScratchBase, ranges.GetValue(range + P::kScratchBase) + tile.GetValue(stat + SourceCombinePlanning::kLaneScratchPrefix));
+            lanes.SetValue(lane * C::kLaneWords + C::kDestinationBegin, ranges.GetValue(range + P::kRequestBase) + tile.GetValue(stat + SourceCombinePlanning::kLaneRequestPrefix));
+            relayCount += count;
+            paddedRows += (count + 3U) & ~3U;
+        }
+        if (txCount > C::kMaxRows || contributorCount > C::kMaxRows || relayCount > TaskTokens() * k || paddedRows > C::kMaxRelayOutputRows)
+            aclshmemi_kernel_abort("combine source compact tile capacity\n");
+        if (!(txCount || contributorCount || relayCount)) return false;
+        WaitWriter();
+        SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+        WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+        if (txCount) Load(txRows, reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden + StagedTable(0U, source)) + uint64_t(first) * C::kRowWords, txCount * C::kRowWords);
+        if (contributorCount) Load(contributorRows, reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden + StagedTable(1U, source)) + uint64_t(first) * C::kRowWords, contributorCount * C::kRowWords);
+        if (relayCount) Load(relayInput, reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden + StagedTable(2U, source)) + uint64_t(first) * C::kRelayWords, relayCount * C::kRelayWords);
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        SetFlag<HardEvent::S_V>(EVENT_ID0);
+        WaitFlag<HardEvent::S_V>(EVENT_ID0);
+        asc_vf_call<CompactCombineTablesSimt>(dim3(C::kThreads),
+            (__ubuf__ uint32_t*)txRows.GetPhyAddr(), (__ubuf__ uint32_t*)contributorRows.GetPhyAddr(),
+            (__ubuf__ uint32_t*)relayInput.GetPhyAddr(), (__ubuf__ uint32_t*)relayOutput.GetPhyAddr(),
+            (__ubuf__ uint32_t*)lanes.GetPhyAddr(), txCount, contributorCount, txBase, groupBase, scratchBase);
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        if (txCount) Store(reinterpret_cast<__gm__ uint32_t*>(plan + q.tx_rows) + uint64_t(txBase) * C::kRowWords, txRows, txCount * C::kRowWords);
+        if (contributorCount) Store(reinterpret_cast<__gm__ uint32_t*>(plan + q.contributor) + uint64_t(scratchBase) * C::kRowWords, contributorRows, contributorCount * C::kRowWords);
+        for (uint32_t lane = 0U; lane < C::kLanes; ++lane) {
+            const uint32_t count = lanes.GetValue(lane * C::kLaneWords + C::kCount);
+            if (!count) continue;
+            Store(reinterpret_cast<__gm__ uint32_t*>(plan + q.relay_send) + (uint64_t(lane) * n + lanes.GetValue(lane * C::kLaneWords + C::kDestinationBegin)) * C::kRelayWords,
+                relayOutput[lanes.GetValue(lane * C::kLaneWords + C::kOutputBegin) * C::kRelayWords], count * C::kRelayWords);
+        }
+        SetFlag<HardEvent::MTE3_S>(completionEvent);
+        return true;
+    }
+
+    // Source compaction revisits one task every coreCount records. Cache that
+    // strided statistics slice once instead of issuing one MTE2 wait per task.
+    // Helpers use UB below this arena; large cases retain the streaming path.
+    static constexpr uint32_t kCompactStatsRecordWords = 64U;
+    static constexpr uint32_t kCompactStatsCacheUb = SourceCompactLayout::kCachedStatsUb;
+    static constexpr uint32_t kCompactStatsMaxCachedTasks = 256U;
+    static_assert(kCompactStatsCacheUb + kCompactStatsMaxCachedTasks *
+        kCompactStatsRecordWords * sizeof(uint32_t) <= 216U * 1024U);
+
+    __aicore__ void CompactSourceCachedMetadata() {
+        namespace C = SourceCompactLayout;
+        namespace F = SourceCombinePlanning;
+        namespace P = CombineSourcePrefix;
+        const uint32_t tiles = SourceTiles();
+        const uint32_t tasks = r * tiles;
+        const uint32_t ownTasks = core < tasks ? (tasks - 1U - core) / coreCount + 1U : 0U;
+        const bool cacheStats = ownTasks && ownTasks <= kCompactStatsMaxCachedTasks;
+        auto statsCache = Ub<uint32_t>(kCompactStatsCacheUb,
+            kCompactStatsMaxCachedTasks * kCompactStatsRecordWords);
+        auto ranges = Ub<uint32_t>(SourceCompactLayout::kRangesUb, 8U * r * 16U);
+        auto sources = Ub<uint32_t>(SourceCompactLayout::kSourcesUb, r * 16U);
+        auto groups = Ub<uint32_t>(SourceCompactLayout::kGroupsUb, r * 16U);
+        auto tile = Ub<uint32_t>(SourceCompactLayout::kTaskStatsUb, 64U);
+        SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+        WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+        Load(ranges, reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_ranges_send), 8U * r * 16U);
+        Load(sources, reinterpret_cast<__gm__ uint32_t*>(plan + q.source_counts), r * 16U);
+        Load(groups, reinterpret_cast<__gm__ uint32_t*>(ws + p.counts_send), r * 16U);
+        if (cacheStats) {
+            GlobalTensor<uint32_t> gm;
+            gm.SetGlobalBuffer(TileStats(core));
+            const uint32_t recordBytes = kCompactStatsRecordWords * sizeof(uint32_t);
+            DataCopyExtParams copy{static_cast<uint16_t>(ownTasks), recordBytes,
+                (coreCount - 1U) * recordBytes, 0U, 0U};
+            DataCopyPadExtParams<uint32_t> pad{false, 0U, 0U, 0U};
+            DataCopyPad(statsCache, gm, copy, pad);
+        }
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        bool pending[SourceCompactLayout::kBankCount] = {false, false};
+        for (uint32_t task = core; task < tasks; task += coreCount) {
+            const uint32_t source = task / tiles, first = (task % tiles) * TaskTokens() * k;
+            if (cacheStats) {
+                const uint32_t localTask = (task - core) / coreCount;
+                tile = statsCache[localTask * kCompactStatsRecordWords];
+            } else {
+                SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                Load(tile, TileStats(task), kCompactStatsRecordWords);
+                SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            }
+            const uint32_t own = F::kLaneStatsBegin + Lane(rank) * F::kLaneStatsWords;
+            const uint32_t txBase = sources.GetValue(source * C::kMetadataWords + P::kTxBase) + tile.GetValue(F::kStatsTxPrefix);
+            const uint32_t groupBase = groups.GetValue(source * C::kMetadataWords + P::kGroupBase) + tile.GetValue(F::kStatsGroupPrefix);
+            const uint32_t scratchBase = sources.GetValue(source * C::kMetadataWords + P::kSourceScratchBase) + tile.GetValue(own + F::kLaneScratchPrefix);
+            const uint32_t bank = ((task - core) / coreCount) % SourceCompactLayout::kBankCount;
+            const event_t completion = bank ? EVENT_ID3 : EVENT_ID2;
+            // Only wait when this bank is reused. The other bank can still
+            // write out while MTE2/VF handles the current tile.
+            if (pending[bank]) WaitFlag<HardEvent::MTE3_S>(completion);
+            pending[bank] = CompactSourceTile(source, first, tile, txBase, groupBase, scratchBase, bank, completion);
+        }
+        if (pending[0]) WaitFlag<HardEvent::MTE3_S>(EVENT_ID2);
+        if (pending[1]) WaitFlag<HardEvent::MTE3_S>(EVENT_ID3);
+    }
+
+    __aicore__ void CompactReceiverTile(uint32_t source, uint32_t first,
+        LocalTensor<uint32_t> tile, uint32_t txBase, uint32_t groupBase, uint32_t scratchBase,
+        uint32_t tileOrdinal, bool* pending, uint32_t sourceBegin, uint32_t sourceCount) {
+        namespace C = ReceiverCompactLayout;
+        namespace D = SourceCompactLayout;
+        namespace F = SourceCombinePlanning;
+        namespace P = CombineSourcePrefix;
+        const uint32_t own = F::kLaneStatsBegin + Lane(rank) * F::kLaneStatsWords;
+        const uint32_t txCount = tile.GetValue(F::kStatsTx);
+        const uint32_t contributorCount = tile.GetValue(own + F::kLaneScratch);
+        const uint32_t contributorOffset = (txCount + 1U) & ~1U;
+        if (uint64_t(contributorOffset) + contributorCount > C::kMaxTxContributorRows)
+            aclshmemi_kernel_abort("combine receiver TX/contributor capacity\n");
+        uint32_t laneCounts[C::kLanes], laneBegins[C::kLanes];
+        uint32_t paddedRows = 0U, relayCount = 0U;
+        for (uint32_t lane = 0U; lane < C::kLanes; ++lane) {
+            laneCounts[lane] = tile.GetValue(F::kLaneStatsBegin + lane * F::kLaneStatsWords + F::kLaneRequests);
+            laneBegins[lane] = paddedRows;
+            relayCount += laneCounts[lane];
+            paddedRows += (laneCounts[lane] + 3U) & ~3U;
+        }
+        if (relayCount > TaskTokens() * k || paddedRows > C::kMaxRelayRows)
+            aclshmemi_kernel_abort("combine receiver relay capacity\n");
+        if (!(txCount || contributorCount || relayCount)) return;
+        const bool fast = uint64_t(contributorOffset) + contributorCount <= C::kFastTxContributorRows &&
+            paddedRows <= C::kFastRelayRows;
+        const uint32_t bank = fast ? tileOrdinal % C::kBankCount : 0U;
+        const event_t completion = bank ? EVENT_ID3 : EVENT_ID2;
+        if (fast) {
+            if (pending[bank]) {WaitFlag<HardEvent::MTE3_S>(completion); pending[bank] = false; }
+        } else {
+            // A large tile overlaps both small banks. Retire all their DMA
+            // sources before the single large buffer is written or loaded.
+            if (pending[0]) {WaitFlag<HardEvent::MTE3_S>(EVENT_ID2); pending[0] = false; }
+            if (pending[1]) {WaitFlag<HardEvent::MTE3_S>(EVENT_ID3); pending[1] = false; }
+        }
+        const uint32_t bankBase = fast ? bank * C::kFastBankBytes : 0U;
+        const uint32_t relayUb = bankBase + (fast ? C::kFastRelayUb : C::kRelayUb);
+        const uint32_t lanesUb = bankBase + (fast ? C::kFastLanesUb : C::kLanesUb);
+        auto txRows = Ub<uint32_t>(bankBase + C::kTxUb, contributorOffset * C::kRowWords + contributorCount * C::kRowWords);
+        auto contributorRows = txRows[contributorOffset * C::kRowWords];
+        auto relays = Ub<uint32_t>(relayUb, paddedRows * C::kRelayWords);
+        auto lanes = Ub<uint32_t>(lanesUb, C::kLanes * D::kLaneWords);
+        auto ranges = Ub<uint32_t>(C::kRangesUb, C::kLanes * sourceCount * C::kRecordWords);
+        for (uint32_t lane = 0U; lane < C::kLanes; ++lane) {
+            const uint32_t stat = F::kLaneStatsBegin + lane * F::kLaneStatsWords;
+            const uint32_t range = (lane * sourceCount + source - sourceBegin) * C::kRecordWords;
+            lanes.SetValue(lane * D::kLaneWords + D::kPackedBegin, laneBegins[lane]);
+            lanes.SetValue(lane * D::kLaneWords + D::kCount, laneCounts[lane]);
+            lanes.SetValue(lane * D::kLaneWords + D::kOutputBegin, laneBegins[lane]);
+            lanes.SetValue(lane * D::kLaneWords + D::kScratchBase, ranges.GetValue(range + P::kScratchBase) + tile.GetValue(stat + F::kLaneScratchPrefix));
+            lanes.SetValue(lane * D::kLaneWords + D::kDestinationBegin, ranges.GetValue(range + P::kRequestBase) + tile.GetValue(stat + F::kLaneRequestPrefix));
+        }
+        WaitWriter();
+        SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+        WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+        if (tileStageStride) {
+            const uint64_t offset = uint64_t(tile.GetValue(kStageOffsetLow)) |
+                (uint64_t(tile.GetValue(kStageOffsetHigh)) << 32U);
+            auto input = reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden + offset);
+            const uint32_t combinedRows = contributorOffset + contributorCount;
+            const uint32_t relayStartWords = (contributorOffset + ((contributorCount + 1U) & ~1U)) * C::kRowWords;
+            if (combinedRows) Load(txRows, input, combinedRows * C::kRowWords);
+            if (paddedRows) Load(relays, input + relayStartWords, paddedRows * C::kRelayWords);
+        } else {
+            if (txCount) Load(txRows, reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden + StagedTable(0U, source)) + uint64_t(first) * C::kRowWords, txCount * C::kRowWords);
+            if (contributorCount) Load(contributorRows, reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden + StagedTable(1U, source)) + uint64_t(first) * C::kRowWords, contributorCount * C::kRowWords);
+            for (uint32_t lane = 0U; lane < C::kLanes; ++lane) {
+                const uint32_t count = lanes.GetValue(lane * D::kLaneWords + D::kCount);
+                if (count) Load(relays[lanes.GetValue(lane * D::kLaneWords + D::kPackedBegin) * C::kRelayWords],
+                    reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden + StagedTable(2U, source, lane)) + uint64_t(first) * C::kRelayWords, count * C::kRelayWords);
+            }
+        }
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        SetFlag<HardEvent::S_V>(EVENT_ID0);
+        WaitFlag<HardEvent::S_V>(EVENT_ID0);
+        asc_vf_call<CompactCombineTablesSimt>(dim3(D::kThreads),
+            (__ubuf__ uint32_t*)txRows.GetPhyAddr(), (__ubuf__ uint32_t*)contributorRows.GetPhyAddr(),
+            (__ubuf__ uint32_t*)relays.GetPhyAddr(), (__ubuf__ uint32_t*)relays.GetPhyAddr(),
+            (__ubuf__ uint32_t*)lanes.GetPhyAddr(), txCount, contributorCount, txBase, groupBase, scratchBase);
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        if (txCount) Store(reinterpret_cast<__gm__ uint32_t*>(plan + q.tx_rows) + uint64_t(txBase) * C::kRowWords, txRows, txCount * C::kRowWords);
+        if (contributorCount) Store(reinterpret_cast<__gm__ uint32_t*>(plan + q.contributor) + uint64_t(scratchBase) * C::kRowWords, contributorRows, contributorCount * C::kRowWords);
+        for (uint32_t lane = 0U; lane < C::kLanes; ++lane) {
+            const uint32_t count = lanes.GetValue(lane * D::kLaneWords + D::kCount);
+            if (count) Store(reinterpret_cast<__gm__ uint32_t*>(plan + q.relay_send) +
+                (uint64_t(lane) * n + lanes.GetValue(lane * D::kLaneWords + D::kDestinationBegin)) * C::kRelayWords,
+                relays[lanes.GetValue(lane * D::kLaneWords + D::kOutputBegin) * C::kRelayWords], count * C::kRelayWords);
+        }
+        if (fast) {SetFlag<HardEvent::MTE3_S>(completion); pending[bank] = true; }
+        else {SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0); }
+    }
+
+    __aicore__ void CompactReceiverTiledMetadata() {
+        namespace C = ReceiverCompactLayout;
+        namespace F = SourceCombinePlanning;
+        namespace P = CombineSourcePrefix;
+        const uint32_t tiles = SourceTiles();
+        auto statsCache = Ub<uint32_t>(C::kCachedStatsUb, C::kMaxCachedTasks * C::kStatsWords);
+        // Source windows bound metadata UB independently of R (up to 1024).
+        for (uint32_t begin = 0U; begin < r; begin += C::kSourceBatchRanks) {
+            const uint32_t count = r - begin < C::kSourceBatchRanks ? r - begin : C::kSourceBatchRanks;
+            const uint32_t first = begin * tiles, end = (begin + count) * tiles;
+            // Preserve global task-to-core ownership even when coreCount does
+            // not divide the source-window size.
+            const uint32_t firstTask = first + (core + coreCount - first % coreCount) % coreCount;
+            const uint32_t ownTasks = firstTask < end ? (end - 1U - firstTask) / coreCount + 1U : 0U;
+            if (!ownTasks) continue;
+            const bool cacheStats = ownTasks <= C::kMaxCachedTasks;
+            auto ranges = Ub<uint32_t>(C::kRangesUb, C::kLanes * count * C::kRecordWords);
+            auto sources = Ub<uint32_t>(C::kSourcesUb, count * C::kRecordWords);
+            auto groups = Ub<uint32_t>(C::kGroupsUb, count * C::kRecordWords);
+            SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            LoadSourceWindow(ranges, reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_ranges_send) + begin * C::kRecordWords, count);
+            Load(sources, reinterpret_cast<__gm__ uint32_t*>(plan + q.source_counts) + begin * C::kRecordWords, count * C::kRecordWords);
+            Load(groups, reinterpret_cast<__gm__ uint32_t*>(ws + p.counts_send) + begin * C::kRecordWords, count * C::kRecordWords);
+            if (cacheStats) {
+                GlobalTensor<uint32_t> gm;
+                gm.SetGlobalBuffer(TileStats(firstTask));
+                const uint32_t bytes = C::kStatsWords * C::kWordBytes;
+                DataCopyExtParams copy{static_cast<uint16_t>(ownTasks), bytes, (coreCount - 1U) * bytes, 0U, 0U};
+                DataCopyPadExtParams<uint32_t> pad{false, 0U, 0U, 0U}; DataCopyPad(statsCache, gm, copy, pad);
+            }
+            SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            bool pending[C::kBankCount] = {false, false};
+            for (uint32_t task = firstTask; task < end; task += coreCount) {
+                auto tile = Ub<uint32_t>(C::kTaskStatsUb, C::kStatsWords);
+                if (cacheStats) tile = statsCache[((task - firstTask) / coreCount) * C::kStatsWords];
+                else {
+                    SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                    WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                    Load(tile, TileStats(task), C::kStatsWords);
+                    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                }
+                const uint32_t source = task / tiles, row = (task % tiles) * TaskTokens() * k;
+                const uint32_t localSource = source - begin;
+                const uint32_t own = F::kLaneStatsBegin + Lane(rank) * F::kLaneStatsWords;
+                const uint32_t txBase = sources.GetValue(localSource * C::kRecordWords + P::kTxBase) + tile.GetValue(F::kStatsTxPrefix);
+                const uint32_t groupBase = groups.GetValue(localSource * C::kRecordWords + P::kGroupBase) + tile.GetValue(F::kStatsGroupPrefix);
+                const uint32_t scratchBase = sources.GetValue(localSource * C::kRecordWords + P::kSourceScratchBase) + tile.GetValue(own + F::kLaneScratchPrefix);
+                CompactReceiverTile(source, row, tile, txBase, groupBase, scratchBase,
+                    (task - firstTask) / coreCount, pending, begin, count);
+            }
+            // Both banks must retire before the next window overwrites UB.
+            if (pending[0]) WaitFlag<HardEvent::MTE3_S>(EVENT_ID2);
+            if (pending[1]) WaitFlag<HardEvent::MTE3_S>(EVENT_ID3);
+        }
+    }
+
     __aicore__ void CompactTiledMetadata() {
+        if (UseSourcePlan()) {CompactSourceCachedMetadata(); return;}
+        if (server) {CompactReceiverTiledMetadata();return;}
         const uint32_t tiles = SourceTiles();
         for (uint32_t task = core; task < r * tiles; task += coreCount) {
-            const uint32_t source = task / tiles, first = (task % tiles) * 256U * k;
+            const uint32_t source = task / tiles, first = (task % tiles) * TaskTokens() * k;
             auto tile = TileStats(task);
-            Flush(tile); Flush(tile + 16U);
+            Flush(tile);
+            Flush(tile + 16U);
             if (Width() > 4U) Flush(tile + 32U);
-            auto sc = Meta(p.source_counts, source); Flush(sc);
-            auto gc = Meta(p.counts_send, source); Flush(gc);
+            auto sc = Meta(p.source_counts, source);
+            Flush(sc);
+            auto gc = Meta(p.counts_send, source);
+            Flush(gc);
             const uint32_t txBase = sc[2] + tile[4], groupBase = gc[1] + tile[5];
             const uint32_t own = 16U + Lane(rank) * 4U, scratchBase = sc[4] + tile[own + 2U];
             CompactTable(0U, source, 0U, tile[0], q.tx_rows + uint64_t(txBase) * 16U,
                          txBase, groupBase, scratchBase, first);
             CompactTable(1U, source, 0U, tile[own], q.contributor + uint64_t(scratchBase) * 16U,
                          txBase, 0U, 0U, first);
+            uint32_t relayFirst = first;
             for (uint32_t lane = 0U; lane < Width(); ++lane) {
-                auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source); Flush(stats);
+                auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source);
+                Flush(stats);
                 const uint32_t off = 16U + lane * 4U;
                 CompactTable(2U, source, lane, tile[off + 1U],
                     q.relay_send + (uint64_t(lane) * n + stats[3] + tile[off + 3U]) * 8U,
-                    0U, 0U, stats[2] + tile[off + 2U], first);
+                    0U, 0U, stats[2] + tile[off + 2U], UseSourcePlan() ? relayFirst : first);
+                relayFirst += tile[off + 1U];
             }
         }
     }
+
     __aicore__ void CompactTable(uint32_t kind, uint32_t source, uint32_t lane,
         uint32_t count, uint64_t output, uint32_t txBase, uint32_t groupBase,
         uint32_t scratchBase, uint32_t inputFirst = 0U) {
@@ -4906,9 +7056,9 @@ struct CombinePlanBuilder {
         auto dest = reinterpret_cast<__gm__ uint32_t*>(plan + output);
         // Only valid records are copied. MTE byte stores are required: adjacent
         // source segments may share cachelines and are compacted by different cores.
-        for (uint32_t first = 0U; first < count; first += 64U) {
-            const uint32_t size = count - first < 64U ? count - first : 64U;
-            auto rows = Ub<uint32_t>(((first / 64U) & 1U) * 4096U, 64U * words);
+        for (uint32_t first = 0U; first < count; first += 256U) {
+            const uint32_t size = count - first < 256U ? count - first : 256U;
+            auto rows = Ub<uint32_t>(((first / 256U) & 1U) * 4096U, 256U * words);
             SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
             WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
             Load(rows, input + uint64_t(first) * words, size * words);
@@ -4916,7 +7066,7 @@ struct CombinePlanBuilder {
             WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
             SetFlag<HardEvent::S_V>(EVENT_ID0);
             WaitFlag<HardEvent::S_V>(EVENT_ID0);
-            asc_vf_call<AdjustCombineRowsSimt>(dim3(64),
+            asc_vf_call<AdjustCombineRowsSimt>(dim3(256),
                 (__ubuf__ uint32_t*)rows.GetPhyAddr(), size, kind, txBase, groupBase, scratchBase);
             SetFlag<HardEvent::V_S>(EVENT_ID0);
             WaitFlag<HardEvent::V_S>(EVENT_ID0);
@@ -4929,22 +7079,27 @@ struct CombinePlanBuilder {
         }
         WaitWriter();
     }
+
     __aicore__ void CompactStagedMetadata() {
         for (uint32_t source = core; source < r; source += coreCount) {
-            auto sc = Meta(p.source_counts, source); Flush(sc);
-            auto gc = Meta(p.counts_send, source); Flush(gc);
+            auto sc = Meta(p.source_counts, source);
+            Flush(sc);
+            auto gc = Meta(p.counts_send, source);
+            Flush(gc);
             CompactTable(0U, source, 0U, sc[0], q.tx_rows + uint64_t(sc[2]) * 16U,
                          sc[2], gc[1], sc[4]);
             CompactTable(1U, source, 0U, sc[5], q.contributor + uint64_t(sc[4]) * 16U,
                          sc[2], 0U, 0U);
             for (uint32_t lane = 0U; lane < Width(); ++lane) {
-                auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source); Flush(stats);
+                auto stats = Meta(p.relay_ranges_send, uint64_t(lane) * r + source);
+                Flush(stats);
                 CompactTable(2U, source, lane, stats[1],
                     q.relay_send + (uint64_t(lane) * n + stats[3]) * 8U,
                     0U, 0U, stats[2]);
             }
         }
     }
+
     __aicore__ void FinishPlan() {
         PipeBarrier<PIPE_ALL>();
         DataSyncBarrier<MemDsbT::DDR>();
@@ -4962,6 +7117,7 @@ struct CombinePlanBuilder {
         // UB: routes [0,32KiB), padded counters [32,64KiB), cursors
         // [64,68KiB), output [72,80KiB). R<=1024, K<=16.
         auto counts = Ub<uint32_t>(32768U, r * 8U);
+        GlobalTensor<uint32_t> gm;
         for (uint32_t peer = 0U; peer < r; ++peer) counts.SetValue(peer * 8U, 0U);
         for (uint32_t first = begin; first < end; first += pageTokens) {
             const uint32_t size = end - first < pageTokens ? end - first : pageTokens;
@@ -4975,7 +7131,6 @@ struct CombinePlanBuilder {
             SetFlag<HardEvent::V_S>(EVENT_ID0);
             WaitFlag<HardEvent::V_S>(EVENT_ID0);
         }
-        GlobalTensor<uint32_t> gm;
         gm.SetGlobalBuffer(histogram + core);
         // UB source block stride is in 32B units; GM destination stride in bytes.
         DataCopyExtParams column{static_cast<uint16_t>(r), 4U, 0U, 508U, 0U};
@@ -4999,7 +7154,8 @@ struct CombinePlanBuilder {
             uint32_t total = 0U;
             for (uint32_t part = 0U; part < coreCount; ++part) {
                 const uint32_t count = row.GetValue(part);
-                row.SetValue(part, total); total += count;
+                row.SetValue(part, total);
+                total += count;
             }
             for (uint32_t part = coreCount; part < kCores; ++part) row.SetValue(part, 0U);
             row.SetValue(64U, total);
@@ -5057,9 +7213,18 @@ struct CombinePlanBuilder {
         DataSyncBarrier<MemDsbT::DDR>();
         aclshmemi_sync_core<true>();
     }
+
     // Final metadata is immutable now. Retired workspace contributor records
     // publish {sourcePageSeq,rowOffset} at 64B spacing; each source owns a
     // disjoint scratch interval, so no cacheline RMW can touch another writer.
+    __aicore__ bool UseRingDescriptorMap() const {
+        // A closed page has at least pageRows-K+1 rows. Since each source
+        // has at most N scratch rows, this bounds its page descriptors and
+        // keeps the entire DMA snapshot within a private 16KiB UB region.
+        const uint32_t minimum = p.ring_page_rows - k + 1U;
+        return (uint64_t(n) + minimum - 1U) / minimum <= 256U;
+    }
+
     __aicore__ void PublishRingScratchMap(uint32_t first, uint32_t count,
                                         uint32_t page) {
         constexpr uint32_t rowsPerBatch = 128U;
@@ -5082,12 +7247,15 @@ struct CombinePlanBuilder {
             WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
         }
     }
+
     __aicore__ void StoreRingPage(uint32_t index, uint32_t source,
                                  uint32_t first, uint32_t slots, uint32_t groups) {
         auto values = Ub<uint32_t>(4096U, 16U);
         for (uint32_t j = 0U; j < 16U; ++j) values.SetValue(j, 0U);
-        values.SetValue(0U, first); values.SetValue(1U, slots);
-        values.SetValue(2U, groups); values.SetValue(3U, source);
+        values.SetValue(0U, first);
+        values.SetValue(1U, slots);
+        values.SetValue(2U, groups);
+        values.SetValue(3U, source);
         SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
         Store(reinterpret_cast<__gm__ uint32_t*>(plan + q.ring_pages + uint64_t(index) * 64U),
@@ -5098,18 +7266,160 @@ struct CombinePlanBuilder {
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
         WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     }
+
     // Count whole-group row-packed pages in parallel before the source prefix.
     // A full non-tail page contains >=64 groups (each group has <=K rows),
     // so the existing ceil(N/64)+R descriptor/ready capacity remains sufficient.
+    __aicore__ bool UseRingPageStaging() const {
+        return server && UseRingDescriptorMap() && uint64_t(r) * 16384U <= p.weights - p.relay_hidden;
+    }
+
+    __aicore__ bool TryStageRingPagesByEnds(uint32_t source, __gm__ int32_t* sc) {
+        const uint32_t results = uint32_t(sc[0]), groups = uint32_t(sc[0] - sc[3]);
+        if (results > 8192U || groups > 8192U || uint32_t(sc[5]) > 0x07ffffffU) return false;
+        if (!groups) {
+            if (sc[5]) aclshmemi_kernel_abort("combine ring empty groups with scratch\n");
+            sc[6] = 0;
+            Flush(sc);
+            return true;
+        }
+        auto gc = Meta(p.counts_send, source);
+        Flush(gc);
+        if (gc[0] != static_cast<int32_t>(groups))
+            aclshmemi_kernel_abort("combine ring group index count\n");
+        auto rows = Ub<uint32_t>(0U, 8192U * 4U);
+        auto ends = Ub<uint32_t>(131072U, 8192U);
+        auto pages = Ub<uint32_t>(163840U, 256U * 16U);
+        auto errors = Ub<uint32_t>(180224U, 8U);
+        errors.SetValue(0U, 0U);
+        // Clear only live groups: continuity checks must not read a previous plan.
+        Duplicate(ends, uint32_t(0), groups);
+        SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+        WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+        Load(rows, reinterpret_cast<__gm__ uint32_t*>(plan + q.tx_rows) + uint64_t(sc[2]) * 4U, results * 4U);
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        SetFlag<HardEvent::S_V>(EVENT_ID0);
+        WaitFlag<HardEvent::S_V>(EVENT_ID0);
+        asc_vf_call<GatherRingGroupEndsSimt>(dim3(256),
+            (__ubuf__ uint32_t*)rows.GetPhyAddr(), (__ubuf__ uint32_t*)ends.GetPhyAddr(),
+            (__ubuf__ uint32_t*)errors.GetPhyAddr(), results, groups, uint32_t(gc[1]),
+            uint32_t(sc[4]), uint32_t(sc[5]), k);
+        SetFlag<HardEvent::V_S>(EVENT_ID0);
+        WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        if (errors.GetValue(0U)) aclshmemi_kernel_abort("combine ring dense group continuity\n");
+        uint32_t first = 0U, cursor = 0U, count = 0U;
+        while (first < groups) {
+            // First group beyond this page's row limit. Groups remain whole;
+            // this is exactly the prior greedy recurrence, not fixed slicing.
+            uint32_t lo = first, hi = groups;
+            while (lo < hi) {
+                const uint32_t mid = lo + (hi - lo) / 2U;
+                if ((ends.GetValue(mid) >> 5U) <= cursor + p.ring_page_rows) lo = mid + 1U;
+                else hi = mid;
+            }
+            if (lo == first || count >= 256U) aclshmemi_kernel_abort("combine ring page search bounds\n");
+            const uint32_t end = ends.GetValue(lo - 1U) >> 5U;
+            pages.SetValue(count * 16U, uint32_t(sc[4]) + cursor);
+            pages.SetValue(count * 16U + 1U, end - cursor);
+            pages.SetValue(count * 16U + 2U, lo - first);
+            pages.SetValue(count * 16U + 3U, source);
+            first = lo;
+            cursor = end;
+            ++count;
+        }
+        SetFlag<HardEvent::S_V>(EVENT_ID0);
+        WaitFlag<HardEvent::S_V>(EVENT_ID0);
+        asc_vf_call<ClearRingPagePaddingSimt>(dim3(128), (__ubuf__ uint32_t*)pages.GetPhyAddr(), count);
+        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+        Store(reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden + uint64_t(source) * 16384U), pages, count * 16U);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        sc[6] = count;
+        Flush(sc);
+        return true;
+    }
+
+    __aicore__ void StageRingPagesFromTx(uint32_t source, __gm__ int32_t* sc) {
+        if (TryStageRingPagesByEnds(source, sc)) return;
+        const uint32_t results = static_cast<uint32_t>(sc[0]);
+        const uint32_t txBegin = static_cast<uint32_t>(sc[2]);
+        const uint32_t scratchBegin = static_cast<uint32_t>(sc[4]);
+        const uint32_t scratchCount = static_cast<uint32_t>(sc[5]);
+        if (uint64_t(txBegin) + results > n)
+            aclshmemi_kernel_abort("combine ring staged TX bounds rank=%u source=%u\n", rank, source);
+        auto rows = Ub<uint32_t>(0U, 1024U * 4U);
+        auto pages = Ub<uint32_t>(16384U, 256U * 16U);
+        uint32_t cursor = 0U, first = 0U, count = 0U, groups = 0U, pageGroups = 0U;
+        for (uint32_t begin = 0U; begin < results; begin += 1024U) {
+            const uint32_t size = results - begin < 1024U ? results - begin : 1024U;
+            SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            Load(rows, reinterpret_cast<__gm__ uint32_t*>(plan + q.tx_rows) + uint64_t(txBegin + begin) * 4U, size * 4U);
+            SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            for (uint32_t j = 0U; j < size; ++j) {
+                const uint32_t head = rows.GetValue(j * 4U + 2U);
+                if (head == 0xffffffffU) continue;
+                const uint32_t members = rows.GetValue(j * 4U + 3U);
+                if (members < 2U || members > k || cursor > scratchCount || members > scratchCount - cursor || head != scratchBegin + cursor)
+                    aclshmemi_kernel_abort("combine ring staged group mismatch rank=%u source=%u\n", rank, source);
+                if (pageGroups && cursor - first + members > p.ring_page_rows) {
+                    if (count >= 256U) aclshmemi_kernel_abort("combine ring staged page capacity\n");
+                    pages.SetValue(count * 16U, scratchBegin + first);
+                    pages.SetValue(count * 16U + 1U, cursor - first);
+                    pages.SetValue(count * 16U + 2U, pageGroups);
+                    pages.SetValue(count * 16U + 3U, source);
+                    ++count;
+                    first = cursor;
+                    pageGroups = 0U;
+                }
+                cursor += members;
+                ++groups;
+                ++pageGroups;
+            }
+        }
+        if (pageGroups) {
+            if (count >= 256U) aclshmemi_kernel_abort("combine ring staged page capacity\n");
+            pages.SetValue(count * 16U, scratchBegin + first);
+            pages.SetValue(count * 16U + 1U, cursor - first);
+            pages.SetValue(count * 16U + 2U, pageGroups);
+            pages.SetValue(count * 16U + 3U, source);
+            ++count;
+        }
+        if (cursor != scratchCount || groups != uint32_t(sc[0] - sc[3]))
+            aclshmemi_kernel_abort("combine ring staged result mismatch rank=%u source=%u\n", rank, source);
+        if (count) {
+            SetFlag<HardEvent::S_V>(EVENT_ID0);
+            WaitFlag<HardEvent::S_V>(EVENT_ID0);
+            asc_vf_call<ClearRingPagePaddingSimt>(dim3(128), (__ubuf__ uint32_t*)pages.GetPhyAddr(), count);
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            Store(reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden + uint64_t(source) * 16384U), pages, count * 16U);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        }
+        sc[6] = count;
+        Flush(sc);
+    }
+
     __aicore__ void CountRingSourcePages() {
         auto rows = Ub<uint32_t>(0U, 64U * 4U);
         for (uint32_t source = core; source < r; source += coreCount) {
-            auto sc = Meta(p.source_counts, source); Flush(sc);
+            auto sc = Meta(p.source_counts, source);
+            Flush(sc);
             if (sc[0] < 0 || sc[3] < 0 || sc[3] > sc[0] || sc[4] < 0 || sc[5] < 0 ||
                 uint64_t(sc[4]) + uint32_t(sc[5]) > 8ULL * n || uint32_t(sc[5]) > n)
                 aclshmemi_kernel_abort("combine ring invalid count range rank=%u source=%u\n", rank, source);
             const uint32_t begin = static_cast<uint32_t>(sc[4]);
             const uint32_t count = static_cast<uint32_t>(sc[5]);
+            // Dense heads in the TX stream avoid reading padded contributors
+            // twice. Sparse/direct-dominated streams retain the original path.
+            if (UseRingPageStaging() && uint32_t(sc[0]) <= count) {
+                StageRingPagesFromTx(source, sc);
+                continue;
+            }
             uint32_t cursor = 0U, loadedBegin = 0U, loadedCount = 0U;
             uint32_t pageRows = 0U, pages = 0U, groups = 0U;
             while (cursor < count) {
@@ -5127,23 +7437,60 @@ struct CombinePlanBuilder {
                 if (members < 2U || members > k || members > count - cursor)
                     aclshmemi_kernel_abort("combine ring invalid count group rank=%u source=%u\n", rank, source);
                 if (pageRows && pageRows + members > p.ring_page_rows) {
-                    ++pages; pageRows = 0U;
+                    ++pages;
+                    pageRows = 0U;
                 }
-                pageRows += members; cursor += members; ++groups;
+                pageRows += members;
+                cursor += members;
+                ++groups;
             }
             if (pageRows) ++pages;
             if (groups != uint32_t(sc[0] - sc[3]) || (LocalSource(source) && (groups || count)))
                 aclshmemi_kernel_abort("combine ring count groups mismatch rank=%u source=%u\n", rank, source);
-            sc[6] = pages; Flush(sc);
+            sc[6] = pages;
+            Flush(sc);
         }
         DataSyncBarrier<MemDsbT::DDR>();
         aclshmemi_sync_core<true>();
     }
+
+    __aicore__ bool TryBuildRingPagePrefixSimt() {
+        namespace P = CombineRingPrefix;
+        if (r > P::kMaxRanks) return false;
+        if (core == 0U) {
+            const uint32_t words = r * P::kRecordWords;
+            auto counts = Ub<uint32_t>(P::kCountsUb, words);
+            auto errors = Ub<uint32_t>(P::kErrorsUb, P::kMaxRanks);
+            SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            Load(counts, reinterpret_cast<__gm__ uint32_t*>(plan + q.source_counts), words);
+            SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+            asc_vf_call<P::Build>(dim3(r < P::kThreads ? ((r + 31U) / 32U) * 32U : P::kThreads),
+                (__ubuf__ uint32_t*)counts.GetPhyAddr(), (__ubuf__ uint32_t*)errors.GetPhyAddr(),
+                r, rank, uint32_t(server), p.ring_page_capacity, n);
+            SetFlag<HardEvent::V_S>(EVENT_ID0);
+            WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            for (uint32_t source = 0U; source < r; ++source)
+                if (errors.GetValue(source)) aclshmemi_kernel_abort("combine ring prefix invalid counts\n");
+            SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+            Store(reinterpret_cast<__gm__ uint32_t*>(plan + q.source_counts), counts, words);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        }
+        DataSyncBarrier<MemDsbT::DDR>();
+        aclshmemi_sync_core<true>();
+        return true;
+    }
+
     __aicore__ void BuildRingPagePrefix() {
+        if (TryBuildRingPagePrefixSimt()) return;
         if (core == 0U) {
             uint64_t pages = 0U, groups = 0U;
             for (uint32_t source = 0U; source < r; ++source) {
-                auto sc = Meta(p.source_counts, source); Flush(sc);
+                auto sc = Meta(p.source_counts, source);
+                Flush(sc);
                 if (sc[0] < 0 || sc[3] < 0 || sc[3] > sc[0])
                     aclshmemi_kernel_abort("combine ring invalid result counts rank=%u source=%u\n", rank, source);
                 const uint32_t heads = static_cast<uint32_t>(sc[0] - sc[3]);
@@ -5154,18 +7501,23 @@ struct CombinePlanBuilder {
                 const uint32_t count = static_cast<uint32_t>(sc[6]);
                 if (pages + count > p.ring_page_capacity || groups + heads > n)
                     aclshmemi_kernel_abort("combine ring page capacity rank=%u source=%u\n", rank, source);
-                sc[6] = count; sc[7] = static_cast<uint32_t>(pages);
+                sc[6] = count;
+                sc[7] = static_cast<uint32_t>(pages);
                 for (uint32_t word = 8U; word < 16U; ++word) sc[word] = 0;
-                Flush(sc); pages += count; groups += heads;
+                Flush(sc);
+                pages += count;
+                groups += heads;
             }
         }
         DataSyncBarrier<MemDsbT::DDR>();
         aclshmemi_sync_core<true>();
     }
+
     __aicore__ void BuildRingLocalPages() {
         auto rows = Ub<uint32_t>(0U, 64U * 4U);
         for (uint32_t source = core; source < r; source += coreCount) {
-            auto sc = Meta(p.source_counts, source); Flush(sc);
+            auto sc = Meta(p.source_counts, source);
+            Flush(sc);
             const uint32_t scratchBegin = static_cast<uint32_t>(sc[4]);
             const uint32_t scratchCount = static_cast<uint32_t>(sc[5]);
             const uint32_t expectedGroups = static_cast<uint32_t>(sc[0] - sc[3]);
@@ -5173,6 +7525,24 @@ struct CombinePlanBuilder {
             const uint32_t pageBase = static_cast<uint32_t>(sc[7]);
             if (uint64_t(scratchBegin) + scratchCount > 8ULL * n || scratchCount > n)
                 aclshmemi_kernel_abort("combine ring invalid scratch range rank=%u source=%u\n", rank, source);
+            if (UseRingPageStaging() && uint32_t(sc[0]) <= scratchCount) {
+                if (pageCount) {
+                    if (pageCount > 256U) aclshmemi_kernel_abort("combine ring staged load bounds\n");
+                    auto pages = Ub<uint32_t>(16384U, 256U * 16U);
+                    SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                    WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                    Load(pages, reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_hidden + uint64_t(source) * 16384U), pageCount * 16U);
+                    SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+                    WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
+                    Store(reinterpret_cast<__gm__ uint32_t*>(plan + q.ring_pages + uint64_t(pageBase) * 64U), pages, pageCount * 16U);
+                    const uint64_t mirror = p.relay_publish + CombinePutAlign(uint64_t(r) * 64U);
+                    Store(reinterpret_cast<__gm__ uint32_t*>(ws + mirror + uint64_t(pageBase) * 64U), pages, pageCount * 16U);
+                    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                }
+                Copy(reinterpret_cast<__gm__ uint32_t*>(ws + p.relay_publish + uint64_t(source) * 64U), reinterpret_cast<__gm__ uint32_t*>(sc), 16U);
+                continue;
+            }
             uint32_t cursor = 0U, groupCount = 0U, page = 0U;
             uint32_t first = 0U, pageGroups = 0U, loadedBegin = 0U, loadedCount = 0U;
             while (cursor < scratchCount) {
@@ -5197,17 +7567,25 @@ struct CombinePlanBuilder {
                         aclshmemi_kernel_abort("combine ring page count overflow rank=%u source=%u\n", rank, source);
                     StoreRingPage(pageBase + page, source, scratchBegin + first,
                                   cursor - first, pageGroups);
-                    PublishRingScratchMap(scratchBegin + first, cursor - first, page);
-                    ++page; first = cursor; pageGroups = 0U;
+                    if (!UseRingDescriptorMap())
+                        PublishRingScratchMap(scratchBegin + first, cursor - first, page);
+                    ++page;
+                    first = cursor;
+                    pageGroups = 0U;
                 }
-                cursor += members; ++groupCount; ++pageGroups;
+                cursor += members;
+                ++groupCount;
+                ++pageGroups;
                 if (cursor == scratchCount) {
                     if (page >= pageCount || cursor - first > p.ring_page_rows)
                         aclshmemi_kernel_abort("combine ring oversized page rank=%u source=%u\n", rank, source);
                     StoreRingPage(pageBase + page, source, scratchBegin + first,
                                   cursor - first, pageGroups);
-                    PublishRingScratchMap(scratchBegin + first, cursor - first, page);
-                    ++page; first = cursor; pageGroups = 0U;
+                    if (!UseRingDescriptorMap())
+                        PublishRingScratchMap(scratchBegin + first, cursor - first, page);
+                    ++page;
+                    first = cursor;
+                    pageGroups = 0U;
                 }
             }
             if (groupCount != expectedGroups || page != pageCount)
@@ -5218,10 +7596,29 @@ struct CombinePlanBuilder {
                  reinterpret_cast<__gm__ uint32_t*>(sc), 16U);
         }
     }
+
     __aicore__ void BuildRingRelayMaps() {
+        constexpr uint32_t kMapBatchRows = 1024U;
+        constexpr uint32_t kRequestsUb = 1024U, kOutputUb = 32768U;
+        static_assert(kRequestsUb + kMapBatchRows * 2U * sizeof(uint32_t) <= 12288U);
         for (uint32_t task = core; task < Width() * r; task += coreCount) {
-            const uint32_t lane = task / r, source = task % r;
+            // Keep each worker on one ingress lane while cycling sources.
+            // At16P the old source=task%R pins half the workers to local
+            // sources with no relay requests; this order spreads remote work.
+            const uint32_t lane = task % Width(), source = task / Width();
             const uint32_t peer = server ? rank / 8U * 8U + lane : rank;
+            if (LocalSource(source)) {
+                // Every peer is in this server, whose local sources have no
+                // relay pages. Remote sources with count==0 MUST retain their
+                // true page count: they still participate in ready publishing.
+                auto localRange = Meta(p.relay_ranges, uint64_t(lane) * r + source);
+                Flush(localRange);
+                if (localRange[1] != 0)
+                    aclshmemi_kernel_abort("combine ring local source has relay requests\n");
+                localRange[2] = 0;
+                Flush(localRange);
+                continue;
+            }
             auto mirror = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(ws + p.relay_publish, peer));
             auto scratch = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(ws + p.contributor, peer));
             auto summary = Ub<uint32_t>(0U, 16U);
@@ -5235,16 +7632,31 @@ struct CombinePlanBuilder {
             if (uint64_t(pageBase) + pageCount > p.ring_page_capacity ||
                 uint64_t(scratchBegin) + scratchCount > 8ULL * n)
                 aclshmemi_kernel_abort("combine ring invalid peer summary rank=%u peer=%u source=%u\n", rank, peer, source);
-            auto range = Meta(p.relay_ranges, uint64_t(lane) * r + source); Flush(range);
+            auto range = Meta(p.relay_ranges, uint64_t(lane) * r + source);
+            Flush(range);
             const uint32_t first = static_cast<uint32_t>(range[0]);
             const uint32_t count = static_cast<uint32_t>(range[1]);
             if (uint64_t(first) + count > n)
                 aclshmemi_kernel_abort("combine ring invalid relay range rank=%u source=%u\n", rank, source);
-            range[2] = pageCount; Flush(range);
-            auto requests = Ub<uint32_t>(1024U, 64U * 2U);
-            auto output = Ub<uint32_t>(8192U, 64U * 2U);
-            for (uint32_t begin = 0U; begin < count; begin += 64U) {
-                const uint32_t size = count - begin < 64U ? count - begin : 64U;
+            range[2] = pageCount;
+            Flush(range);
+            const bool descriptorMap = UseRingDescriptorMap();
+            auto pageDescriptors = Ub<uint32_t>(16384U, 256U * 16U);
+            if (descriptorMap && count) {
+                if (!pageCount || pageCount > 256U)
+                    aclshmemi_kernel_abort("combine ring invalid descriptor count rank=%u source=%u\n", rank, source);
+                const uint64_t offset = CombinePutAlign(uint64_t(r) * 64U) + uint64_t(pageBase) * 64U;
+                SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                Load(pageDescriptors, reinterpret_cast<__gm__ uint32_t*>(mirror + offset), pageCount * 16U);
+                SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            }
+            auto requests = Ub<uint32_t>(kRequestsUb,kMapBatchRows * 2U);
+            auto output = Ub<uint32_t>(kOutputUb,kMapBatchRows * 2U);
+            const uint32_t batch = descriptorMap ? kMapBatchRows : 64U;
+            for (uint32_t begin = 0U; begin < count; begin += batch) {
+                const uint32_t size = count - begin < batch ? count - begin : batch;
                 const uint64_t ordinal = uint64_t(lane) * n + first + begin;
                 SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
                 WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
@@ -5252,6 +7664,23 @@ struct CombinePlanBuilder {
                      size * 2U);
                 SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
                 WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+                if (descriptorMap) {
+                    auto errors = Ub<uint32_t>(12288U, 8U);
+                    SetFlag<HardEvent::S_V>(EVENT_ID0);
+                    WaitFlag<HardEvent::S_V>(EVENT_ID0);
+                    asc_vf_call<MapRingRelayPagesSimt>(dim3(kMapBatchRows),
+                        (__ubuf__ uint32_t*)pageDescriptors.GetPhyAddr(),
+                        (__ubuf__ uint32_t*)requests.GetPhyAddr(),
+                        (__ubuf__ uint32_t*)output.GetPhyAddr(),
+                        (__ubuf__ uint32_t*)errors.GetPhyAddr(),
+                        size, scratchBegin, scratchCount, pageCount, p.ring_page_rows);
+                    SetFlag<HardEvent::V_S>(EVENT_ID0);
+                    WaitFlag<HardEvent::V_S>(EVENT_ID0);
+                    if (errors.GetValue(0U))
+                        aclshmemi_kernel_abort("combine ring descriptor mapping invalid rank=%u source=%u\n", rank, source);
+                    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                    WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                } else {
                 for (uint32_t j = 0U; j < size; ++j) {
                     const uint32_t slot = requests.GetValue(j * 2U + 1U);
                     if (slot < scratchBegin || uint64_t(slot) >= uint64_t(scratchBegin) + scratchCount)
@@ -5268,7 +7697,9 @@ struct CombinePlanBuilder {
                     const uint32_t page = mapping.GetValue(0U), row = mapping.GetValue(1U);
                     if (page >= pageCount || row >= p.ring_page_rows)
                         aclshmemi_kernel_abort("combine ring invalid relay page mapping rank=%u source=%u\n", rank, source);
-                    output.SetValue(j * 2U, page); output.SetValue(j * 2U + 1U, row);
+                    output.SetValue(j * 2U, page);
+                    output.SetValue(j * 2U + 1U, row);
+                }
                 }
                 SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
                 WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
@@ -5279,6 +7710,7 @@ struct CombinePlanBuilder {
             }
         }
     }
+
     __aicore__ void BuildRingPages() {
         // All three old metadata paths join here, after final-route readers
         // retire. No route re-scan or modification of the original record ABI.
@@ -5293,13 +7725,17 @@ struct CombinePlanBuilder {
         DataSyncBarrier<MemDsbT::DDR>();
         aclshmemx_sync_vec_all(); // peer reads retire before temporary arena reuse
     }
+
     __aicore__ void RecordPlanningStages(const uint64_t* elapsed, uint32_t path) {
         // Eight per-core intervals, reduced into reserved plan header bytes
         // 128..415. Plan layout/version and all payload tables are unchanged.
         // Tile/cache scratch is dead after FinishPlan + PublishPlan's join.
         auto detail = reinterpret_cast<__gm__ uint64_t*>(plan + 128U);
         if (uint64_t(n) * 512U < uint64_t(coreCount) * 64U) {
-            if (core == 0U) { detail[0] = 0U; Flush(detail); }
+            if (core == 0U) {
+                detail[0] = 0U;
+                Flush(detail);
+            }
             return;
         }
         auto samples = reinterpret_cast<__gm__ uint64_t*>(ws + p.relay_publish);
@@ -5318,11 +7754,16 @@ struct CombinePlanBuilder {
                     const uint64_t value = row[stage];
                     sums[stage] += value;
                     if (value < minima[stage]) minima[stage] = value;
-                    if (value > maxima[stage]) { maxima[stage] = value; owners[stage] = c; }
+                    if (value > maxima[stage]) {
+                        maxima[stage] = value;
+                        owners[stage] = c;
+                    }
                 }
             }
             detail[0] = 0x504c414e53544731ULL; // PLANSTG1
-            detail[1] = coreCount; detail[2] = 8U; detail[3] = path;
+            detail[1] = coreCount;
+            detail[2] = 8U;
+            detail[3] = path;
             for (uint32_t stage = 0U; stage < 8U; ++stage) {
                 detail[4U + stage * 4U] = minima[stage];
                 detail[5U + stage * 4U] = sums[stage];
@@ -5333,6 +7774,7 @@ struct CombinePlanBuilder {
             DataSyncBarrier<MemDsbT::DDR>();
         }
     }
+
     __aicore__ void PublishPlan() {
         // All output tables already reside in the final tensor; no full-capacity
         // workspace -> plan snapshot copy. Publish the header only after stores.
@@ -5341,10 +7783,17 @@ struct CombinePlanBuilder {
         if (core == 0U) {
             auto header = reinterpret_cast<__gm__ uint64_t*>(plan);
             header[0] = kCombineExecutionPlanVersion;
-            header[1] = n; header[2] = h; header[3] = k;
-            header[4] = r; header[5] = rank; header[6] = server;
+            header[1] = n;
+            header[2] = h;
+            header[3] = k;
+            header[4] = r;
+            header[5] = rank;
+            header[6] = server;
             header[7] = CombineRingLayoutFingerprint(k);
             Flush(header);
+            // Reused allocations may still contain an optional diagnostic header.
+            header[8] = 0U;
+            Flush(header + 8U);
         }
         DataSyncBarrier<MemDsbT::DDR>();
         aclshmemx_sync_vec_all();
@@ -5357,47 +7806,68 @@ __aicore__ __attribute__((noinline)) void RunCombinePlanning(
     ascend_moonep::PlanningTilingData tiling, uint64_t begin, uint64_t baseEnd) {
     using namespace CombineExecutionPlanning;
     ascend_moonep::MoonEPUdmaCombineTilingData t{};
-    t.S = tiling.num_tokens; t.K = tiling.num_topk; t.H = tiling.combine_h;
-    t.R = tiling.world_size; t.rank = tiling.rank; t.server_dedup = tiling.server_dedup;
+    t.S = tiling.num_tokens;
+    t.K = tiling.num_topk;
+    t.H = tiling.combine_h;
+    t.R = tiling.world_size;
+    t.rank = tiling.rank;
+    t.server_dedup = tiling.server_dedup;
     auto workspace = reinterpret_cast<__gm__ uint8_t*>(tiling.combine_workspace);
     auto plan = reinterpret_cast<__gm__ uint8_t*>(tiling.combine_plan);
     if (!t.K || t.K > 16U || !t.R || t.R > 1024U)
         aclshmemi_kernel_abort("planning combine invalid route dimensions\n");
     CombinePlanBuilder x{reinterpret_cast<__gm__ uint8_t*>(workspace),
         reinterpret_cast<const __gm__ int32_t*>(dst),
-        reinterpret_cast<const __gm__ int32_t*>(groups),
-        reinterpret_cast<const __gm__ int32_t*>(dups),
-        reinterpret_cast<const __gm__ int32_t*>(counts),
         ascend_moonep::MakeCombinePutLayout(t.S * t.K, t.H, t.R, t.K),
         t.S * t.K, t.H, t.K, t.R, t.rank, static_cast<uint32_t>(GetBlockIdx()), t.server_dedup != 0U,
         reinterpret_cast<__gm__ uint8_t*>(plan), ascend_moonep::MakeCombineExecutionPlanLayout(t.S * t.K, t.R)};
     x.coreCount = tiling.block_dim;
+    x.InitTileStaging();
     uint64_t elapsed[8];
     uint64_t previous = baseEnd;
     x.Init();
-    uint64_t now = GetSystemCycle(); elapsed[0] = now - previous; previous = now;
+    uint64_t now = GetSystemCycle();
+    elapsed[0] = now - previous;
+    previous = now;
     x.PublishRoutes();
-    now = GetSystemCycle(); elapsed[1] = now - previous; previous = now;
+    now = GetSystemCycle();
+    elapsed[1] = now - previous;
+    previous = now;
     const bool tiled = x.UseTiledPlan(), staged = x.UseStagedPlan();
-    if (tiled) x.BuildTiledMetadata();
+    const bool sourceDirected = tiled && x.UseSourcePlan();
+    if (sourceDirected) x.BuildSourceTiledMetadata();
+    else if (tiled) x.BuildTiledMetadata();
     else if (staged) x.BuildCombineMetadata(true, false);
     else x.CountSources(false);
-    now = GetSystemCycle(); elapsed[2] = now - previous; previous = now;
+    now = GetSystemCycle();
+    elapsed[2] = now - previous;
+    previous = now;
     DataSyncBarrier<MemDsbT::DDR>();
     aclshmemi_sync_core<true>();
-    now = GetSystemCycle(); elapsed[3] = now - previous; previous = now;
+    now = GetSystemCycle();
+    elapsed[3] = now - previous;
+    previous = now;
+    if (sourceDirected) aclshmemx_sync_vec_all(); // retire source-owned MTE publications
     if (tiled) x.BuildTiledSourceCounts();
     x.BuildSourcePrefixes();
-    now = GetSystemCycle(); elapsed[4] = now - previous; previous = now;
+    now = GetSystemCycle();
+    elapsed[4] = now - previous;
+    previous = now;
     if (tiled) x.CompactTiledMetadata();
     else if (staged) x.CompactStagedMetadata();
     else x.BuildCombineMetadata();
-    now = GetSystemCycle(); elapsed[5] = now - previous; previous = now;
-    x.FinishPlan();
+    now = GetSystemCycle();
+    elapsed[5] = now - previous;
+    previous = now;
+    if (sourceDirected && x.UseSourceFinalPlan()) x.FinishSourceFinalRoutes();
+    else x.FinishPlan();
     x.BuildRingPages();
-    now = GetSystemCycle(); elapsed[6] = now - previous; previous = now;
+    now = GetSystemCycle();
+    elapsed[6] = now - previous;
+    previous = now;
     x.PublishPlan();
-    now = GetSystemCycle(); elapsed[7] = now - previous;
+    now = GetSystemCycle();
+    elapsed[7] = now - previous;
     x.RecordPlanningStages(elapsed, tiled ? 4U : staged ? 1U : 0U);
     if (GetBlockIdx() == 0U) {
         const uint64_t end = GetSystemCycle();

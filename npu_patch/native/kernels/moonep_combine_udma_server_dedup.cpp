@@ -77,6 +77,7 @@ __simt_vf__ LAUNCH_BOUND(kBatch) inline void FillRelayWriteWqes(
     wqe[6] = uint64_t(row_bytes);
     wqe[7] = local;
 }
+
 // Same WQE protocol, with bounds validation fused into VF metadata reads.
 __simt_vf__ LAUNCH_BOUND(kBatch) inline void FillRelayWriteWqesChecked(
     uint32_t count, __ubuf__ uint64_t* requests, __ubuf__ uint64_t* maps,
@@ -114,6 +115,62 @@ __simt_vf__ LAUNCH_BOUND(kBatch) inline void FillRelayWriteWqesChecked(
     wqe[6] = uint64_t(row_bytes);
     wqe[7] = local;
 }
+
+// 64P-only page-ready fusion; the legacy checked VF above is unchanged.
+__simt_vf__ LAUNCH_BOUND(kBatch) inline void FillRelayPageWqes64(
+    uint32_t count, __ubuf__ uint64_t* requests, __ubuf__ uint64_t* maps,
+    uint32_t offset, uint64_t hidden_base, uint64_t remote_page_base,
+    uint32_t row_bytes, uint32_t head, uint32_t expected_page,
+    uint32_t page_rows, uint32_t input_rows, uint32_t tail_dw0, __ubuf__ uint32_t* ctx,
+    uint64_t ready_source, uint64_t ready_target) {
+    const uint32_t tid = threadIdx.x;
+    // All lanes in a launched warp participate, including padded tail lanes.
+    const bool active = tid < count;
+    const uint32_t index = (offset + tid) * 4U;
+    const uint64_t mapping = active ? maps[index] : 0U;
+    const uint32_t loff = active ? static_cast<uint32_t>(requests[index]) : 0U;
+    const uint32_t row = static_cast<uint32_t>(mapping >> 32U);
+    const bool invalid = active && (static_cast<uint32_t>(mapping) != expected_page ||
+                                   row >= page_rows || loff >= input_rows);
+    const uint32_t invalid_lanes = asc_ballot(invalid);
+    if ((tid & 31U) == 0U) ctx[14U + tid / 32U] = invalid_lanes;
+    // Invalid entries never produce payload WQEs. S checks both warp masks
+    // after V_S and aborts before posting ANY WQE via the doorbell.
+    if (!active || invalid) return;
+    const uint64_t remote = remote_page_base + uint64_t(row) * row_bytes;
+    const uint64_t local = hidden_base + uint64_t(loff) * row_bytes;
+    const uint64_t sq = uint64_t(ctx[6]) | (uint64_t(ctx[7]) << 32U);
+    // Payload is RO throughout the page. Keep one CQE per batch for SQ
+    // credit accounting; only the subsequent page-ready flag supplies SO.
+    const uint32_t dw0 = tid + 1U == count ? tail_dw0 : ctx[0];
+    __gm__ uint64_t* wqe = reinterpret_cast<__gm__ uint64_t*>(
+        sq + uint64_t((head + tid) % shm::UDMA_SQ_BASKBLK_CNT) * ctx[12]);
+    wqe[0] = uint64_t(dw0) | (uint64_t(ctx[1]) << 32U);
+    wqe[1] = uint64_t(ctx[2]) | (uint64_t(ctx[3]) << 32U);
+    wqe[2] = uint64_t(ctx[8]) | (uint64_t(ctx[9]) << 32U);
+    wqe[3] = uint64_t(ctx[10]) | (uint64_t(ctx[11]) << 32U);
+    wqe[4] = uint64_t(ctx[4]) | (uint64_t(ctx[5]) << 32U);
+    wqe[5] = remote;
+    wqe[6] = uint64_t(row_bytes);
+    wqe[7] = local;
+    if (tid + 1U == count && ready_source != 0U) {
+        // This final lane also emits the page's SO+CQE marker. It follows all
+        // payload indices on the same exclusive SQ; one V_S and doorbell
+        // publishes the whole batch. S validates every active lane first.
+        __gm__ uint64_t* ready = reinterpret_cast<__gm__ uint64_t*>(
+            sq + uint64_t((head + count) % shm::UDMA_SQ_BASKBLK_CNT) * ctx[12]);
+        ready[0] = uint64_t(ctx[13]) | (uint64_t(ctx[1]) << 32U);
+        ready[1] = uint64_t(ctx[2]) | (uint64_t(ctx[3]) << 32U);
+        ready[2] = uint64_t(ctx[8]) | (uint64_t(ctx[9]) << 32U);
+        ready[3] = uint64_t(ctx[10]) | (uint64_t(ctx[11]) << 32U);
+        ready[4] = uint64_t(ctx[4]) | (uint64_t(ctx[5]) << 32U);
+        ready[5] = ready_target;
+        ready[6] = sizeof(uint64_t);
+        ready[7] = ready_source;
+    }
+
+}
+
 // LocalFinal-only: packed tx input offsets and contiguous final target rows.
 __simt_vf__ LAUNCH_BOUND(kBatch) inline void FillLocalFinalWriteWqes(
     uint32_t count, __ubuf__ uint64_t* tx, uint64_t hidden_base,
@@ -348,6 +405,7 @@ __aicore__ inline LocalTensor<T> Ub(uint32_t bytes, uint32_t count) {
     t.address_.dataLen = count * sizeof(T);
     return t;
 }
+
 template <typename T>
 __aicore__ inline void Load(LocalTensor<T> ub, const __gm__ T* p, uint32_t n) {
     GlobalTensor<T> gm;
@@ -356,6 +414,7 @@ __aicore__ inline void Load(LocalTensor<T> ub, const __gm__ T* p, uint32_t n) {
     DataCopyPadExtParams<T> pad{false, 0, 0, 0};
     DataCopyPad(ub, gm, cp, pad);
 }
+
 template <typename T>
 __aicore__ inline void Store(__gm__ T* p, LocalTensor<T> ub, uint32_t n) {
     GlobalTensor<T> gm;
@@ -367,6 +426,7 @@ __aicore__ inline void Store(__gm__ T* p, LocalTensor<T> ub, uint32_t n) {
 __aicore__ inline void Flush(__gm__ void* p) {
     dcci_cacheline(reinterpret_cast<__gm__ uint8_t*>(p));
 }
+
 __aicore__ inline void Publish(__gm__ uint64_t* p, uint64_t magic) {
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
@@ -374,9 +434,12 @@ __aicore__ inline void Publish(__gm__ uint64_t* p, uint64_t magic) {
     *p = magic;
     Flush(p);
 }
+
 __aicore__ inline void Wait(__gm__ uint64_t* p, uint64_t magic) {
     aclshmem_uint64_wait_until(p, ACLSHMEM_CMP_EQ, magic);
 }
+
+enum class RelayMode { ScalarBounds, FastBounds, FusedPageReady };
 
 struct Pipeline {
     // Each AIV owns a Pipeline; GM pointers refer to rank-shared data, while counters are core-private.
@@ -435,15 +498,18 @@ struct Pipeline {
     __aicore__ inline __gm__ uint64_t* Flag(uint64_t base, uint64_t index) {
         return reinterpret_cast<__gm__ uint64_t*>(ws + base + index * 512U);
     }
+
     __aicore__ inline __gm__ bf16_t* Row(uint64_t base, uint64_t index) {
         return reinterpret_cast<__gm__ bf16_t*>(ws + base) + index * h;
     }
+
     __aicore__ inline __gm__ bf16_t* RelayInputRow(uint32_t logical) {
         if (logical < ring_logical_begin ||
             logical - ring_logical_begin >= p.ring_page_rows)
             aclshmemi_kernel_abort("combine ring input row out of page rank=%u row=%u\n", rank, logical);
         return Row(p.relay_hidden, uint64_t(ring_physical_begin) + logical - ring_logical_begin);
     }
+
     __aicore__ inline __gm__ bf16_t* ReducedRow(uint32_t logical) {
         const uint32_t offset = logical - ring_batch_begin;
         if (logical < ring_batch_begin || offset >= ring_batch_size ||
@@ -451,6 +517,7 @@ struct Pipeline {
             aclshmemi_kernel_abort("combine ring result index mismatch rank=%u row=%u\n", rank, logical);
         return Row(p.relay_result, ring_tx_indices[offset]);
     }
+
     __aicore__ inline __gm__ uint32_t* RingPage(uint32_t index) {
         if (index >= p.ring_page_capacity)
             aclshmemi_kernel_abort("combine ring page index overflow rank=%u page=%u\n", rank, index);
@@ -459,9 +526,11 @@ struct Pipeline {
         Flush(page);
         return page;
     }
+
     __aicore__ inline __ubuf__ uint8_t* Wqe() {
         return reinterpret_cast<__ubuf__ uint8_t*>(Ub<uint8_t>(128 * 1024, 8192).GetPhyAddr());
     }
+
     // Default batched PUT retains scalar SHMEM WQE construction and MTE3 SQ staging.
     // DIRECT, cross-server reduced results, and small-world LocalFinal use this non-SIMT entry.
     __aicore__ inline void SubmitPutBatch(__gm__ bf16_t* const* inputs,
@@ -495,6 +564,7 @@ struct Pipeline {
             return;
         }
     }
+
     // Intra-server SIMT payload for 64P/>=128P LocalFinal(); never for cross-server sends.
     // Metadata, weights, and ready keep their original paths; the last WQE in each batch still requests SO+CQE.
     __aicore__ inline void SubmitIntraPutBatch(__gm__ bf16_t* const* inputs,
@@ -574,6 +644,7 @@ struct Pipeline {
         queue_state->cqe_cnt += 1U; // exactly one SO+CQE WQE per nonempty batch
         ++simt_batches_posted;
     }
+
     // Same peer/QP ownership and completion protocol as SubmitIntraPutBatch.
     // Current metadata bank stays immutable until V_S retires the VF reads.
     template <bool Checked = false>
@@ -674,6 +745,119 @@ struct Pipeline {
         queue_state->cqe_cnt += 1U; // one CQE per nonempty batch; checked 16/32P payload is RO, page ready remains SO
         ++simt_batches_posted;
     }
+
+    // The 64-rank server relay can append page-ready to the last payload batch.
+    __aicore__ inline void SubmitRingPageBatch64(LocalTensor<uint64_t> requests,
+                                             LocalTensor<uint64_t> maps,
+                                             uint32_t offset, uint32_t count,
+                                             uint32_t slotIndex, uint32_t peer,
+                                             uint32_t qp, uint32_t expected_page = 0U, uint64_t readyTicket = 0U) {
+        if (!count) return;
+        if (!server || peer / 8U != rank / 8U) {
+            aclshmemi_kernel_abort("combine SIMT intra PUT requires same-server peer\n");
+            return;
+        }
+        auto info = aclshmemi_udma_qp_info_fetch();
+        auto ctx = aclshmemi_udma_get_qp_ctx(info, peer, qp);
+        auto queue_state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(ctx->state_addr);
+        if (count > CombinePutSimt::kBatch || peer == rank || ctx->wqe_size != 64U) {
+            aclshmemi_kernel_abort("combine SIMT invalid count/peer/WQE size\n");
+            return;
+        }
+        const bool fuseReady = readyTicket != 0U;
+        const uint32_t posted = count + uint32_t(fuseReady);
+        // Apply the same SQ credit guard as the aggregate SHMEM writer, using
+        // our checked Drain so a CQ timeout never permits overwriting live SQEs.
+        if (!aclshmemi_udma_sq_has_credit(queue_state, posted)) Drain(peer, qp);
+        if (!aclshmemi_udma_sq_has_credit(queue_state, posted)) {
+            aclshmemi_kernel_abort("combine SIMT SQ credit unavailable\n");
+            return;
+        }
+        const uint32_t cache = qp & 1U;
+        auto rec = reinterpret_cast<__ubuf__ uint32_t*>(
+            Ub<uint32_t>(CombinePutSimt::kContextOffset + cache * 64U, 16U).GetPhyAddr());
+        if (simt_peer[cache] != peer || simt_qp[cache] != qp) {
+            auto mem = aclshmemi_udma_get_mem_info(info, peer, qp);
+            const uint32_t common = (uint32_t(mem->token_value_valid) << 28U) |
+                (ACLSHMEM_UDMA_REMOTE_JETTY_TYPE << 29U);
+            rec[0] = common | (aclshmemi_udma_build_flag<
+                aclshmemi_udma_opcode_t::UDMA_OP_WRITE, kPayload>() << 16U);
+            rec[1] = (mem->target_hint & 0xffU) |
+                (uint32_t(aclshmemi_udma_opcode_t::UDMA_OP_WRITE) << 8U);
+            rec[2] = (mem->tpn & 0xffffffU) | (1U << 24U);
+            rec[3] = mem->tid & 0xfffffU;
+            rec[4] = mem->rmt_token_value;
+            rec[5] = 0U;
+            const uint64_t sq = ctx->buf_addr;
+            rec[6] = uint32_t(sq); rec[7] = uint32_t(sq >> 32U);
+            auto eid = reinterpret_cast<__gm__ uint64_t*>(mem->eid_addr);
+            const uint64_t eid0 = eid[0], eid1 = eid[1];
+            rec[8] = uint32_t(eid0); rec[9] = uint32_t(eid0 >> 32U);
+            rec[10] = uint32_t(eid1); rec[11] = uint32_t(eid1 >> 32U);
+            rec[12] = ctx->wqe_size;
+            rec[13] = common | (aclshmemi_udma_build_flag<
+                aclshmemi_udma_opcode_t::UDMA_OP_WRITE, kCheckpoint>() << 16U);
+            rec[14] = 0U; rec[15] = 0U;
+            simt_peer[cache] = peer; simt_qp[cache] = qp;
+        }
+        const uint32_t head = queue_state->sq_head;
+        const uint64_t remote_page = reinterpret_cast<uint64_t>(aclshmem_ptr(
+            Row(p.relay_hidden, uint64_t(slotIndex) * p.ring_page_rows), peer));
+        auto request_ptr = reinterpret_cast<__ubuf__ uint64_t*>(requests.GetPhyAddr());
+        auto map_ptr = reinterpret_cast<__ubuf__ uint64_t*>(maps.GetPhyAddr());
+        uint64_t ready_source = 0U, ready_target = 0U;
+        if (fuseReady) {
+            const uint64_t token = uint64_t(LocalLane(peer)) * kCombineRingStreams *
+                kCombineRingDepth + slotIndex;
+            Publish(Flag(p.ring_ready_source, token), readyTicket);
+            ready_source = reinterpret_cast<uint64_t>(Flag(p.ring_ready_source, token));
+            ready_target = reinterpret_cast<uint64_t>(aclshmem_ptr(
+                Flag(p.ring_ready, uint64_t(slotIndex) * 8U + LocalLane(rank)), peer));
+        }
+        rec[14] = 0U; rec[15] = 0U;
+        SetFlag<HardEvent::S_V>(EVENT_ID0);
+        WaitFlag<HardEvent::S_V>(EVENT_ID0);
+        const uint32_t threads = (count + 31U) / 32U * 32U;
+        // Both flags request one CQE. Their XOR changes only the order
+        // bits and cannot touch the cached peer token/jetty fields. Do not
+        // mutate rec[13]: legacy paths reuse this cached SO context.
+        constexpr uint32_t tail_delta = (aclshmemi_udma_build_flag<
+            aclshmemi_udma_opcode_t::UDMA_OP_WRITE, kCheckpoint>() ^
+            aclshmemi_udma_build_flag<aclshmemi_udma_opcode_t::UDMA_OP_WRITE,
+                                      kRingPayloadCqe>()) << 16U;
+        static_assert((tail_delta & 0xf0000000U) == 0U,
+                      "ring order transform must not overlap token/jetty");
+        // Every page closes with SO+CQE in PublishRingReady. Intermediate
+        // payload needs a CQE only before the next maximum batch could exhaust
+        // SQ credit. Keep a spare ready WQE. The guard still drains and
+        // verifies credit before any SQ write; completion is never assumed.
+        const bool emitCqe = !fuseReady &&
+            !aclshmemi_udma_sq_has_credit(queue_state, count + CombinePutSimt::kBatch + 1U);
+        const uint32_t ring_tail_dw0 = emitCqe ? rec[13] ^ tail_delta : rec[0];
+
+        AscendC::Simt::VF_CALL<CombinePutSimt::FillRelayPageWqes64>(
+            AscendC::Simt::Dim3(threads, 1, 1), count, request_ptr, map_ptr,
+            offset, reinterpret_cast<uint64_t>(hidden), remote_page,
+            h * sizeof(bf16_t), head, expected_page, p.ring_page_rows, n, ring_tail_dw0, rec, ready_source, ready_target);
+
+        // Match dispatch's direct-GM-store protocol: V_S completes VF stores
+        // before the doorbell and before S can reuse entries/context UB.
+        SetFlag<HardEvent::V_S>(EVENT_ID0);
+        WaitFlag<HardEvent::V_S>(EVENT_ID0);
+
+        if (rec[14] | rec[15]) {
+            aclshmemi_kernel_abort("combine ring relay map invalid rank=%u page=%u\n", rank, expected_page);
+            return;
+        }
+
+
+        auto db = reinterpret_cast<__gm__ uint32_t*>(ctx->db_addr);
+        st_dev(head + posted, db, 0);
+        queue_state->sq_head = head + posted;
+        queue_state->cqe_cnt += uint32_t(emitCqe) + uint32_t(fuseReady);
+        ++simt_batches_posted;
+    }
+
     // Same peer/QP owner, SQ guard, CQE accounting and completion as Relay.
     __aicore__ inline void SubmitLocalFinalPutBatch(LocalTensor<uint64_t> tx,
                                                     uint64_t first, uint32_t count,
@@ -764,10 +948,13 @@ struct Pipeline {
         queue_state->cqe_cnt += 1U; // one CQE per nonempty batch; 16/32P local payload is RO, final ready remains SO
         ++simt_batches_posted;
     }
+
     __aicore__ inline uint32_t Source(uint32_t ordinal) {
         return CombinePutSource(rank, ordinal, r);
     }
+
     __aicore__ inline uint32_t Producer(uint32_t address) { return server ? address / n : rank; }
+
     __aicore__ inline uint32_t Loff(uint32_t address) { return server ? address % n : address; }
 
     template <typename T>
@@ -819,6 +1006,7 @@ struct Pipeline {
                 rank, core, peer, qp, status, phase_id, simt_batches_posted, observed);
         }
     }
+
     template <typename State>
     __aicore__ inline void SendReady(uint64_t base, uint64_t index, uint32_t peer,
                                     uint32_t qp, State& state) {
@@ -842,6 +1030,7 @@ struct Pipeline {
     __aicore__ bool LocalSource(uint32_t source) const {
         return server && source / 8U == rank / 8U;
     }
+
     __aicore__ uint32_t LocalLane(uint32_t peer) const { return server ? peer % 8U : 0U; }
 
     __aicore__ __gm__ uint64_t* Descriptors(uint32_t slot) {
@@ -1033,11 +1222,19 @@ struct Pipeline {
             reinterpret_cast<__ubuf__ uint64_t*>(Wqe()), 1U, peer, 0U, EVENT_ID0, submit);
     }
 
-    template <bool FastBounds = false>
+    template <RelayMode mode = RelayMode::ScalarBounds>
     __aicore__ void RelayRing() {
+        constexpr bool fastBounds = mode != RelayMode::ScalarBounds;
+        constexpr bool streamReady = mode == RelayMode::FusedPageReady;
         if (core >= (server ? 8U : 1U)) return;
         const uint32_t peer = server ? rank / 8U * 8U + core : rank;
         if (peer >= r) return;
+        if (streamReady && peer == rank) {
+            // The local producer's immutable input is read directly from hidden.
+            // Its consumer does not wait for a ring-ready flag or a page copy.
+            LocalFinal(peer);
+            return;
+        }
         uint32_t ordinal[8], first[8], count[8], pages[8], cursor[8], page[8];
         uint64_t ticket[8];
         bool epoch_seen[8];
@@ -1071,6 +1268,7 @@ struct Pipeline {
             // Never block all streams behind one full stream. This round-robin
             // credit check is essential when receiver/source orders differ.
             if (ReadRingControl(p.ring_credit, slotIndex, peer) != ticket[g]) continue;
+            bool readyPosted = false;
             for (;;) {
                 if (cursor[g] == count[g]) break;
                 auto requests = Ub<uint64_t>((48U + g * 4U + bank[g] * 2U) * 1024U, 64U * 4U);
@@ -1085,7 +1283,7 @@ struct Pipeline {
                 const uint32_t offset = cursor[g] - loadedBegin[g];
                 const uint32_t size = loadedSize[g] - offset;
                 uint32_t consumed = 0U;
-                if constexpr (FastBounds) {
+                if constexpr (fastBounds) {
                     if (peer != rank) {
                         // Planner emits each immutable producer CSR in nondecreasing
                         // page order. Find the <=current-page prefix in <=7 scalar
@@ -1138,7 +1336,17 @@ struct Pipeline {
                         uint64_t(core) * n + first[g] + nextCursor, nextSize);
                 }
                 if (peer != rank && consumed) {
-                    if constexpr (FastBounds) SubmitRingPutBatch<true>(
+                    if constexpr (streamReady) {
+                        // A short bank prefix ends at this page boundary. A
+                        // source's final request is terminal too. Exact 64-row
+                        // bank boundaries retain the ordinary ready fallback.
+                        const bool terminal = nextCursor == count[g] || consumed < size;
+                        const bool fuse = terminal;
+                        SubmitRingPageBatch64(requests, maps, offset, consumed,
+                            slotIndex, peer, 0U, page[g], fuse ? ticket[g] : 0U);
+                        readyPosted = fuse;
+                    }
+                    else if constexpr (fastBounds) SubmitRingPutBatch<true>(
                         requests, maps, offset, consumed, slotIndex, peer, 0U, page[g]);
                     else SubmitRingPutBatch(
                         requests, maps, offset, consumed, slotIndex, peer, 0U);
@@ -1151,9 +1359,9 @@ struct Pipeline {
                 }
                 if (consumed < size) break;
             }
-            // Self and zero-contributor producers also signal every nonempty
-            // receiver page, since the consumer waits on the fixed producer set.
-            PublishRingReady(peer, g, slot, ticket[g]);
+            // Empty remote producers still signal every page. The 64P stream
+            // specialization bypasses the self producer in both roles.
+            if (!readyPosted) PublishRingReady(peer, g, slot, ticket[g]);
             ++ticket[g];
             if (++page[g] == pages[g]) {
                 if (cursor[g] != count[g])
@@ -1450,6 +1658,7 @@ struct Pipeline {
         }
     }
 
+    template <bool SkipSelfReady = false>
     __aicore__ void ReduceRing() {
         InitVector(false);
         const uint32_t shards = r >= 128U ? kCombinePut128ReducerShards : kCombinePutReducerShards;
@@ -1477,8 +1686,12 @@ struct Pipeline {
                     firstSlot < static_cast<uint32_t>(sc[4]) ||
                     uint64_t(firstSlot) + rows > uint64_t(sc[4]) + uint32_t(sc[5]))
                     aclshmemi_kernel_abort("combine ring page metadata invalid rank=%u source=%u page=%u\n", rank, source, pageSeq);
-                for (uint32_t producer = 0U; producer < producers; ++producer)
+                for (uint32_t producer = 0U; producer < producers; ++producer) {
+                    // This producer reads immutable hidden directly; its Relay
+                    // role does not copy a page or publish a self-ready flag.
+                    if (SkipSelfReady && producer == LocalLane(rank)) continue;
                     Wait(Flag(p.ring_ready, uint64_t(slotIndex) * 8U + producer), ticket);
+                }
                 ring_logical_begin = firstSlot;
                 ring_physical_begin = slotIndex * p.ring_page_rows;
                 // A whole duplicate group is confined to one input page. Its
@@ -2151,6 +2364,18 @@ struct Pipeline {
         PipeBarrier<PIPE_ALL>();
         pipe.Reset();
     }
+
+    template <RelayMode mode>
+    __aicore__ void RunSmallWorldRoles() {
+        if (core < kReduceBegin) {
+            RelayRing<mode>();
+        } else if (core < kSendBegin) {
+            // Only the fused relay skips publishing its own ready flag.
+            ReduceRing<mode == RelayMode::FusedPageReady>();
+        } else if (core < kSendEnd) {
+            Send();
+        }
+    }
 };
 
 __aicore__ void Run(GM_ADDR hidden, GM_ADDR weights, GM_ADDR dst,
@@ -2178,24 +2403,21 @@ __aicore__ void Run(GM_ADDR hidden, GM_ADDR weights, GM_ADDR dst,
         if (core < kCombinePut128ReducerBegin) x.RelayRing();
         else if (core < kCombinePut128SenderBegin) x.ReduceRing();
         else if (core < kCombinePut128SenderEnd) x.Send128();
+    } else if (t.R == 64U && t.server_dedup != 0U) {
+        x.RunSmallWorldRoles<RelayMode::FusedPageReady>();
+    } else if (t.R == 16U || t.R == 32U) {
+        x.RunSmallWorldRoles<RelayMode::FastBounds>();
     } else {
-        // Preserve the existing 64P and smaller-world core ownership exactly.
-        if (core < kReduceBegin) {
-            if (t.R == 16U || t.R == 32U) x.RelayRing<true>();
-            else x.RelayRing();
-        }
-        else if (core < kSendBegin) x.ReduceRing();
-        else if (core < kSendEnd) x.Send();
+        x.RunSmallWorldRoles<RelayMode::ScalarBounds>();
     }
-    // All >=128P worlds reuse the parallel final fan-in, then the same final reducer.
-    // Keep the token-ready/out-of-order experiment out of this path.
+
     x.phase_id = 5U;
     x.FinalWeights(); // Fetch weights after this core's WORK, before waiting for hidden ready, to hide part of the wait.
     x.Final();
     aclshmemx_sync_vec_all();
-
 }
 } // namespace
+
 // Payload-only entry: its immutable plan is produced by planning.cpp.
 // Legacy planning-input argument slots are retained for launch ABI compatibility.
 [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void
@@ -2206,6 +2428,7 @@ moonep_udma_combine_server_dedup_kernel(GM_ADDR hidden, GM_ADDR weights, GM_ADDR
     Run(hidden, weights, dst, out, outw,
         workspace, t, magic, plan);
 }
+
 extern "C" __attribute__((visibility("default"))) void moonep_udma_combine_server_dedup_kernel_do(
     void* stream, uint8_t* hidden, uint8_t* weights, uint8_t* dst,
     uint8_t* groups, uint8_t* dups, uint8_t* counts, uint8_t* out, uint8_t* outw,
